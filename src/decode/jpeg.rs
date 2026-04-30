@@ -1,0 +1,1075 @@
+use std::borrow::Cow;
+
+use crate::core::types::{ColorSpace, CpuTile};
+#[cfg(feature = "metal")]
+use crate::core::types::{DeviceTile, TilePixels};
+use crate::error::WsiError;
+#[cfg(feature = "metal")]
+use ashlar_core::{
+    BackendKind as AshlarBackendKind, BackendRequest as AshlarBackendRequest,
+    DeviceSurface as AshlarDeviceSurface,
+};
+#[cfg(feature = "metal")]
+use ashlar_jpeg::JpegView as AshlarJpegView;
+use ashlar_jpeg::{
+    ColorTransform as AshlarColorTransform, DecodeOptions as AshlarDecodeOptions,
+    Decoder as AshlarJpegDecoder, Downscale as AshlarDownscale, PixelFormat as AshlarPixelFormat,
+};
+use image::RgbaImage;
+use rayon::prelude::*;
+
+/// Maximum total bytes allowed for a single JPEG decode allocation.
+/// Set to 512 MB to cover large NDPI full-decode levels while preventing
+/// OOM from crafted JPEG headers with extreme dimensions.
+const MAX_JPEG_DECODE_BYTES: u64 = 512 * 1024 * 1024;
+const JPEG_MAX_DIMENSION: u16 = 65500;
+
+pub struct DecodedJpegRgb {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct JpegTileGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    #[allow(dead_code)]
+    pub restart_interval: u16,
+}
+
+#[derive(Debug)]
+pub(crate) struct JpegDecodeJob<'a> {
+    pub data: Cow<'a, [u8]>,
+    pub tables: Option<Cow<'a, [u8]>>,
+    pub expected_width: u32,
+    pub expected_height: u32,
+    pub color_transform: AshlarColorTransform,
+    pub force_dimensions: bool,
+    pub requested_size: Option<(u32, u32)>,
+}
+
+struct ScaledJpegDecode<'a> {
+    data: &'a [u8],
+    tables: Option<&'a [u8]>,
+    expected_width: u32,
+    expected_height: u32,
+    requested_width: u32,
+    requested_height: u32,
+    force_dimensions: bool,
+    color_transform: AshlarColorTransform,
+}
+
+/// Decode JPEG data to premultiplied RGBA (alpha=255 for all decoded pixels).
+///
+/// If `tables` is provided, it is prepended to `data` before decoding.
+/// Tables end with FFD9 (EOI), data starts with FFD8 (SOI).
+/// Strip EOI from tables, strip SOI from data, concatenate.
+#[allow(dead_code)]
+pub fn decode_jpeg(
+    data: &[u8],
+    tables: Option<&[u8]>,
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<RgbaImage, WsiError> {
+    let decoded = decode_jpeg_rgb(data, tables, expected_width, expected_height)?;
+    let pixel_count = (decoded.width as usize)
+        .checked_mul(decoded.height as usize)
+        .ok_or_else(|| WsiError::Jpeg("pixel dimensions overflow".into()))?;
+    let rgba_size = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| WsiError::Jpeg("RGBA buffer size overflow".into()))?;
+    let mut rgba_buf = vec![255u8; rgba_size];
+    for (rgb, rgba) in decoded
+        .pixels
+        .chunks_exact(3)
+        .zip(rgba_buf.chunks_exact_mut(4))
+    {
+        rgba[0] = rgb[0];
+        rgba[1] = rgb[1];
+        rgba[2] = rgb[2];
+    }
+    RgbaImage::from_raw(decoded.width, decoded.height, rgba_buf)
+        .ok_or_else(|| WsiError::Jpeg("failed to create RgbaImage".into()))
+}
+
+pub fn decode_jpeg_rgb(
+    data: &[u8],
+    tables: Option<&[u8]>,
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<DecodedJpegRgb, WsiError> {
+    decode_jpeg_rgb_with_color_transform(
+        data,
+        tables,
+        expected_width,
+        expected_height,
+        AshlarColorTransform::Auto,
+    )
+}
+
+pub(crate) fn decode_jpeg_rgb_with_size_override(
+    data: &[u8],
+    tables: Option<&[u8]>,
+    image_width: u32,
+    image_height: u32,
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+    color_transform: AshlarColorTransform,
+) -> Result<DecodedJpegRgb, WsiError> {
+    if image_width == 0
+        || image_height == 0
+        || image_width > u16::MAX as u32
+        || image_height > u16::MAX as u32
+    {
+        return Err(WsiError::Jpeg(
+            "JPEG size override requires nonzero u16 dimensions".into(),
+        ));
+    }
+
+    match (requested_width, requested_height) {
+        (Some(requested_width), Some(requested_height)) => {
+            try_decode_jpeg_rgb_scaled(ScaledJpegDecode {
+                data,
+                tables,
+                expected_width: image_width,
+                expected_height: image_height,
+                requested_width,
+                requested_height,
+                force_dimensions: true,
+                color_transform,
+            })?
+            .map_or_else(
+                || {
+                    decode_jpeg_rgb_with_color_transform_and_patch(
+                        data,
+                        tables,
+                        image_width,
+                        image_height,
+                        true,
+                        color_transform,
+                    )
+                    .and_then(|decoded| {
+                        resize_jpeg_rgb_nearest(decoded, requested_width, requested_height)
+                    })
+                },
+                Ok,
+            )
+        }
+        _ => decode_jpeg_rgb_with_color_transform_and_patch(
+            data,
+            tables,
+            image_width,
+            image_height,
+            true,
+            color_transform,
+        ),
+    }
+}
+
+pub(crate) fn decode_batch_jpeg<'a>(jobs: &[JpegDecodeJob<'a>]) -> Vec<Result<CpuTile, WsiError>> {
+    if jobs.len() <= 1 {
+        return jobs.iter().map(decode_one_jpeg_job).collect();
+    }
+    jobs.par_iter().map(decode_one_jpeg_job).collect()
+}
+
+#[cfg(feature = "metal")]
+pub(crate) fn decode_batch_jpeg_pixels<'a>(
+    jobs: &[JpegDecodeJob<'a>],
+    backend: AshlarBackendRequest,
+    require_device: bool,
+    metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
+) -> Vec<Result<TilePixels, WsiError>> {
+    if jobs.len() <= 1 {
+        return jobs
+            .iter()
+            .map(|job| decode_one_jpeg_pixels(job, backend, require_device, metal_sessions))
+            .collect();
+    }
+    jobs.par_iter()
+        .map(|job| decode_one_jpeg_pixels(job, backend, require_device, metal_sessions))
+        .collect()
+}
+
+fn decode_one_jpeg_job(job: &JpegDecodeJob<'_>) -> Result<CpuTile, WsiError> {
+    let decoded = if job.force_dimensions {
+        decode_jpeg_rgb_with_size_override(
+            job.data.as_ref(),
+            job.tables.as_deref(),
+            job.expected_width,
+            job.expected_height,
+            job.requested_size.map(|(width, _)| width),
+            job.requested_size.map(|(_, height)| height),
+            job.color_transform,
+        )
+    } else if let Some((requested_width, requested_height)) = job.requested_size {
+        try_decode_jpeg_rgb_scaled(ScaledJpegDecode {
+            data: job.data.as_ref(),
+            tables: job.tables.as_deref(),
+            expected_width: job.expected_width,
+            expected_height: job.expected_height,
+            requested_width,
+            requested_height,
+            force_dimensions: false,
+            color_transform: job.color_transform,
+        })?
+        .map_or_else(
+            || {
+                decode_jpeg_rgb_with_color_transform(
+                    job.data.as_ref(),
+                    job.tables.as_deref(),
+                    job.expected_width,
+                    job.expected_height,
+                    job.color_transform,
+                )
+                .and_then(|decoded| {
+                    resize_jpeg_rgb_nearest(decoded, requested_width, requested_height)
+                })
+            },
+            Ok,
+        )
+    } else {
+        decode_jpeg_rgb_with_color_transform(
+            job.data.as_ref(),
+            job.tables.as_deref(),
+            job.expected_width,
+            job.expected_height,
+            job.color_transform,
+        )
+    }
+    .map_err(|err| WsiError::Codec {
+        codec: "jpeg",
+        source: Box::new(err),
+    })?;
+
+    CpuTile::from_u8_interleaved(
+        decoded.width,
+        decoded.height,
+        3,
+        ColorSpace::Rgb,
+        decoded.pixels,
+    )
+}
+
+#[cfg(feature = "metal")]
+fn decode_one_jpeg_pixels(
+    job: &JpegDecodeJob<'_>,
+    _backend: AshlarBackendRequest,
+    require_device: bool,
+    metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
+) -> Result<TilePixels, WsiError> {
+    let Some(metal_sessions) = metal_sessions else {
+        if require_device {
+            return Err(WsiError::Unsupported {
+                reason: "device backend not available for jpeg without Metal session".into(),
+            });
+        }
+        return decode_one_jpeg_job(job).map(TilePixels::Cpu);
+    };
+    let input = prepare_jpeg_input(
+        job.data.as_ref(),
+        job.tables.as_deref(),
+        job.expected_width,
+        job.expected_height,
+        job.force_dimensions,
+    );
+    validate_ashlar_jpeg_output_size(input.as_ref())?;
+    let view = AshlarJpegView::parse_with_options(
+        input.as_ref(),
+        AshlarDecodeOptions::default().with_color_transform(job.color_transform),
+    )
+    .map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    let mut decoder = ashlar_jpeg_metal::Decoder::from_view(view)
+        .map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    let surface = decoder
+        .decode_to_device_with_session(AshlarPixelFormat::Rgb8, metal_sessions.jpeg())
+        .map_err(|err| WsiError::Jpeg(format!("ashlar JPEG device decode failed: {err}")))?;
+
+    if surface.backend_kind() == AshlarBackendKind::Metal {
+        if let Some(tile) = crate::output::metal::MetalDeviceTile::from_jpeg(surface) {
+            return Ok(TilePixels::Device(DeviceTile::Metal(tile)));
+        }
+        if require_device {
+            return Err(WsiError::Unsupported {
+                reason: "device backend not available for jpeg".into(),
+            });
+        }
+        return decode_one_jpeg_job(job).map(TilePixels::Cpu);
+    }
+
+    if require_device {
+        return Err(WsiError::Unsupported {
+            reason: "device backend not available for jpeg".into(),
+        });
+    }
+    cpu_tile_from_jpeg_surface(surface, job.expected_width, job.expected_height)
+        .map(TilePixels::Cpu)
+}
+
+#[cfg(feature = "metal")]
+fn cpu_tile_from_jpeg_surface(
+    surface: ashlar_jpeg_metal::Surface,
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<CpuTile, WsiError> {
+    if surface.pixel_format() != AshlarPixelFormat::Rgb8 {
+        return Err(WsiError::Jpeg(format!(
+            "ashlar JPEG returned unsupported pixel format {:?}",
+            surface.pixel_format()
+        )));
+    }
+    let (width, height) = surface.dimensions();
+    let decoded = crop_jpeg_rgb_to_expected(
+        DecodedJpegRgb {
+            width,
+            height,
+            pixels: surface.as_bytes().to_vec(),
+        },
+        expected_width,
+        expected_height,
+    )?;
+    CpuTile::from_u8_interleaved(
+        decoded.width,
+        decoded.height,
+        3,
+        ColorSpace::Rgb,
+        decoded.pixels,
+    )
+}
+
+fn prepare_jpeg_input<'a>(
+    data: &'a [u8],
+    tables: Option<&[u8]>,
+    expected_width: u32,
+    expected_height: u32,
+    force_dimensions: bool,
+) -> Cow<'a, [u8]> {
+    let input = if let Some(tbl) = tables {
+        let tbl_end = if tbl.len() >= 2 && tbl[tbl.len() - 2..] == [0xFF, 0xD9] {
+            tbl.len() - 2
+        } else {
+            tbl.len()
+        };
+        let data_start = if data.len() >= 2 && data[0..2] == [0xFF, 0xD8] {
+            2
+        } else {
+            0
+        };
+        Cow::Owned([&tbl[..tbl_end], &data[data_start..]].concat())
+    } else {
+        Cow::Borrowed(data)
+    };
+    let patched = patch_jpeg_dimensions(
+        input.as_ref(),
+        expected_width,
+        expected_height,
+        force_dimensions,
+    );
+    match ensure_jpeg_eoi(patched.as_ref()) {
+        Cow::Borrowed(bytes) if tables.is_none() && bytes.as_ptr() == data.as_ptr() => {
+            Cow::Borrowed(data)
+        }
+        Cow::Borrowed(bytes) => Cow::Owned(bytes.to_vec()),
+        Cow::Owned(bytes) => Cow::Owned(bytes),
+    }
+}
+
+fn find_sof_position(header: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while i < header.len().saturating_sub(1) {
+        if header[i] == 0xFF && is_sof_marker(header[i + 1]) {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn patch_sof_dimensions(header: &mut [u8], sof_offset: usize, width: u16, height: u16) {
+    if sof_offset + 9 > header.len() {
+        return;
+    }
+    let y = u16::from_be_bytes([header[sof_offset + 5], header[sof_offset + 6]]);
+    let x = u16::from_be_bytes([header[sof_offset + 7], header[sof_offset + 8]]);
+
+    let new_y = if y > JPEG_MAX_DIMENSION || y == 0 {
+        height.min(JPEG_MAX_DIMENSION)
+    } else {
+        y
+    };
+    let new_x = if x > JPEG_MAX_DIMENSION || x == 0 {
+        width.min(JPEG_MAX_DIMENSION)
+    } else {
+        x
+    };
+
+    header[sof_offset + 5..sof_offset + 7].copy_from_slice(&new_y.to_be_bytes());
+    header[sof_offset + 7..sof_offset + 9].copy_from_slice(&new_x.to_be_bytes());
+}
+
+fn set_sof_dimensions(header: &mut [u8], sof_offset: usize, width: u16, height: u16) {
+    if sof_offset + 9 > header.len() {
+        return;
+    }
+    header[sof_offset + 5..sof_offset + 7].copy_from_slice(&height.to_be_bytes());
+    header[sof_offset + 7..sof_offset + 9].copy_from_slice(&width.to_be_bytes());
+}
+
+pub(crate) fn decode_jpeg_rgb_with_color_transform(
+    data: &[u8],
+    tables: Option<&[u8]>,
+    expected_width: u32,
+    expected_height: u32,
+    color_transform: AshlarColorTransform,
+) -> Result<DecodedJpegRgb, WsiError> {
+    decode_jpeg_rgb_with_color_transform_and_patch(
+        data,
+        tables,
+        expected_width,
+        expected_height,
+        false,
+        color_transform,
+    )
+}
+
+fn decode_jpeg_rgb_with_color_transform_and_patch(
+    data: &[u8],
+    tables: Option<&[u8]>,
+    expected_width: u32,
+    expected_height: u32,
+    force_dimensions: bool,
+    color_transform: AshlarColorTransform,
+) -> Result<DecodedJpegRgb, WsiError> {
+    let input = prepare_jpeg_input(
+        data,
+        tables,
+        expected_width,
+        expected_height,
+        force_dimensions,
+    );
+    validate_ashlar_jpeg_output_size(input.as_ref())?;
+    let decoder = AshlarJpegDecoder::new_with_options(
+        input.as_ref(),
+        AshlarDecodeOptions::default().with_color_transform(color_transform),
+    )
+    .map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    let (pixels, outcome) = decoder
+        .decode(AshlarPixelFormat::Rgb8)
+        .map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    crop_jpeg_rgb_to_expected(
+        DecodedJpegRgb {
+            width: outcome.decoded.w,
+            height: outcome.decoded.h,
+            pixels,
+        },
+        expected_width,
+        expected_height,
+    )
+}
+
+fn ashlar_downscale_for_dimensions(
+    expected_width: u32,
+    expected_height: u32,
+    requested_width: u32,
+    requested_height: u32,
+) -> Option<AshlarDownscale> {
+    if expected_width == requested_width && expected_height == requested_height {
+        return Some(AshlarDownscale::None);
+    }
+    for (scale, denom) in [
+        (AshlarDownscale::Half, 2),
+        (AshlarDownscale::Quarter, 4),
+        (AshlarDownscale::Eighth, 8),
+    ] {
+        if expected_width.is_multiple_of(denom)
+            && expected_height.is_multiple_of(denom)
+            && expected_width / denom == requested_width
+            && expected_height / denom == requested_height
+        {
+            return Some(scale);
+        }
+    }
+    None
+}
+
+fn try_decode_jpeg_rgb_scaled(
+    req: ScaledJpegDecode<'_>,
+) -> Result<Option<DecodedJpegRgb>, WsiError> {
+    let Some(scale) = ashlar_downscale_for_dimensions(
+        req.expected_width,
+        req.expected_height,
+        req.requested_width,
+        req.requested_height,
+    ) else {
+        return Ok(None);
+    };
+
+    let input = prepare_jpeg_input(
+        req.data,
+        req.tables,
+        req.expected_width,
+        req.expected_height,
+        req.force_dimensions,
+    );
+    validate_ashlar_jpeg_output_size(input.as_ref())?;
+    let decoder = AshlarJpegDecoder::new_with_options(
+        input.as_ref(),
+        AshlarDecodeOptions::default().with_color_transform(req.color_transform),
+    )
+    .map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    let (pixels, outcome) = if scale == AshlarDownscale::None {
+        decoder
+            .decode(AshlarPixelFormat::Rgb8)
+            .map_err(|err| WsiError::Jpeg(err.to_string()))?
+    } else {
+        decoder
+            .decode_scaled(AshlarPixelFormat::Rgb8, scale)
+            .map_err(|err| WsiError::Jpeg(err.to_string()))?
+    };
+    let decoded = if scale == AshlarDownscale::None {
+        DecodedJpegRgb {
+            width: outcome.decoded.w,
+            height: outcome.decoded.h,
+            pixels,
+        }
+    } else {
+        DecodedJpegRgb {
+            width: req.requested_width,
+            height: req.requested_height,
+            pixels,
+        }
+    };
+    Ok(Some(crop_jpeg_rgb_to_expected(
+        decoded,
+        req.requested_width,
+        req.requested_height,
+    )?))
+}
+
+pub(crate) fn jpeg_dimensions(data: &[u8]) -> Result<(u32, u32), WsiError> {
+    let info = AshlarJpegDecoder::inspect(data).map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    Ok(info.dimensions)
+}
+
+#[cfg(test)]
+pub(crate) fn jpeg_tile_geometry(data: &[u8]) -> Result<JpegTileGeometry, WsiError> {
+    let header = parse_jpeg_tile_header(data)?;
+    let restart_interval = header.restart_interval;
+    let mcu_width = u32::from(header.max_h) * 8;
+    let mcu_height = u32::from(header.max_v) * 8;
+    let mcus_per_row = header.width.div_ceil(mcu_width as u16);
+    if restart_interval > mcus_per_row {
+        return Err(WsiError::Jpeg(format!(
+            "JPEG restart interval {} exceeds MCUs per row {}",
+            restart_interval, mcus_per_row
+        )));
+    }
+    if mcus_per_row % restart_interval != 0 {
+        return Err(WsiError::Jpeg(
+            "JPEG restart interval does not divide MCUs per row".into(),
+        ));
+    }
+
+    Ok(JpegTileGeometry {
+        width: header.width as u32,
+        height: header.height as u32,
+        tile_width: mcu_width * u32::from(restart_interval),
+        tile_height: mcu_height,
+        restart_interval,
+    })
+}
+
+#[cfg(test)]
+struct ParsedJpegTileHeader {
+    width: u16,
+    height: u16,
+    restart_interval: u16,
+    max_h: u8,
+    max_v: u8,
+}
+
+#[cfg(test)]
+fn parse_jpeg_tile_header(data: &[u8]) -> Result<ParsedJpegTileHeader, WsiError> {
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return Err(WsiError::Jpeg("JPEG missing SOI marker".into()));
+    }
+
+    let mut i = 2usize;
+    let mut width = None;
+    let mut height = None;
+    let mut restart_interval = None;
+    let mut max_h = 1u8;
+    let mut max_v = 1u8;
+
+    while i + 1 < data.len() {
+        if data[i] != 0xFF {
+            return Err(WsiError::Jpeg(format!(
+                "expected JPEG marker at byte {i}, found {:02X}",
+                data[i]
+            )));
+        }
+
+        while i < data.len() && data[i] == 0xFF {
+            i += 1;
+        }
+        if i >= data.len() {
+            break;
+        }
+        let marker = data[i];
+        i += 1;
+
+        match marker {
+            0xD9 | 0xDA => break,
+            0x00 | 0xD0..=0xD7 => continue,
+            _ => {}
+        }
+
+        if i + 1 >= data.len() {
+            return Err(WsiError::Jpeg(format!(
+                "truncated JPEG marker length for marker FF{:02X}",
+                marker
+            )));
+        }
+        let seg_len = u16::from_be_bytes([data[i], data[i + 1]]) as usize;
+        if seg_len < 2 || i + seg_len > data.len() {
+            return Err(WsiError::Jpeg(format!(
+                "invalid JPEG segment length {} for marker FF{:02X}",
+                seg_len, marker
+            )));
+        }
+        let payload = &data[i + 2..i + seg_len];
+
+        if is_sof_marker(marker) {
+            if payload.len() < 6 {
+                return Err(WsiError::Jpeg("JPEG SOF segment too short".into()));
+            }
+            height = Some(u16::from_be_bytes([payload[1], payload[2]]));
+            width = Some(u16::from_be_bytes([payload[3], payload[4]]));
+            let component_count = payload[5] as usize;
+            let components = &payload[6..];
+            if components.len() < component_count * 3 {
+                return Err(WsiError::Jpeg("JPEG SOF component table too short".into()));
+            }
+            for component in components.chunks_exact(3).take(component_count) {
+                let sampling = component[1];
+                max_h = max_h.max(sampling >> 4);
+                max_v = max_v.max(sampling & 0x0F);
+            }
+        } else if marker == 0xDD {
+            if payload.len() < 2 {
+                return Err(WsiError::Jpeg("JPEG DRI segment too short".into()));
+            }
+            restart_interval = Some(u16::from_be_bytes([payload[0], payload[1]]));
+        }
+
+        i += seg_len;
+    }
+
+    let width = width.ok_or_else(|| WsiError::Jpeg("JPEG missing SOF marker".into()))?;
+    let height = height.ok_or_else(|| WsiError::Jpeg("JPEG missing SOF marker".into()))?;
+    let restart_interval = restart_interval.unwrap_or(0);
+    if restart_interval == 0 {
+        return Err(WsiError::Jpeg("JPEG missing restart markers".into()));
+    }
+
+    Ok(ParsedJpegTileHeader {
+        width,
+        height,
+        restart_interval,
+        max_h,
+        max_v,
+    })
+}
+
+fn is_sof_marker(marker: u8) -> bool {
+    matches!(
+        marker,
+        0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF
+    )
+}
+
+fn ensure_jpeg_eoi<'a>(input: &'a [u8]) -> Cow<'a, [u8]> {
+    if input.len() >= 2 && input[input.len() - 2..] == [0xFF, 0xD9] {
+        return Cow::Borrowed(input);
+    }
+
+    let mut repaired = input.to_vec();
+    if repaired.len() >= 2 && repaired[repaired.len() - 2] == 0xFF {
+        let last = repaired.len() - 1;
+        repaired[last] = 0xD9;
+    } else {
+        repaired.push(0xFF);
+        repaired.push(0xD9);
+    }
+    Cow::Owned(repaired)
+}
+
+fn validate_ashlar_jpeg_output_size(input: &[u8]) -> Result<(), WsiError> {
+    let info = AshlarJpegDecoder::inspect(input).map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    let bytes = u64::from(info.dimensions.0)
+        .checked_mul(u64::from(info.dimensions.1))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| WsiError::Jpeg("JPEG decode size overflow".into()))?;
+    if bytes > MAX_JPEG_DECODE_BYTES {
+        return Err(WsiError::Jpeg(format!(
+            "JPEG decode size {bytes} bytes exceeds {MAX_JPEG_DECODE_BYTES} byte limit"
+        )));
+    }
+    Ok(())
+}
+
+fn crop_jpeg_rgb_to_expected(
+    decoded: DecodedJpegRgb,
+    expected_width: u32,
+    expected_height: u32,
+) -> Result<DecodedJpegRgb, WsiError> {
+    if expected_width == 0 || expected_height == 0 {
+        return Ok(decoded);
+    }
+    if decoded.width <= expected_width && decoded.height <= expected_height {
+        return Ok(decoded);
+    }
+
+    let crop_w = decoded.width.min(expected_width) as usize;
+    let crop_h = decoded.height.min(expected_height) as usize;
+    let src_stride = decoded.width as usize * 3;
+    let dst_stride = crop_w * 3;
+    let mut cropped = Vec::with_capacity(crop_w * crop_h * 3);
+    for row in 0..crop_h {
+        let start = row * src_stride;
+        cropped.extend_from_slice(&decoded.pixels[start..start + dst_stride]);
+    }
+    Ok(DecodedJpegRgb {
+        width: crop_w as u32,
+        height: crop_h as u32,
+        pixels: cropped,
+    })
+}
+
+fn resize_jpeg_rgb_nearest(
+    decoded: DecodedJpegRgb,
+    requested_width: u32,
+    requested_height: u32,
+) -> Result<DecodedJpegRgb, WsiError> {
+    let pixel_count = u64::from(requested_width)
+        .checked_mul(u64::from(requested_height))
+        .ok_or_else(|| WsiError::Jpeg("scaled JPEG dimensions overflow".into()))?;
+    let len = pixel_count
+        .checked_mul(3)
+        .ok_or_else(|| WsiError::Jpeg("scaled JPEG buffer size overflow".into()))?;
+    if len > MAX_JPEG_DECODE_BYTES {
+        return Err(WsiError::Jpeg(format!(
+            "JPEG scaled decode size {len} bytes exceeds {MAX_JPEG_DECODE_BYTES} byte limit"
+        )));
+    }
+
+    let mut pixels = vec![0u8; len as usize];
+    let src_width = decoded.width as usize;
+    let src_height = decoded.height as usize;
+    let dst_width = requested_width as usize;
+    let dst_height = requested_height as usize;
+    for y in 0..dst_height {
+        let src_y = y * src_height / dst_height;
+        for x in 0..dst_width {
+            let src_x = x * src_width / dst_width;
+            let src = (src_y * src_width + src_x) * 3;
+            let dst = (y * dst_width + x) * 3;
+            pixels[dst..dst + 3].copy_from_slice(&decoded.pixels[src..src + 3]);
+        }
+    }
+
+    Ok(DecodedJpegRgb {
+        width: requested_width,
+        height: requested_height,
+        pixels,
+    })
+}
+
+fn patch_jpeg_dimensions<'a>(
+    input: &'a [u8],
+    expected_width: u32,
+    expected_height: u32,
+    force_dimensions: bool,
+) -> Cow<'a, [u8]> {
+    if expected_width == 0
+        || expected_height == 0
+        || expected_width > u16::MAX as u32
+        || expected_height > u16::MAX as u32
+    {
+        return Cow::Borrowed(input);
+    }
+
+    let Some(sof_offset) = find_sof_position(input) else {
+        return Cow::Borrowed(input);
+    };
+
+    if sof_offset + 9 > input.len() {
+        return Cow::Borrowed(input);
+    }
+
+    let encoded_height = u16::from_be_bytes([input[sof_offset + 5], input[sof_offset + 6]]);
+    let encoded_width = u16::from_be_bytes([input[sof_offset + 7], input[sof_offset + 8]]);
+    let needs_patch = encoded_width == 0
+        || encoded_height == 0
+        || (force_dimensions
+            && (encoded_width != expected_width as u16
+                || encoded_height != expected_height as u16));
+    if !needs_patch {
+        return Cow::Borrowed(input);
+    }
+
+    let mut patched = input.to_vec();
+    if force_dimensions {
+        set_sof_dimensions(
+            &mut patched,
+            sof_offset,
+            expected_width as u16,
+            expected_height as u16,
+        );
+    } else {
+        patch_sof_dimensions(
+            &mut patched,
+            sof_offset,
+            expected_width as u16,
+            expected_height as u16,
+        );
+    }
+    Cow::Owned(patched)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
+
+    fn encode_test_jpeg(img: &image::RgbImage) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        JpegEncoder::new(&mut encoded, 90)
+            .encode(
+                img.as_raw().as_slice(),
+                img.width() as u16,
+                img.height() as u16,
+                JpegColorType::Rgb,
+            )
+            .unwrap();
+        encoded
+    }
+
+    #[test]
+    fn decode_valid_jpeg() {
+        let mut rgb = image::RgbImage::new(8, 8);
+        for pixel in rgb.pixels_mut() {
+            *pixel = image::Rgb([200, 100, 50]);
+        }
+        let jpeg_data = encode_test_jpeg(&rgb);
+        let decoded = decode_jpeg(&jpeg_data, None, 8, 8).unwrap();
+        assert_eq!(decoded.width(), 8);
+        assert_eq!(decoded.height(), 8);
+        // All alpha channels should be 255
+        for pixel in decoded.pixels() {
+            assert_eq!(pixel[3], 255);
+        }
+    }
+
+    #[test]
+    fn decode_empty_data_fails() {
+        let result = decode_jpeg(&[], None, 0, 0);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_with_jpeg_tables() {
+        // Create a valid JPEG
+        let mut rgb = image::RgbImage::new(8, 8);
+        for pixel in rgb.pixels_mut() {
+            *pixel = image::Rgb([100, 150, 200]);
+        }
+        let jpeg_data = encode_test_jpeg(&rgb);
+
+        // Find SOS marker (0xFF, 0xDA) to split into tables and scan data.
+        // Tables = everything up to (but not including) SOS marker, plus EOI.
+        // Data = SOI + SOS marker onward.
+        let sos_pos = jpeg_data
+            .windows(2)
+            .position(|w| w == [0xFF, 0xDA])
+            .expect("SOS marker not found");
+
+        // tables: from start to just before SOS, with EOI appended
+        let mut tables = jpeg_data[..sos_pos].to_vec();
+        tables.extend_from_slice(&[0xFF, 0xD9]); // EOI
+
+        // data: SOI + from SOS onward
+        let mut data = vec![0xFF, 0xD8]; // SOI
+        data.extend_from_slice(&jpeg_data[sos_pos..]);
+
+        let decoded = decode_jpeg(&data, Some(&tables), 8, 8).unwrap();
+        assert_eq!(decoded.width(), 8);
+        assert_eq!(decoded.height(), 8);
+        for pixel in decoded.pixels() {
+            assert_eq!(pixel[3], 255);
+        }
+    }
+
+    #[test]
+    fn decode_jpeg_rgb_returns_interleaved_rgb() {
+        let mut rgb = image::RgbImage::new(4, 4);
+        for (idx, pixel) in rgb.pixels_mut().enumerate() {
+            *pixel = image::Rgb([idx as u8, 200, 50]);
+        }
+        let jpeg_data = encode_test_jpeg(&rgb);
+
+        let decoded = decode_jpeg_rgb(&jpeg_data, None, 4, 4).unwrap();
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 4);
+        assert_eq!(decoded.pixels.len(), 4 * 4 * 3);
+    }
+
+    #[test]
+    fn decode_jpeg_rgb_scaled_returns_scaled_dimensions() {
+        let mut rgb = image::RgbImage::new(16, 16);
+        for (idx, pixel) in rgb.pixels_mut().enumerate() {
+            *pixel = image::Rgb([idx as u8, 100, 200]);
+        }
+        let jpeg_data = encode_test_jpeg(&rgb);
+
+        let decoded = try_decode_jpeg_rgb_scaled(ScaledJpegDecode {
+            data: &jpeg_data,
+            tables: None,
+            expected_width: 16,
+            expected_height: 16,
+            requested_width: 4,
+            requested_height: 4,
+            force_dimensions: false,
+            color_transform: AshlarColorTransform::Auto,
+        })
+        .unwrap()
+        .expect("power-of-two downscale should use ashlar IDCT scale");
+
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 4);
+        assert_eq!(decoded.pixels.len(), 4 * 4 * 3);
+    }
+
+    #[test]
+    fn patch_jpeg_dimensions_overwrites_zero_sized_sof() {
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x11, // length
+            0x08, // precision
+            0x00, 0x00, // height
+            0x00, 0x00, // width
+            0x03, // components
+            0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+        ];
+
+        let patched = patch_jpeg_dimensions(&jpeg, 512, 256, false);
+        let patched = patched.as_ref();
+        assert_eq!(&patched[7..9], &256u16.to_be_bytes());
+        assert_eq!(&patched[9..11], &512u16.to_be_bytes());
+
+        // Original input is unchanged.
+        assert_eq!(&jpeg[7..9], &[0, 0]);
+        assert_eq!(&jpeg[9..11], &[0, 0]);
+    }
+
+    #[test]
+    fn patch_jpeg_dimensions_leaves_nonzero_sof_alone() {
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x11, // length
+            0x08, // precision
+            0x01, 0x00, // height
+            0x02, 0x00, // width
+            0x03, // components
+            0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+        ];
+
+        let patched = patch_jpeg_dimensions(&jpeg, 512, 256, false);
+        assert!(matches!(patched, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn patch_jpeg_dimensions_forces_nonzero_sof_when_requested() {
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x11, // length
+            0x08, // precision
+            0x00, 0x10, // height = 16
+            0x04, 0x00, // width = 1024
+            0x03, // components
+            0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00,
+        ];
+
+        let patched = patch_jpeg_dimensions(&jpeg, 1024, 4, true);
+        let patched = patched.as_ref();
+        assert_eq!(&patched[7..9], &4u16.to_be_bytes());
+        assert_eq!(&patched[9..11], &1024u16.to_be_bytes());
+    }
+
+    #[test]
+    fn ensure_jpeg_eoi_appends_missing_marker() {
+        let jpeg = vec![0xFF, 0xD8, 0x00, 0x01];
+        let repaired = ensure_jpeg_eoi(&jpeg);
+        assert_eq!(
+            repaired.as_ref()[repaired.as_ref().len() - 2..],
+            [0xFF, 0xD9]
+        );
+    }
+
+    #[test]
+    fn ensure_jpeg_eoi_keeps_valid_trailer() {
+        let jpeg = vec![0xFF, 0xD8, 0xFF, 0xD9];
+        let repaired = ensure_jpeg_eoi(&jpeg);
+        assert!(matches!(repaired, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn jpeg_tile_geometry_parses_dri_after_sof() {
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x11, // len
+            0x08, // precision
+            0x00, 0x08, // height
+            0x00, 0x20, // width
+            0x03, // components
+            0x01, 0x22, 0x00, // h=2, v=2
+            0x02, 0x11, 0x00, 0x03, 0x11, 0x00, 0xFF, 0xDD, // DRI
+            0x00, 0x04, // len
+            0x00, 0x02, // restart interval
+            0xFF, 0xDA, // SOS
+            0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00,
+        ];
+
+        let geometry = jpeg_tile_geometry(&jpeg).unwrap();
+        assert_eq!(geometry.width, 32);
+        assert_eq!(geometry.height, 8);
+        assert_eq!(geometry.restart_interval, 2);
+        assert_eq!(geometry.tile_width, 32);
+        assert_eq!(geometry.tile_height, 16);
+    }
+
+    #[test]
+    fn jpeg_tile_geometry_rejects_missing_restart_markers() {
+        let jpeg = vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, // SOF0
+            0x00, 0x11, // len
+            0x08, // precision
+            0x00, 0x08, // height
+            0x00, 0x10, // width
+            0x03, // components
+            0x01, 0x11, 0x00, 0x02, 0x11, 0x00, 0x03, 0x11, 0x00, 0xFF, 0xDA, // SOS
+            0x00, 0x0C, 0x03, 0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00,
+        ];
+
+        let err = jpeg_tile_geometry(&jpeg).unwrap_err();
+        assert!(err.to_string().contains("restart markers"));
+    }
+}

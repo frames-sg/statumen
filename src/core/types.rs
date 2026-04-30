@@ -1,0 +1,1795 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use ashlar_core::PixelFormat;
+
+use crate::error::WsiError;
+use crate::properties::Properties;
+
+// ── Dataset hierarchy ──────────────────────────────────────────────
+
+/// A whole-slide image file (or set of files for DICOM).
+#[derive(Debug)]
+pub struct Dataset {
+    pub id: DatasetId,
+    pub scenes: Vec<Scene>,
+    pub associated_images: HashMap<String, AssociatedImage>,
+    pub properties: Properties,
+    pub icc_profiles: HashMap<(usize, usize), Vec<u8>>,
+}
+
+/// A distinct scan region within a dataset.
+#[derive(Debug)]
+pub struct Scene {
+    pub id: String,
+    pub name: Option<String>,
+    pub series: Vec<Series>,
+}
+
+/// A coherent image pyramid sharing the same axes and sample type.
+#[derive(Debug)]
+pub struct Series {
+    pub id: String,
+    pub axes: AxesShape,
+    pub levels: Vec<Level>,
+    pub sample_type: SampleType,
+    pub channels: Vec<ChannelInfo>,
+}
+
+/// Axis extents beyond x/y. Default is 2D (z=1, c=1, t=1).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct AxesShape {
+    pub z: u32,
+    pub c: u32,
+    pub t: u32,
+}
+
+impl Default for AxesShape {
+    fn default() -> Self {
+        Self { z: 1, c: 1, t: 1 }
+    }
+}
+
+/// One resolution level in a pyramid.
+#[derive(Debug)]
+pub struct Level {
+    pub dimensions: (u64, u64),
+    pub downsample: f64,
+    pub tile_layout: TileLayout,
+}
+
+// ── Tile layout ────────────────────────────────────────────────────
+
+/// How tiles are organized at a given level.
+#[derive(Debug)]
+pub enum TileLayout {
+    /// Regular grid — fixed tile size, row-major.
+    Regular {
+        tile_width: u32,
+        tile_height: u32,
+        tiles_across: u64,
+        tiles_down: u64,
+    },
+    /// Per-tile offsets (Ventana BIF, some DICOM).
+    /// Geometry follows compatibility tilemap semantics and uses floating-point
+    /// tile advances/offsets plus conservative extra-tile expansion.
+    Irregular {
+        tile_advance: (f64, f64),
+        /// Extra tiles to consider around the nominal tilemap region, in the
+        /// order `(top, bottom, left, right)`.
+        extra_tiles: (u32, u32, u32, u32),
+        tiles: HashMap<(i64, i64), TileEntry>,
+    },
+    /// Entire level is one contiguous image (NDPI giant JPEG).
+    /// Backend exposes it as a virtual tile grid.
+    WholeLevel {
+        width: u64,
+        height: u64,
+        virtual_tile_width: u32,
+        virtual_tile_height: u32,
+    },
+}
+
+/// Result of tile intersection computation.
+#[derive(Debug, Clone)]
+pub struct TileHit {
+    pub col: i64,
+    pub row: i64,
+    /// Pixel offset where this tile's top-left lands in the output buffer.
+    pub dest_x: i64,
+    pub dest_y: i64,
+    /// Floating-point placement used by irregular tilemaps.
+    pub dest_x_f64: f64,
+    pub dest_y_f64: f64,
+}
+
+impl TileLayout {
+    /// Compute which tiles intersect the given pixel region.
+    pub fn tiles_for_region(&self, x: i64, y: i64, w: u32, h: u32) -> Vec<TileHit> {
+        match self {
+            TileLayout::Regular {
+                tile_width,
+                tile_height,
+                tiles_across,
+                tiles_down,
+            } => {
+                let tw = *tile_width as i64;
+                let th = *tile_height as i64;
+                let start_col = if x >= 0 { x / tw } else { (x - tw + 1) / tw };
+                let start_row = if y >= 0 { y / th } else { (y - th + 1) / th };
+                let end_col = (x + w as i64 + tw - 1) / tw;
+                let end_row = (y + h as i64 + th - 1) / th;
+
+                let mut hits = Vec::new();
+                for row in start_row..end_row {
+                    for col in start_col..end_col {
+                        if col >= 0
+                            && col < *tiles_across as i64
+                            && row >= 0
+                            && row < *tiles_down as i64
+                        {
+                            hits.push(TileHit {
+                                col,
+                                row,
+                                dest_x: col * tw - x,
+                                dest_y: row * th - y,
+                                dest_x_f64: (col * tw - x) as f64,
+                                dest_y_f64: (row * th - y) as f64,
+                            });
+                        }
+                    }
+                }
+                hits
+            }
+            TileLayout::WholeLevel {
+                width,
+                height,
+                virtual_tile_width,
+                virtual_tile_height,
+            } => {
+                let vtw = *virtual_tile_width as i64;
+                let vth = *virtual_tile_height as i64;
+                let max_col = (*width as i64 + vtw - 1) / vtw;
+                let max_row = (*height as i64 + vth - 1) / vth;
+
+                let start_col = if x >= 0 { x / vtw } else { (x - vtw + 1) / vtw }.max(0);
+                let start_row = if y >= 0 { y / vth } else { (y - vth + 1) / vth }.max(0);
+                let end_col = ((x + w as i64 + vtw - 1) / vtw).min(max_col);
+                let end_row = ((y + h as i64 + vth - 1) / vth).min(max_row);
+
+                let mut hits = Vec::new();
+                for row in start_row..end_row {
+                    for col in start_col..end_col {
+                        hits.push(TileHit {
+                            col,
+                            row,
+                            dest_x: col * vtw - x,
+                            dest_y: row * vth - y,
+                            dest_x_f64: (col * vtw - x) as f64,
+                            dest_y_f64: (row * vth - y) as f64,
+                        });
+                    }
+                }
+                hits
+            }
+            TileLayout::Irregular {
+                tile_advance,
+                extra_tiles,
+                tiles,
+            } => {
+                let adv_x = tile_advance.0;
+                let adv_y = tile_advance.1;
+                if !(adv_x.is_finite() && adv_y.is_finite()) || adv_x <= 0.0 || adv_y <= 0.0 {
+                    return Vec::new();
+                }
+
+                let (extra_top, extra_bottom, extra_left, extra_right) = *extra_tiles;
+                let region_x = x as f64;
+                let region_y = y as f64;
+                let region_x2 = region_x + w as f64;
+                let region_y2 = region_y + h as f64;
+                let start_col = (region_x / adv_x) as i64 - i64::from(extra_left);
+                let end_col = (region_x2 / adv_x).ceil() as i64 + i64::from(extra_right);
+                let start_row = (region_y / adv_y) as i64 - i64::from(extra_top);
+                let end_row = (region_y2 / adv_y).ceil() as i64 + i64::from(extra_bottom);
+                let mut hits = Vec::new();
+                for row in start_row..end_row {
+                    for col in start_col..end_col {
+                        if let Some(entry) = tiles.get(&(col, row)) {
+                            let tile_x = col as f64 * adv_x + entry.offset.0;
+                            let tile_y = row as f64 * adv_y + entry.offset.1;
+                            let tile_x2 = tile_x + entry.dimensions.0 as f64;
+                            let tile_y2 = tile_y + entry.dimensions.1 as f64;
+
+                            if tile_x2 > region_x
+                                && tile_x < region_x2
+                                && tile_y2 > region_y
+                                && tile_y < region_y2
+                            {
+                                hits.push(TileHit {
+                                    col,
+                                    row,
+                                    dest_x: (tile_x - region_x).round() as i64,
+                                    dest_y: (tile_y - region_y).round() as i64,
+                                    dest_x_f64: tile_x - region_x,
+                                    dest_y_f64: tile_y - region_y,
+                                });
+                            }
+                        }
+                    }
+                }
+                hits
+            }
+        }
+    }
+}
+
+/// Per-tile position and size in an Irregular layout.
+#[derive(Debug, Clone)]
+pub struct TileEntry {
+    pub offset: (f64, f64),
+    pub dimensions: (u32, u32),
+    /// For irregular TIFF tile grids (e.g. Ventana BIF), the exact TIFF tile
+    /// index to use when reading from tile_offsets/tile_byte_counts arrays.
+    /// `None` for regular row-major addressing.
+    pub tiff_tile_index: Option<usize>,
+}
+
+// ── Channel / Associated image metadata ────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ChannelInfo {
+    pub name: Option<String>,
+    pub color: Option<[u8; 3]>,
+    pub excitation_nm: Option<f64>,
+    pub emission_nm: Option<f64>,
+}
+
+/// Metadata for an associated image (label, macro, thumbnail).
+#[derive(Debug, Clone)]
+pub struct AssociatedImage {
+    pub dimensions: (u32, u32),
+    pub sample_type: SampleType,
+    pub channels: u16,
+}
+
+// ── Identity / Compression ─────────────────────────────────────────
+
+/// Unique identity for cache keying. 128-bit to avoid truncation collisions.
+#[derive(Clone, Copy, Hash, Eq, PartialEq, Debug)]
+pub struct DatasetId(pub u128);
+
+/// Stable index into `Dataset::scenes`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct SceneId(pub usize);
+
+/// Stable index into `Scene::series`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct SeriesId(pub usize);
+
+/// Stable index into `Series::levels`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct LevelIdx(pub u32);
+
+/// Plane index for multi-dimensional axes (z/c/t).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Default)]
+pub struct PlaneIdx(pub PlaneSelection);
+
+/// Compression codec for TIFF tile/strip data.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum Compression {
+    None,
+    Lzw,
+    Deflate,
+    Zstd,
+    Jpeg,
+    Jp2kYcbcr,
+    Jp2kRgb,
+    JpegLs,
+    Other(u16),
+}
+
+// ── Sample types ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub enum SampleType {
+    Uint8,
+    Uint16,
+    Float32,
+}
+
+impl SampleType {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            SampleType::Uint8 => 1,
+            SampleType::Uint16 => 2,
+            SampleType::Float32 => 4,
+        }
+    }
+}
+
+/// Typed, aligned sample storage.
+#[derive(Debug, Clone)]
+pub enum CpuTileData {
+    U8(Arc<Vec<u8>>),
+    U16(Arc<Vec<u16>>),
+    F32(Arc<Vec<f32>>),
+}
+
+fn into_owned_vec<T: Clone>(samples: Arc<Vec<T>>) -> Vec<T> {
+    Arc::try_unwrap(samples).unwrap_or_else(|shared| shared.as_ref().clone())
+}
+
+impl CpuTileData {
+    pub fn u8(samples: Vec<u8>) -> Self {
+        Self::U8(Arc::new(samples))
+    }
+
+    pub fn u16(samples: Vec<u16>) -> Self {
+        Self::U16(Arc::new(samples))
+    }
+
+    pub fn f32(samples: Vec<f32>) -> Self {
+        Self::F32(Arc::new(samples))
+    }
+
+    pub fn sample_type(&self) -> SampleType {
+        match self {
+            CpuTileData::U8(_) => SampleType::Uint8,
+            CpuTileData::U16(_) => SampleType::Uint16,
+            CpuTileData::F32(_) => SampleType::Float32,
+        }
+    }
+
+    pub fn byte_size(&self) -> usize {
+        match self {
+            CpuTileData::U8(v) => v.len(),
+            CpuTileData::U16(v) => v.len() * 2,
+            CpuTileData::F32(v) => v.len() * 4,
+        }
+    }
+
+    pub fn as_u8(&self) -> Option<&[u8]> {
+        match self {
+            CpuTileData::U8(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn as_u16(&self) -> Option<&[u16]> {
+        match self {
+            CpuTileData::U16(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<&[f32]> {
+        match self {
+            CpuTileData::F32(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn make_mut_u8(&mut self) -> Option<&mut Vec<u8>> {
+        match self {
+            CpuTileData::U8(v) => Some(Arc::make_mut(v)),
+            _ => None,
+        }
+    }
+
+    pub fn make_mut_u16(&mut self) -> Option<&mut Vec<u16>> {
+        match self {
+            CpuTileData::U16(v) => Some(Arc::make_mut(v)),
+            _ => None,
+        }
+    }
+
+    pub fn make_mut_f32(&mut self) -> Option<&mut Vec<f32>> {
+        match self {
+            CpuTileData::F32(v) => Some(Arc::make_mut(v)),
+            _ => None,
+        }
+    }
+}
+
+/// Declared color model.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ColorSpace {
+    Rgb,
+    Rgba,
+    Grayscale,
+    YCbCr,
+    Cmyk,
+    /// Indexed color with LUT entries as [R, G, B] triples.
+    Palette(Arc<Vec<[u8; 3]>>),
+    Unknown,
+}
+
+/// Whether channel samples are interleaved or planar.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum CpuTileLayout {
+    Interleaved,
+    Planar,
+}
+
+/// Generic decoded pixel buffer.
+///
+/// **Invariant:** `data` length must equal `width * height * channels` in samples.
+/// Use [`CpuTile::new()`] to construct with validation. Fields are `pub`
+/// for direct read access but direct construction bypasses validation.
+#[derive(Debug, Clone)]
+pub struct CpuTile {
+    pub width: u32,
+    pub height: u32,
+    pub channels: u16,
+    pub color_space: ColorSpace,
+    pub layout: CpuTileLayout,
+    pub data: CpuTileData,
+}
+
+/// Windowing parameters for high-dynamic-range display conversion.
+#[derive(Debug, Clone)]
+pub struct DisplayWindow {
+    pub min: f64,
+    pub max: f64,
+}
+
+impl CpuTile {
+    /// Construct a CpuTile, validating that the data length matches
+    /// `width * height * channels`. Uses checked arithmetic to prevent
+    /// overflow on large dimensions.
+    pub fn new(
+        width: u32,
+        height: u32,
+        channels: u16,
+        color_space: ColorSpace,
+        layout: CpuTileLayout,
+        data: CpuTileData,
+    ) -> Result<Self, WsiError> {
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|wh| wh.checked_mul(channels as usize))
+            .ok_or_else(|| {
+                WsiError::DisplayConversion(format!(
+                    "CpuTile dimensions overflow: {}x{}x{}",
+                    width, height, channels,
+                ))
+            })?;
+        let actual = match &data {
+            CpuTileData::U8(v) => v.len(),
+            CpuTileData::U16(v) => v.len(),
+            CpuTileData::F32(v) => v.len(),
+        };
+        if actual != expected {
+            return Err(WsiError::DisplayConversion(format!(
+                "CpuTile invariant violated: {}x{}x{} = {} samples, but data has {}",
+                width, height, channels, expected, actual,
+            )));
+        }
+        Ok(Self {
+            width,
+            height,
+            channels,
+            color_space,
+            layout,
+            data,
+        })
+    }
+
+    /// Construct an interleaved U8 CPU tile.
+    pub fn from_u8_interleaved(
+        width: u32,
+        height: u32,
+        channels: u16,
+        color_space: ColorSpace,
+        pixels: Vec<u8>,
+    ) -> Result<Self, WsiError> {
+        Self::new(
+            width,
+            height,
+            channels,
+            color_space,
+            CpuTileLayout::Interleaved,
+            CpuTileData::u8(pixels),
+        )
+    }
+
+    /// Test/support constructor for code that already owns byte-slice storage.
+    pub fn new_for_test(
+        pixels: Arc<[u8]>,
+        width: u32,
+        height: u32,
+        stride_bytes: usize,
+        format: PixelFormat,
+    ) -> Self {
+        let channels = format.channels() as u16;
+        let row_min = width as usize * format.bytes_per_pixel();
+        assert!(
+            stride_bytes >= row_min,
+            "stride_bytes={stride_bytes} < row_min={row_min}"
+        );
+        assert_eq!(
+            stride_bytes, row_min,
+            "CpuTile::new_for_test currently stores packed interleaved data; use sv_tile::SlideCpuTile for padded test storage until ziggurat CpuTile is reshaped"
+        );
+        let expected = stride_bytes
+            .checked_mul(height as usize)
+            .expect("test tile dimensions overflow");
+        assert!(
+            pixels.len() >= expected,
+            "pixels len {} < expected {}",
+            pixels.len(),
+            expected
+        );
+        let color_space = match format.layout() {
+            ashlar_core::PixelLayout::Rgb => ColorSpace::Rgb,
+            ashlar_core::PixelLayout::Rgba => ColorSpace::Rgba,
+            ashlar_core::PixelLayout::Gray => ColorSpace::Grayscale,
+            _ => ColorSpace::Unknown,
+        };
+        Self::new(
+            width,
+            height,
+            channels,
+            color_space,
+            CpuTileLayout::Interleaved,
+            CpuTileData::u8(pixels.as_ref().to_vec()),
+        )
+        .expect("validated test tile")
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn stride_bytes(&self) -> usize {
+        self.width as usize * self.channels as usize * self.data.sample_type().byte_size()
+    }
+
+    pub fn pixel_format(&self) -> Option<PixelFormat> {
+        match (self.data.sample_type(), self.channels, &self.color_space) {
+            (SampleType::Uint8, 1, ColorSpace::Grayscale) => Some(PixelFormat::Gray8),
+            (SampleType::Uint8, 3, _) => Some(PixelFormat::Rgb8),
+            (SampleType::Uint8, 4, _) => Some(PixelFormat::Rgba8),
+            (SampleType::Uint16, 1, ColorSpace::Grayscale) => Some(PixelFormat::Gray16),
+            (SampleType::Uint16, 3, _) => Some(PixelFormat::Rgb16),
+            (SampleType::Uint16, 4, _) => Some(PixelFormat::Rgba16),
+            (SampleType::Float32, _, _) => None,
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(&self) -> Option<&[u8]> {
+        self.data.as_u8()
+    }
+
+    pub fn pixels_arc(&self) -> Option<Arc<[u8]>> {
+        self.data.as_u8().map(Arc::<[u8]>::from)
+    }
+
+    #[cfg(any(test, doc))]
+    pub fn solid_red(width: u32, height: u32) -> Self {
+        let mut pixels = vec![0u8; width as usize * height as usize * 3];
+        for chunk in pixels.chunks_exact_mut(3) {
+            chunk.copy_from_slice(&[255, 0, 0]);
+        }
+        Self::from_u8_interleaved(width, height, 3, ColorSpace::Rgb, pixels)
+            .expect("solid red test tile dimensions are valid")
+    }
+
+    fn expected_samples(&self) -> usize {
+        self.width as usize * self.height as usize * self.channels as usize
+    }
+
+    fn validate_len<T>(&self, samples: &[T]) -> Result<(), WsiError> {
+        if samples.len() == self.expected_samples() {
+            Ok(())
+        } else {
+            Err(WsiError::DisplayConversion(format!(
+                "buffer size mismatch: expected {} samples, got {}",
+                self.expected_samples(),
+                samples.len()
+            )))
+        }
+    }
+
+    fn u8_triplet_at(&self, bytes: &[u8], idx: usize) -> Result<[u8; 3], WsiError> {
+        match self.layout {
+            CpuTileLayout::Interleaved => {
+                let base = idx * 3;
+                Ok([bytes[base], bytes[base + 1], bytes[base + 2]])
+            }
+            CpuTileLayout::Planar => {
+                let plane = self.width as usize * self.height as usize;
+                Ok([bytes[idx], bytes[plane + idx], bytes[2 * plane + idx]])
+            }
+        }
+    }
+
+    fn u8_quad_at(&self, bytes: &[u8], idx: usize) -> Result<[u8; 4], WsiError> {
+        match self.layout {
+            CpuTileLayout::Interleaved => {
+                let base = idx * 4;
+                Ok([
+                    bytes[base],
+                    bytes[base + 1],
+                    bytes[base + 2],
+                    bytes[base + 3],
+                ])
+            }
+            CpuTileLayout::Planar => {
+                let plane = self.width as usize * self.height as usize;
+                Ok([
+                    bytes[idx],
+                    bytes[plane + idx],
+                    bytes[2 * plane + idx],
+                    bytes[3 * plane + idx],
+                ])
+            }
+        }
+    }
+
+    fn u16_triplet_at(&self, samples: &[u16], idx: usize) -> Result<[u16; 3], WsiError> {
+        match self.layout {
+            CpuTileLayout::Interleaved => {
+                let base = idx * 3;
+                Ok([samples[base], samples[base + 1], samples[base + 2]])
+            }
+            CpuTileLayout::Planar => {
+                let plane = self.width as usize * self.height as usize;
+                Ok([samples[idx], samples[plane + idx], samples[2 * plane + idx]])
+            }
+        }
+    }
+
+    /// Convert Uint8 data to RgbaImage. Returns error for non-Uint8 data.
+    pub fn to_rgba(&self) -> Result<image::RgbaImage, WsiError> {
+        let bytes = self.data.as_u8().ok_or_else(|| {
+            WsiError::DisplayConversion(
+                "to_rgba() requires Uint8 data; use to_rgba_windowed() for Uint16/Float32".into(),
+            )
+        })?;
+        self.validate_len(bytes)?;
+        match &self.color_space {
+            ColorSpace::Rgba if self.channels == 4 => {
+                let pixel_count = self.width as usize * self.height as usize;
+                let mut rgba = Vec::with_capacity(pixel_count * 4);
+                for idx in 0..pixel_count {
+                    rgba.extend_from_slice(&self.u8_quad_at(bytes, idx)?);
+                }
+                image::RgbaImage::from_raw(self.width, self.height, rgba)
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+            ColorSpace::Rgb if self.channels == 3 => {
+                let pixel_count = self.width as usize * self.height as usize;
+                let mut rgba = Vec::with_capacity(pixel_count * 4);
+                for idx in 0..pixel_count {
+                    rgba.extend_from_slice(&self.u8_triplet_at(bytes, idx)?);
+                    rgba.push(255);
+                }
+                image::RgbaImage::from_raw(self.width, self.height, rgba)
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+            ColorSpace::Grayscale if self.channels == 1 => {
+                let mut rgba = Vec::with_capacity((self.width * self.height * 4) as usize);
+                for &val in bytes {
+                    rgba.extend_from_slice(&[val, val, val, 255]);
+                }
+                image::RgbaImage::from_raw(self.width, self.height, rgba)
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+            ColorSpace::YCbCr if self.channels == 3 => {
+                let pixel_count = self.width as usize * self.height as usize;
+                let mut rgba = Vec::with_capacity(pixel_count * 4);
+                for idx in 0..pixel_count {
+                    let [y_raw, cb_raw, cr_raw] = self.u8_triplet_at(bytes, idx)?;
+                    let y = y_raw as f64;
+                    let cb = cb_raw as f64 - 128.0;
+                    let cr = cr_raw as f64 - 128.0;
+                    let r = (y + 1.402 * cr).round().clamp(0.0, 255.0) as u8;
+                    let g = (y - 0.344136 * cb - 0.714136 * cr)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                    let b = (y + 1.772 * cb).round().clamp(0.0, 255.0) as u8;
+                    rgba.extend_from_slice(&[r, g, b, 255]);
+                }
+                image::RgbaImage::from_raw(self.width, self.height, rgba)
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+            ColorSpace::Palette(lut) if self.channels == 1 => {
+                let mut rgba = Vec::with_capacity((self.width * self.height * 4) as usize);
+                for &idx in bytes {
+                    let rgb = lut.get(idx as usize).unwrap_or(&[0, 0, 0]);
+                    rgba.extend_from_slice(rgb);
+                    rgba.push(255);
+                }
+                image::RgbaImage::from_raw(self.width, self.height, rgba)
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+            ColorSpace::Unknown => Err(WsiError::DisplayConversion("unknown color space".into())),
+            other => Err(WsiError::DisplayConversion(format!(
+                "unsupported color space {:?} with {} channels for to_rgba()",
+                other, self.channels
+            ))),
+        }
+    }
+
+    /// Convert this buffer into an owned RgbaImage, reusing the underlying
+    /// byte vector directly when the buffer is already RGBA8 interleaved.
+    pub fn into_rgba(self) -> Result<image::RgbaImage, WsiError> {
+        if let CpuTileData::U8(bytes) = &self.data {
+            self.validate_len(bytes)?;
+        }
+        match self {
+            CpuTile {
+                width,
+                height,
+                channels: 4,
+                color_space: ColorSpace::Rgba,
+                layout: CpuTileLayout::Interleaved,
+                data: CpuTileData::U8(bytes),
+            } => image::RgbaImage::from_raw(width, height, into_owned_vec(bytes))
+                .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into())),
+            buffer => buffer.to_rgba(),
+        }
+    }
+
+    /// Convert any sample type to RgbaImage with explicit windowing.
+    pub fn to_rgba_windowed(&self, window: &DisplayWindow) -> Result<image::RgbaImage, WsiError> {
+        if let CpuTileData::U8(_) = &self.data {
+            return self.to_rgba();
+        }
+        let range = window.max - window.min;
+        if range <= 0.0 {
+            return Err(WsiError::DisplayConversion(
+                "window range must be positive".into(),
+            ));
+        }
+        let pixel_count = (self.width as usize) * (self.height as usize);
+        let mut rgba = Vec::with_capacity(pixel_count * 4);
+
+        match &self.data {
+            CpuTileData::U16(samples) => {
+                self.validate_len(samples)?;
+                if self.channels == 1 {
+                    for &s in samples.iter() {
+                        let v = (((s as f64 - window.min) / range) * 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                        rgba.extend_from_slice(&[v, v, v, 255]);
+                    }
+                } else if self.channels == 3 {
+                    for idx in 0..pixel_count {
+                        for s in self.u16_triplet_at(samples, idx)? {
+                            let v = (((s as f64 - window.min) / range) * 255.0)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                            rgba.push(v);
+                        }
+                        rgba.push(255);
+                    }
+                } else {
+                    return Err(WsiError::DisplayConversion(format!(
+                        "unsupported channel count {} for windowed conversion",
+                        self.channels
+                    )));
+                }
+            }
+            CpuTileData::F32(samples) => {
+                self.validate_len(samples)?;
+                if self.channels == 1 {
+                    for &s in samples.iter() {
+                        let v = (((s as f64 - window.min) / range) * 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                        rgba.extend_from_slice(&[v, v, v, 255]);
+                    }
+                } else if self.channels == 3 && self.layout == CpuTileLayout::Interleaved {
+                    for pixel in samples.chunks_exact(3) {
+                        for &s in pixel {
+                            let v = (((s as f64 - window.min) / range) * 255.0)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                            rgba.push(v);
+                        }
+                        rgba.push(255);
+                    }
+                } else {
+                    return Err(WsiError::DisplayConversion(format!(
+                        "unsupported channel count {} for F32 windowed conversion",
+                        self.channels
+                    )));
+                }
+            }
+            CpuTileData::U8(_) => {
+                return Err(WsiError::DisplayConversion(
+                    "U8 data should not reach windowed conversion path".into(),
+                ));
+            }
+        }
+
+        image::RgbaImage::from_raw(self.width, self.height, rgba)
+            .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+    }
+
+    /// Convert Uint8 data to RgbImage. Direct path for RGB8 and Grayscale;
+    /// other color spaces fall through RGBA conversion.
+    pub fn to_rgb(&self) -> Result<image::RgbImage, WsiError> {
+        let bytes = self.data.as_u8().ok_or_else(|| {
+            WsiError::DisplayConversion(
+                "to_rgb() requires Uint8 data; use to_rgb_windowed() for Uint16/Float32".into(),
+            )
+        })?;
+        self.validate_len(bytes)?;
+
+        match (&self.color_space, self.channels, self.layout) {
+            (ColorSpace::Rgb, 3, CpuTileLayout::Interleaved) => {
+                image::RgbImage::from_raw(self.width, self.height, bytes.to_vec())
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+            (ColorSpace::Grayscale, 1, _) => {
+                let pixel_count = self.width as usize * self.height as usize;
+                let mut rgb_data = Vec::with_capacity(pixel_count * 3);
+                for &val in bytes {
+                    rgb_data.extend_from_slice(&[val, val, val]);
+                }
+                image::RgbImage::from_raw(self.width, self.height, rgb_data)
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+            _ => {
+                // Fallback: go through RGBA and strip alpha
+                let rgba = self.to_rgba()?;
+                let (w, h) = rgba.dimensions();
+                let mut rgb_data = Vec::with_capacity((w * h * 3) as usize);
+                for pixel in rgba.pixels() {
+                    rgb_data.extend_from_slice(&pixel.0[..3]);
+                }
+                image::RgbImage::from_raw(w, h, rgb_data)
+                    .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+            }
+        }
+    }
+
+    /// Convert this buffer into an owned RgbImage, reusing the underlying
+    /// byte vector directly when the buffer is already RGB8 interleaved.
+    pub fn into_rgb(self) -> Result<image::RgbImage, WsiError> {
+        if let CpuTileData::U8(bytes) = &self.data {
+            self.validate_len(bytes)?;
+        }
+        match self {
+            CpuTile {
+                width,
+                height,
+                channels: 3,
+                color_space: ColorSpace::Rgb,
+                layout: CpuTileLayout::Interleaved,
+                data: CpuTileData::U8(bytes),
+            } => image::RgbImage::from_raw(width, height, into_owned_vec(bytes))
+                .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into())),
+            buffer => buffer.to_rgb(),
+        }
+    }
+
+    /// Convert any sample type to RgbImage with explicit windowing.
+    /// Direct path avoids intermediate RGBA allocation.
+    pub fn to_rgb_windowed(&self, window: &DisplayWindow) -> Result<image::RgbImage, WsiError> {
+        if let CpuTileData::U8(_) = &self.data {
+            return self.to_rgb();
+        }
+        let range = window.max - window.min;
+        if range <= 0.0 {
+            return Err(WsiError::DisplayConversion(
+                "window range must be positive".into(),
+            ));
+        }
+        let pixel_count = (self.width as usize) * (self.height as usize);
+        let mut rgb = Vec::with_capacity(pixel_count * 3);
+
+        match &self.data {
+            CpuTileData::U16(samples) => {
+                self.validate_len(samples)?;
+                if self.channels == 1 {
+                    for &s in samples.iter() {
+                        let v = (((s as f64 - window.min) / range) * 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                        rgb.extend_from_slice(&[v, v, v]);
+                    }
+                } else if self.channels == 3 {
+                    for idx in 0..pixel_count {
+                        for s in self.u16_triplet_at(samples, idx)? {
+                            let v = (((s as f64 - window.min) / range) * 255.0)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                            rgb.push(v);
+                        }
+                    }
+                } else {
+                    return Err(WsiError::DisplayConversion(format!(
+                        "unsupported channel count {} for windowed conversion",
+                        self.channels
+                    )));
+                }
+            }
+            CpuTileData::F32(samples) => {
+                self.validate_len(samples)?;
+                if self.channels == 1 {
+                    for &s in samples.iter() {
+                        let v = (((s as f64 - window.min) / range) * 255.0)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                        rgb.extend_from_slice(&[v, v, v]);
+                    }
+                } else if self.channels == 3 && self.layout == CpuTileLayout::Interleaved {
+                    for pixel in samples.chunks_exact(3) {
+                        for &s in pixel {
+                            let v = (((s as f64 - window.min) / range) * 255.0)
+                                .round()
+                                .clamp(0.0, 255.0) as u8;
+                            rgb.push(v);
+                        }
+                    }
+                } else {
+                    return Err(WsiError::DisplayConversion(format!(
+                        "unsupported channel count {} for F32 windowed conversion",
+                        self.channels
+                    )));
+                }
+            }
+            CpuTileData::U8(_) => {
+                return Err(WsiError::DisplayConversion(
+                    "U8 data should not reach windowed conversion path".into(),
+                ));
+            }
+        }
+
+        image::RgbImage::from_raw(self.width, self.height, rgb)
+            .ok_or_else(|| WsiError::DisplayConversion("buffer size mismatch".into()))
+    }
+}
+
+// ── Request types ──────────────────────────────────────────────────
+
+/// Selects a z/c/t plane. Default is (0,0,0) for plain 2D reads.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
+pub struct PlaneSelection {
+    pub z: u32,
+    pub c: u32,
+    pub t: u32,
+}
+
+/// A region request — used by Slide (public API), not by backends.
+#[derive(Debug, Clone)]
+pub struct RegionRequest {
+    pub scene: SceneId,
+    pub series: SeriesId,
+    pub level: LevelIdx,
+    pub plane: PlaneIdx,
+    /// Signed top-left pixel position in level coordinates.
+    pub origin_px: (i64, i64),
+    /// Unsigned region size in pixels.
+    pub size_px: (u32, u32),
+}
+
+impl RegionRequest {
+    /// Construct from the pre-Phase-2 arg shape. Removed in Phase 4 cleanup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn legacy_xywh(
+        scene: usize,
+        series: usize,
+        level: u32,
+        plane: PlaneSelection,
+        x: i64,
+        y: i64,
+        w: u32,
+        h: u32,
+    ) -> Self {
+        Self {
+            scene: SceneId(scene),
+            series: SeriesId(series),
+            level: LevelIdx(level),
+            plane: PlaneIdx(plane),
+            origin_px: (x, y),
+            size_px: (w, h),
+        }
+    }
+}
+
+/// Caller's output preference.
+///
+/// `Cpu` always returns host pixels; the contained `OutputBackendRequest` lets the
+/// codec layer pick the cheapest backend that still hands back host bytes.
+/// `PreferDevice` falls back to CPU silently. `RequireDevice` errors with
+/// `WsiError::Unsupported` if the device path is not available.
+#[derive(Debug, Clone, Default)]
+pub struct DeviceOutputContext {
+    #[cfg(feature = "metal")]
+    metal: Option<crate::output::metal::MetalBackendSessions>,
+}
+
+impl DeviceOutputContext {
+    pub fn none() -> Self {
+        Self {
+            #[cfg(feature = "metal")]
+            metal: None,
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn with_metal(metal: crate::output::metal::MetalBackendSessions) -> Self {
+        Self { metal: Some(metal) }
+    }
+
+    #[cfg(feature = "metal")]
+    pub(crate) fn metal(&self) -> Option<&crate::output::metal::MetalBackendSessions> {
+        self.metal.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputBackendRequest {
+    Auto,
+    Cpu,
+    Metal,
+    Cuda,
+}
+
+impl OutputBackendRequest {
+    pub(crate) fn to_ashlar(self) -> ashlar_core::BackendRequest {
+        match self {
+            Self::Auto => ashlar_core::BackendRequest::Auto,
+            Self::Cpu => ashlar_core::BackendRequest::Cpu,
+            Self::Metal => ashlar_core::BackendRequest::Metal,
+            Self::Cuda => ashlar_core::BackendRequest::Cuda,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TileOutputPreference {
+    Cpu {
+        backend: OutputBackendRequest,
+    },
+    PreferDevice {
+        backend: OutputBackendRequest,
+        context: DeviceOutputContext,
+    },
+    RequireDevice {
+        backend: OutputBackendRequest,
+        context: DeviceOutputContext,
+    },
+}
+
+impl TileOutputPreference {
+    /// CPU-resident output; codec picks cheapest backend that returns host pixels.
+    pub fn cpu() -> Self {
+        Self::Cpu {
+            backend: OutputBackendRequest::Auto,
+        }
+    }
+
+    /// CPU-resident output with an explicit CPU backend request.
+    pub fn cpu_only() -> Self {
+        Self::Cpu {
+            backend: OutputBackendRequest::Cpu,
+        }
+    }
+
+    /// Prefer device output, fall back to CPU silently.
+    pub fn prefer_device_auto() -> Self {
+        Self::PreferDevice {
+            backend: OutputBackendRequest::Auto,
+            context: DeviceOutputContext::none(),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn prefer_device_auto_with_metal(
+        sessions: crate::output::metal::MetalBackendSessions,
+    ) -> Self {
+        Self::PreferDevice {
+            backend: OutputBackendRequest::Auto,
+            context: DeviceOutputContext::with_metal(sessions),
+        }
+    }
+
+    /// Require Metal device output. Returns Unsupported on fallback.
+    pub fn require_metal() -> Self {
+        Self::RequireDevice {
+            backend: OutputBackendRequest::Metal,
+            context: DeviceOutputContext::none(),
+        }
+    }
+
+    pub fn backend(&self) -> OutputBackendRequest {
+        match self {
+            Self::Cpu { backend }
+            | Self::PreferDevice { backend, .. }
+            | Self::RequireDevice { backend, .. } => *backend,
+        }
+    }
+
+    pub fn requires_device(&self) -> bool {
+        matches!(self, Self::RequireDevice { .. })
+    }
+
+    pub fn prefers_device(&self) -> bool {
+        matches!(self, Self::PreferDevice { .. } | Self::RequireDevice { .. })
+    }
+
+    #[cfg(feature = "metal")]
+    pub(crate) fn metal_sessions(&self) -> Option<&crate::output::metal::MetalBackendSessions> {
+        match self {
+            Self::PreferDevice { context, .. } | Self::RequireDevice { context, .. } => {
+                context.metal()
+            }
+            Self::Cpu { .. } => None,
+        }
+    }
+}
+
+/// Output payload from `SlideReader::read_tiles` and friends.
+#[derive(Debug, Clone)]
+pub enum TilePixels {
+    Cpu(CpuTile),
+    Device(DeviceTile),
+}
+
+/// Renderer-uploadable device payload. Real payload fields land in Phase 5.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum DeviceTile {
+    #[cfg(feature = "metal")]
+    Metal(crate::output::metal::MetalDeviceTile),
+    #[cfg(feature = "cuda")]
+    Cuda(CudaDeviceTile),
+}
+
+/// Phase-5 placeholder. See `MetalDeviceTile`.
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone)]
+pub struct CudaDeviceTile {
+    _phase5_placeholder: (),
+}
+
+/// A single-tile request — the backend primitive.
+#[derive(Debug, Clone)]
+pub struct TileRequest {
+    pub scene: usize,
+    pub series: usize,
+    pub level: u32,
+    pub plane: PlaneSelection,
+    pub col: i64,
+    pub row: i64,
+}
+
+/// A viewer/display-tile request.
+///
+/// Unlike `TileRequest`, this is expressed in the viewer's regular display grid
+/// rather than the storage-native tile layout. Backends may satisfy it from
+/// native tiles, cached decode bands, or region composition as appropriate.
+#[derive(Debug, Clone)]
+pub struct TileViewRequest {
+    pub scene: usize,
+    pub series: usize,
+    pub level: u32,
+    pub plane: PlaneSelection,
+    pub col: i64,
+    pub row: i64,
+    pub tile_width: u32,
+    pub tile_height: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- AxesShape ---
+
+    #[test]
+    fn axes_shape_default_is_2d() {
+        let axes = AxesShape::default();
+        assert_eq!(axes.z, 1);
+        assert_eq!(axes.c, 1);
+        assert_eq!(axes.t, 1);
+    }
+
+    // --- PlaneSelection ---
+
+    #[test]
+    fn plane_selection_default_is_origin() {
+        let plane = PlaneSelection::default();
+        assert_eq!(plane.z, 0);
+        assert_eq!(plane.c, 0);
+        assert_eq!(plane.t, 0);
+    }
+
+    // --- DatasetId ---
+
+    #[test]
+    fn dataset_id_equality() {
+        let a = DatasetId(42);
+        let b = DatasetId(42);
+        let c = DatasetId(99);
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn dataset_id_hash_consistent() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(DatasetId(1));
+        set.insert(DatasetId(1));
+        assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn tile_output_preference_constructors_map_correctly() {
+        match TileOutputPreference::cpu() {
+            TileOutputPreference::Cpu { backend } => {
+                assert!(matches!(backend, OutputBackendRequest::Auto));
+            }
+            other => panic!("cpu() must produce Cpu/Auto, got {other:?}"),
+        }
+        match TileOutputPreference::cpu_only() {
+            TileOutputPreference::Cpu { backend } => {
+                assert!(matches!(backend, OutputBackendRequest::Cpu));
+            }
+            other => panic!("cpu_only() must produce Cpu/Cpu, got {other:?}"),
+        }
+        assert!(matches!(
+            TileOutputPreference::prefer_device_auto(),
+            TileOutputPreference::PreferDevice {
+                backend: OutputBackendRequest::Auto,
+                ..
+            }
+        ));
+        assert!(matches!(
+            TileOutputPreference::require_metal(),
+            TileOutputPreference::RequireDevice {
+                backend: OutputBackendRequest::Metal,
+                ..
+            }
+        ));
+    }
+
+    // --- TileLayout intersection ---
+
+    #[test]
+    fn regular_tiles_for_region_basic() {
+        let layout = TileLayout::Regular {
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: 4,
+            tiles_down: 4,
+        };
+        // 300x300 at (100, 100) → cols 0-1, rows 0-1 → 4 tiles
+        let tiles = layout.tiles_for_region(100, 100, 300, 300);
+        assert_eq!(tiles.len(), 4);
+        let coords: Vec<(i64, i64)> = tiles.iter().map(|t| (t.col, t.row)).collect();
+        assert!(coords.contains(&(0, 0)));
+        assert!(coords.contains(&(1, 0)));
+        assert!(coords.contains(&(0, 1)));
+        assert!(coords.contains(&(1, 1)));
+    }
+
+    #[test]
+    fn regular_tiles_single_tile() {
+        let layout = TileLayout::Regular {
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: 4,
+            tiles_down: 4,
+        };
+        let tiles = layout.tiles_for_region(0, 0, 100, 100);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].col, 0);
+        assert_eq!(tiles[0].row, 0);
+    }
+
+    #[test]
+    fn regular_tiles_clipped_at_bounds() {
+        let layout = TileLayout::Regular {
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: 2,
+            tiles_down: 2,
+        };
+        // Region extends beyond grid
+        let tiles = layout.tiles_for_region(256, 256, 512, 512);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].col, 1);
+        assert_eq!(tiles[0].row, 1);
+    }
+
+    #[test]
+    fn regular_tiles_negative_coords() {
+        let layout = TileLayout::Regular {
+            tile_width: 256,
+            tile_height: 256,
+            tiles_across: 4,
+            tiles_down: 4,
+        };
+        // Negative start — only in-bounds tiles returned
+        let tiles = layout.tiles_for_region(-100, -100, 200, 200);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].col, 0);
+        assert_eq!(tiles[0].row, 0);
+    }
+
+    #[test]
+    fn whole_level_tiles_for_region() {
+        let layout = TileLayout::WholeLevel {
+            width: 1024,
+            height: 768,
+            virtual_tile_width: 256,
+            virtual_tile_height: 256,
+        };
+        // Region covering the entire image → ceil(1024/256) * ceil(768/256) = 4*3 = 12 tiles
+        let tiles = layout.tiles_for_region(0, 0, 1024, 768);
+        assert_eq!(tiles.len(), 12);
+    }
+
+    #[test]
+    fn whole_level_small_region() {
+        let layout = TileLayout::WholeLevel {
+            width: 4096,
+            height: 4096,
+            virtual_tile_width: 512,
+            virtual_tile_height: 512,
+        };
+        // 100x100 at origin → 1 tile
+        let tiles = layout.tiles_for_region(0, 0, 100, 100);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].col, 0);
+        assert_eq!(tiles[0].row, 0);
+    }
+
+    #[test]
+    fn whole_level_negative_coords_clamp_to_first_tile() {
+        let layout = TileLayout::WholeLevel {
+            width: 1024,
+            height: 1024,
+            virtual_tile_width: 256,
+            virtual_tile_height: 256,
+        };
+
+        let tiles = layout.tiles_for_region(-300, -300, 400, 400);
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].col, 0);
+        assert_eq!(tiles[0].row, 0);
+        assert_eq!(tiles[0].dest_x, 300);
+        assert_eq!(tiles[0].dest_y, 300);
+    }
+
+    #[test]
+    fn irregular_tiles_for_region_basic() {
+        let mut tiles_map = std::collections::HashMap::new();
+        tiles_map.insert(
+            (0i64, 0i64),
+            TileEntry {
+                offset: (0.0, 0.0),
+                dimensions: (256, 256),
+                tiff_tile_index: None,
+            },
+        );
+        tiles_map.insert(
+            (1, 0),
+            TileEntry {
+                offset: (5.0, 0.0),
+                dimensions: (256, 256),
+                tiff_tile_index: None,
+            },
+        );
+        tiles_map.insert(
+            (0, 1),
+            TileEntry {
+                offset: (0.0, 3.0),
+                dimensions: (256, 256),
+                tiff_tile_index: None,
+            },
+        );
+
+        let layout = TileLayout::Irregular {
+            tile_advance: (256.0, 256.0),
+            extra_tiles: (1, 0, 1, 0),
+            tiles: tiles_map,
+        };
+
+        let result = layout.tiles_for_region(0, 0, 512, 512);
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn irregular_tiles_negative_offset() {
+        let mut tiles_map = std::collections::HashMap::new();
+        tiles_map.insert(
+            (0i64, 0i64),
+            TileEntry {
+                offset: (-10.0, -5.0),
+                dimensions: (256, 256),
+                tiff_tile_index: None,
+            },
+        );
+
+        let layout = TileLayout::Irregular {
+            tile_advance: (256.0, 256.0),
+            extra_tiles: (0, 1, 0, 1),
+            tiles: tiles_map,
+        };
+
+        // Tile actual position is (-10, -5) to (246, 251)
+        // Region (0, 0, 100, 100) should hit it
+        let result = layout.tiles_for_region(0, 0, 100, 100);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].dest_x, -10);
+        assert_eq!(result[0].dest_y, -5);
+    }
+
+    #[test]
+    fn irregular_tiles_no_match() {
+        let mut tiles_map = std::collections::HashMap::new();
+        tiles_map.insert(
+            (0i64, 0i64),
+            TileEntry {
+                offset: (0.0, 0.0),
+                dimensions: (256, 256),
+                tiff_tile_index: None,
+            },
+        );
+
+        let layout = TileLayout::Irregular {
+            tile_advance: (256.0, 256.0),
+            extra_tiles: (0, 0, 0, 0),
+            tiles: tiles_map,
+        };
+
+        let result = layout.tiles_for_region(10000, 10000, 100, 100);
+        assert_eq!(result.len(), 0);
+    }
+
+    // --- Compression ---
+
+    #[test]
+    fn compression_equality() {
+        assert_eq!(Compression::Jpeg, Compression::Jpeg);
+        assert_ne!(Compression::Jpeg, Compression::Jp2kRgb);
+        assert_eq!(Compression::Other(99), Compression::Other(99));
+        assert_ne!(Compression::Other(99), Compression::Other(100));
+    }
+
+    // --- SampleType ---
+
+    #[test]
+    fn sample_type_byte_size() {
+        assert_eq!(SampleType::Uint8.byte_size(), 1);
+        assert_eq!(SampleType::Uint16.byte_size(), 2);
+        assert_eq!(SampleType::Float32.byte_size(), 4);
+    }
+
+    // --- CpuTile display conversion ---
+
+    #[test]
+    fn to_rgba_from_rgb_u8() {
+        let buf = CpuTile {
+            width: 2,
+            height: 1,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(vec![255, 0, 0, 0, 255, 0]),
+        };
+        let img = buf.to_rgba().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn to_rgba_from_rgb_u8_planar() {
+        let buf = CpuTile {
+            width: 2,
+            height: 1,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Planar,
+            data: CpuTileData::u8(vec![255, 0, 0, 255, 0, 0]),
+        };
+        let img = buf.to_rgba().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn to_rgba_from_grayscale_u8() {
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Grayscale,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(vec![128]),
+        };
+        let img = buf.to_rgba().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn to_rgba_from_palette() {
+        let lut = vec![[255, 0, 0], [0, 255, 0]];
+        let buf = CpuTile {
+            width: 2,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Palette(Arc::new(lut)),
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(vec![0, 1]),
+        };
+        let img = buf.to_rgba().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn to_rgba_rejects_non_u8() {
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Grayscale,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u16(vec![1000]),
+        };
+        assert!(buf.to_rgba().is_err());
+    }
+
+    #[test]
+    fn to_rgba_windowed_u16() {
+        let buf = CpuTile {
+            width: 2,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Grayscale,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u16(vec![0, 1000]),
+        };
+        let window = DisplayWindow {
+            min: 0.0,
+            max: 1000.0,
+        };
+        let img = buf.to_rgba_windowed(&window).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0[0], 0); // 0 maps to 0
+        assert_eq!(img.get_pixel(1, 0).0[0], 255); // 1000 maps to 255
+    }
+
+    #[test]
+    fn to_rgba_windowed_u16_planar_rgb() {
+        let buf = CpuTile {
+            width: 2,
+            height: 1,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Planar,
+            data: CpuTileData::u16(vec![0, 1000, 0, 1000, 0, 0]),
+        };
+        let window = DisplayWindow {
+            min: 0.0,
+            max: 1000.0,
+        };
+        let img = buf.to_rgba_windowed(&window).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [255, 255, 0, 255]);
+    }
+
+    #[test]
+    fn to_rgba_windowed_zero_range_errors() {
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Grayscale,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u16(vec![100]),
+        };
+        let window = DisplayWindow {
+            min: 50.0,
+            max: 50.0,
+        };
+        assert!(buf.to_rgba_windowed(&window).is_err());
+    }
+
+    #[test]
+    fn to_rgb_from_rgb_u8() {
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(vec![100, 150, 200]),
+        };
+        let img = buf.to_rgb().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [100, 150, 200]);
+    }
+
+    #[test]
+    fn into_rgb_reuses_interleaved_rgb_storage() {
+        let raw = vec![100, 150, 200];
+        let ptr = raw.as_ptr();
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(raw),
+        };
+        let img = buf.into_rgb().unwrap();
+        assert_eq!(img.as_raw().as_ptr(), ptr);
+        assert_eq!(img.get_pixel(0, 0).0, [100, 150, 200]);
+    }
+
+    #[test]
+    fn into_rgba_reuses_interleaved_rgba_storage() {
+        let raw = vec![100, 150, 200, 255];
+        let ptr = raw.as_ptr();
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 4,
+            color_space: ColorSpace::Rgba,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(raw),
+        };
+        let img = buf.into_rgba().unwrap();
+        assert_eq!(img.as_raw().as_ptr(), ptr);
+        assert_eq!(img.get_pixel(0, 0).0, [100, 150, 200, 255]);
+    }
+
+    // --- CpuTile::new() ---
+
+    #[test]
+    fn sample_buffer_new_valid() {
+        let buf = CpuTile::new(
+            2,
+            1,
+            3,
+            ColorSpace::Rgb,
+            CpuTileLayout::Interleaved,
+            CpuTileData::u8(vec![0; 6]),
+        );
+        assert!(buf.is_ok());
+        assert_eq!(buf.unwrap().width, 2);
+    }
+
+    #[test]
+    fn sample_buffer_new_invalid_length() {
+        let buf = CpuTile::new(
+            2,
+            1,
+            3,
+            ColorSpace::Rgb,
+            CpuTileLayout::Interleaved,
+            CpuTileData::u8(vec![0; 5]),
+        );
+        assert!(buf.is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "CpuTile::new_for_test currently stores packed interleaved data")]
+    fn cpu_tile_new_for_test_rejects_padded_stride() {
+        CpuTile::new_for_test(
+            Arc::<[u8]>::from(vec![0u8; 32]),
+            2,
+            2,
+            16,
+            PixelFormat::Rgba8,
+        );
+    }
+
+    #[test]
+    fn sample_buffer_new_overflow_dimensions() {
+        let buf = CpuTile::new(
+            u32::MAX,
+            u32::MAX,
+            3,
+            ColorSpace::Rgb,
+            CpuTileLayout::Interleaved,
+            CpuTileData::u8(vec![]),
+        );
+        assert!(buf.is_err());
+    }
+
+    // --- Direct to_rgb() paths ---
+
+    #[test]
+    fn to_rgb_direct_path_rgb8() {
+        let buf = CpuTile {
+            width: 2,
+            height: 1,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(vec![255, 0, 0, 0, 255, 0]),
+        };
+        let img = buf.to_rgb().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0]);
+    }
+
+    #[test]
+    fn to_rgb_direct_path_grayscale() {
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Grayscale,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(vec![128]),
+        };
+        let img = buf.to_rgb().unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [128, 128, 128]);
+    }
+
+    #[test]
+    fn to_rgb_rejects_non_u8() {
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Grayscale,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u16(vec![1000]),
+        };
+        assert!(buf.to_rgb().is_err());
+    }
+
+    #[test]
+    fn to_rgb_windowed_u16_direct() {
+        let buf = CpuTile {
+            width: 2,
+            height: 1,
+            channels: 1,
+            color_space: ColorSpace::Grayscale,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u16(vec![0, 1000]),
+        };
+        let window = DisplayWindow {
+            min: 0.0,
+            max: 1000.0,
+        };
+        let img = buf.to_rgb_windowed(&window).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(img.get_pixel(1, 0).0, [255, 255, 255]);
+    }
+
+    #[test]
+    fn to_rgb_windowed_f32_3ch_direct() {
+        let buf = CpuTile {
+            width: 1,
+            height: 1,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::f32(vec![0.0, 0.5, 1.0]),
+        };
+        let window = DisplayWindow { min: 0.0, max: 1.0 };
+        let img = buf.to_rgb_windowed(&window).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [0, 128, 255]);
+    }
+
+    // --- Arc Palette ---
+
+    #[test]
+    fn palette_clone_is_cheap() {
+        let lut = Arc::new(vec![[255, 0, 0]; 256]);
+        let cs = ColorSpace::Palette(lut.clone());
+        let cs2 = cs.clone();
+        drop(cs2);
+        assert_eq!(Arc::strong_count(&lut), 2); // original + cs
+    }
+}

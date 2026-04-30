@@ -1,0 +1,2388 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use ashlar_core::BackendRequest;
+use dicom_dictionary_std::{tags, uids};
+use dicom_object::{meta::FileMetaTable, DefaultDicomObject, OpenFileOptions};
+use dicom_parser::dataset::{lazy_read::LazyDataSetReader, LazyDataToken};
+use dicom_parser::stateful::decode::StatefulDecode;
+use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
+use image::imageops;
+use lru::LruCache;
+
+use crate::core::hash::Quickhash1;
+use crate::core::registry::{
+    DatasetReader, FormatProbe, ProbeConfidence, ProbeResult, SlideReader,
+};
+use crate::core::types::*;
+use crate::decode::jp2k::{decode_batch_jp2k, Jp2kDecodeJob};
+use crate::decode::jpeg::{decode_batch_jpeg, JpegDecodeJob};
+use crate::error::WsiError;
+use crate::properties::Properties;
+
+const LEVEL_IMAGE_TYPES: &[&[&str]] = &[
+    &["ORIGINAL", "PRIMARY", "VOLUME", "NONE"],
+    &["DERIVED", "PRIMARY", "VOLUME", "NONE"],
+    &["DERIVED", "PRIMARY", "VOLUME", "RESAMPLED"],
+];
+const LABEL_IMAGE_TYPES: &[&[&str]] = &[
+    &["ORIGINAL", "PRIMARY", "LABEL", "NONE"],
+    &["DERIVED", "PRIMARY", "LABEL", "NONE"],
+];
+const OVERVIEW_IMAGE_TYPES: &[&[&str]] = &[
+    &["ORIGINAL", "PRIMARY", "OVERVIEW", "NONE"],
+    &["DERIVED", "PRIMARY", "OVERVIEW", "NONE"],
+];
+const THUMBNAIL_IMAGE_TYPES: &[&[&str]] = &[
+    &["ORIGINAL", "PRIMARY", "THUMBNAIL", "RESAMPLED"],
+    &["DERIVED", "PRIMARY", "THUMBNAIL", "RESAMPLED"],
+];
+const SUPPORTED_TRANSFER_SYNTAXES: &[&str] = &[
+    uids::IMPLICIT_VR_LITTLE_ENDIAN,
+    uids::EXPLICIT_VR_LITTLE_ENDIAN,
+    EXPLICIT_VR_BIG_ENDIAN_TRANSFER_SYNTAX,
+    uids::JPEG_BASELINE8_BIT,
+    uids::JPEG2000_LOSSLESS,
+    uids::JPEG2000,
+    uids::RLE_LOSSLESS,
+];
+const JPEG_TRANSFER_SYNTAX: &str = uids::JPEG_BASELINE8_BIT;
+const RLE_TRANSFER_SYNTAX: &str = uids::RLE_LOSSLESS;
+const EXPLICIT_VR_BIG_ENDIAN_TRANSFER_SYNTAX: &str = "1.2.840.10008.1.2.2";
+const JP2K_TRANSFER_SYNTAXES: &[&str] = &[uids::JPEG2000_LOSSLESS, uids::JPEG2000];
+
+fn is_encapsulated_transfer_syntax(uid: &str) -> bool {
+    uid == JPEG_TRANSFER_SYNTAX
+        || uid == RLE_TRANSFER_SYNTAX
+        || JP2K_TRANSFER_SYNTAXES.contains(&uid)
+}
+
+pub(crate) struct DicomBackend {
+    probe_cache: Mutex<LruCache<PathBuf, Arc<DicomSlide>>>,
+}
+
+impl DicomBackend {
+    pub(crate) fn new() -> Self {
+        Self {
+            probe_cache: Mutex::new(LruCache::new(NonZeroUsize::new(4).unwrap())),
+        }
+    }
+
+    fn cache_key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    fn parse(&self, path: &Path) -> Result<Arc<DicomSlide>, WsiError> {
+        Ok(Arc::new(DicomSlide::parse(path)?))
+    }
+}
+
+impl Default for DicomBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatProbe for DicomBackend {
+    fn probe(&self, path: &Path) -> Result<ProbeResult, WsiError> {
+        let key = Self::cache_key(path);
+        if self
+            .probe_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .is_some()
+        {
+            return Ok(ProbeResult {
+                detected: true,
+                vendor: "dicom".into(),
+                confidence: ProbeConfidence::Definite,
+            });
+        }
+        match parse_metadata_object(path) {
+            Ok(meta) if is_vl_wsi(meta.obj.meta().media_storage_sop_class_uid()) => {
+                let slide = self.parse(path)?;
+                self.probe_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .put(key, slide);
+                Ok(ProbeResult {
+                    detected: true,
+                    vendor: "dicom".into(),
+                    confidence: ProbeConfidence::Definite,
+                })
+            }
+            Ok(_) => Ok(ProbeResult {
+                detected: false,
+                vendor: String::new(),
+                confidence: ProbeConfidence::Likely,
+            }),
+            Err(_) => Ok(ProbeResult {
+                detected: false,
+                vendor: String::new(),
+                confidence: ProbeConfidence::Likely,
+            }),
+        }
+    }
+}
+
+impl DatasetReader for DicomBackend {
+    fn open(&self, path: &Path) -> Result<Box<dyn SlideReader>, WsiError> {
+        let key = Self::cache_key(path);
+        let cached = self
+            .probe_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .cloned();
+        let slide = match cached {
+            Some(slide) => slide,
+            None => self.parse(path)?,
+        };
+        Ok(Box::new(DicomReader { slide }))
+    }
+}
+
+struct DicomReader {
+    slide: Arc<DicomSlide>,
+}
+
+impl SlideReader for DicomReader {
+    fn dataset(&self) -> &Dataset {
+        &self.slide.dataset
+    }
+
+    fn use_display_tile_cache(&self, _req: &TileViewRequest) -> bool {
+        true
+    }
+
+    fn read_tiles(
+        &self,
+        reqs: &[TileRequest],
+        output: TileOutputPreference,
+    ) -> Result<Vec<TilePixels>, WsiError> {
+        let backend = (match output {
+            TileOutputPreference::Cpu { backend }
+            | TileOutputPreference::PreferDevice { backend, .. } => backend,
+            TileOutputPreference::RequireDevice { .. } => {
+                return Err(WsiError::Unsupported {
+                    reason: "RequireDevice not supported for DICOM in Phase 2".into(),
+                });
+            }
+        })
+        .to_ashlar();
+        reqs.iter()
+            .map(|req| {
+                self.read_tile_with_backend(req, backend)
+                    .map(TilePixels::Cpu)
+            })
+            .collect()
+    }
+
+    fn read_tile_cpu(&self, req: &TileRequest) -> Result<CpuTile, WsiError> {
+        self.read_tile_with_backend(req, BackendRequest::Auto)
+    }
+
+    fn read_associated(&self, name: &str) -> Result<CpuTile, WsiError> {
+        let image = self
+            .slide
+            .associated
+            .get(name)
+            .ok_or_else(|| WsiError::AssociatedImageNotFound(name.into()))?;
+        image.read_associated(name)
+    }
+}
+
+impl DicomReader {
+    fn read_tile_with_backend(
+        &self,
+        req: &TileRequest,
+        backend: BackendRequest,
+    ) -> Result<CpuTile, WsiError> {
+        let image = self
+            .slide
+            .levels
+            .get(req.level as usize)
+            .ok_or(WsiError::LevelOutOfRange {
+                level: req.level,
+                count: self.slide.levels.len() as u32,
+            })?;
+        image.read_tile(req.col, req.row, req.level, backend)
+    }
+}
+
+struct DicomSlide {
+    dataset: Dataset,
+    levels: Vec<DicomLevel>,
+    associated: HashMap<String, Arc<DicomImage>>,
+}
+
+impl DicomSlide {
+    fn parse(path: &Path) -> Result<Self, WsiError> {
+        let start_meta = parse_metadata_object(path)?;
+        let start_meta_level0_properties = parse_level0_properties_from_metadata(&start_meta);
+        let start_series_uid = start_meta.series_instance_uid.clone();
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let start_key = canonicalize_or_fallback(path);
+
+        let mut level_images = Vec::new();
+        let mut associated_images = Vec::new();
+        match start_meta.classify()? {
+            ImageRole::Ignore => {}
+            ImageRole::Level => level_images.push(Arc::new(DicomImage::from_metadata(start_meta)?)),
+            ImageRole::Associated(kind) => {
+                associated_images.push((
+                    kind.name().to_string(),
+                    Arc::new(DicomImage::from_metadata(start_meta)?),
+                ));
+            }
+        }
+
+        for entry in std::fs::read_dir(dir).map_err(|source| WsiError::IoWithPath {
+            source: Arc::new(source),
+            path: dir.to_path_buf(),
+        })? {
+            let entry = entry?;
+            let sibling_path = entry.path();
+            if !sibling_path.is_file() || canonicalize_or_fallback(&sibling_path) == start_key {
+                continue;
+            }
+            let meta = match parse_metadata_object(&sibling_path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            if meta.series_instance_uid != start_series_uid {
+                continue;
+            }
+            match meta.classify()? {
+                ImageRole::Ignore => {}
+                ImageRole::Level => level_images.push(Arc::new(DicomImage::from_metadata(meta)?)),
+                ImageRole::Associated(kind) => {
+                    associated_images.push((
+                        kind.name().to_string(),
+                        Arc::new(DicomImage::from_metadata(meta)?),
+                    ));
+                }
+            }
+        }
+
+        if level_images.is_empty() {
+            return Err(invalid_slide(path, "No pyramid levels found"));
+        }
+
+        dedupe_associated(path, &mut associated_images)?;
+        let mut levels = build_levels(path, level_images)?;
+        levels.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
+
+        let level0 = levels
+            .first()
+            .ok_or_else(|| invalid_slide(path, "No pyramid levels found"))?
+            .clone();
+
+        let quickhash = quickhash_for_series_uid(&start_series_uid)?;
+        let dataset_id = dataset_id_from_quickhash(path, &quickhash)?;
+        let largest_dimensions = (level0.width, level0.height);
+        let public_levels = levels
+            .iter()
+            .map(|level| Level {
+                dimensions: (level.width as u64, level.height as u64),
+                downsample: largest_dimensions.0 as f64 / level.width as f64,
+                tile_layout: TileLayout::Regular {
+                    tile_width: level.tile_width,
+                    tile_height: level.tile_height,
+                    tiles_across: level.tiles_across as u64,
+                    tiles_down: level.tiles_down as u64,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let mut properties = Properties::new();
+        properties.insert("openslide.vendor", "dicom");
+        properties.insert("openslide.quickhash-1", quickhash);
+        let (shared_pixel_spacing, shared_objective_lens_power) =
+            if level0.pixel_spacing.is_none() || level0.objective_lens_power.is_none() {
+                if canonicalize_or_fallback(&level0.path) == start_key {
+                    start_meta_level0_properties
+                } else {
+                    parse_level0_properties(&level0.path).unwrap_or((None, None))
+                }
+            } else {
+                (None, None)
+            };
+        let level0_pixel_spacing = level0.pixel_spacing.or(shared_pixel_spacing);
+        if let Some((mpp_x, mpp_y)) = level0_pixel_spacing {
+            properties.insert("openslide.mpp-x", format!("{mpp_x}"));
+            properties.insert("openslide.mpp-y", format!("{mpp_y}"));
+        }
+        let level0_objective_lens_power =
+            level0.objective_lens_power.or(shared_objective_lens_power);
+        if let Some(objective) = level0_objective_lens_power {
+            properties.insert("openslide.objective-power", format!("{objective}"));
+        }
+
+        let associated_metadata = associated_images
+            .iter()
+            .map(|(name, image)| {
+                (
+                    name.clone(),
+                    AssociatedImage {
+                        dimensions: (image.width, image.height),
+                        sample_type: SampleType::Uint8,
+                        channels: 3,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let associated = associated_images.into_iter().collect::<HashMap<_, _>>();
+
+        let dataset = Dataset {
+            id: dataset_id,
+            scenes: vec![Scene {
+                id: "s0".into(),
+                name: None,
+                series: vec![Series {
+                    id: "ser0".into(),
+                    axes: AxesShape::default(),
+                    levels: public_levels,
+                    sample_type: SampleType::Uint8,
+                    channels: vec![],
+                }],
+            }],
+            associated_images: associated_metadata,
+            properties,
+            icc_profiles: HashMap::new(),
+        };
+
+        Ok(Self {
+            dataset,
+            levels,
+            associated,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct DicomLevel {
+    width: u32,
+    height: u32,
+    tile_width: u32,
+    tile_height: u32,
+    tiles_across: u32,
+    tiles_down: u32,
+    path: PathBuf,
+    pixel_spacing: Option<(f64, f64)>,
+    objective_lens_power: Option<f64>,
+    parts: Vec<Arc<DicomImage>>,
+}
+
+impl DicomLevel {
+    fn from_image(image: Arc<DicomImage>) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            tile_width: image.tile_width,
+            tile_height: image.tile_height,
+            tiles_across: image.tiles_across,
+            tiles_down: image.tiles_down,
+            path: image.path.clone(),
+            pixel_spacing: image.pixel_spacing,
+            objective_lens_power: image.objective_lens_power,
+            parts: vec![image],
+        }
+    }
+
+    fn push_part(&mut self, path: &Path, image: Arc<DicomImage>) -> Result<(), WsiError> {
+        if self
+            .parts
+            .iter()
+            .any(|part| part.sop_instance_uid == image.sop_instance_uid)
+        {
+            return Ok(());
+        }
+        if self.tile_width != image.tile_width
+            || self.tile_height != image.tile_height
+            || self.tiles_across != image.tiles_across
+            || self.tiles_down != image.tiles_down
+            || self.samples_per_pixel() != image.samples_per_pixel
+            || self.planar_configuration() != image.planar_configuration
+            || self.photometric_interpretation() != image.photometric_interpretation
+        {
+            return Err(invalid_slide(
+                path,
+                format!(
+                    "DICOM level {}x{} has incompatible split image {}",
+                    self.width, self.height, image.sop_instance_uid
+                ),
+            ));
+        }
+        self.parts.push(image);
+        Ok(())
+    }
+
+    fn samples_per_pixel(&self) -> u16 {
+        self.parts[0].samples_per_pixel
+    }
+
+    fn planar_configuration(&self) -> Option<u16> {
+        self.parts[0].planar_configuration
+    }
+
+    fn photometric_interpretation(&self) -> &str {
+        &self.parts[0].photometric_interpretation
+    }
+
+    fn read_tile(
+        &self,
+        col: i64,
+        row: i64,
+        level: u32,
+        backend: BackendRequest,
+    ) -> Result<CpuTile, WsiError> {
+        if col < 0 || row < 0 || col >= self.tiles_across as i64 || row >= self.tiles_down as i64 {
+            return Err(WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!(
+                    "tile ({col},{row}) out of range ({}x{})",
+                    self.tiles_across, self.tiles_down
+                ),
+            });
+        }
+
+        let col_u32 = col as u32;
+        let row_u32 = row as u32;
+        for image in &self.parts {
+            if image.frame_index(col_u32, row_u32).is_some() {
+                return image.read_tile(col, row, level, backend);
+            }
+        }
+
+        let (width, height) = self.actual_tile_dimensions(col_u32, row_u32);
+        Ok(black_sample_buffer(width, height))
+    }
+
+    fn actual_tile_dimensions(&self, col: u32, row: u32) -> (u32, u32) {
+        let tile_x = col * self.tile_width;
+        let tile_y = row * self.tile_height;
+        let width = self.width.saturating_sub(tile_x).min(self.tile_width);
+        let height = self.height.saturating_sub(tile_y).min(self.tile_height);
+        (width, height)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AssociatedKind {
+    Label,
+    Macro,
+    Thumbnail,
+}
+
+impl AssociatedKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Label => "label",
+            Self::Macro => "macro",
+            Self::Thumbnail => "thumbnail",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageRole {
+    Level,
+    Associated(AssociatedKind),
+    Ignore,
+}
+
+#[derive(Debug)]
+struct DicomImage {
+    path: PathBuf,
+    sop_instance_uid: String,
+    transfer_syntax_uid: String,
+    photometric_interpretation: String,
+    samples_per_pixel: u16,
+    planar_configuration: Option<u16>,
+    width: u32,
+    height: u32,
+    tile_width: u32,
+    tile_height: u32,
+    tiles_across: u32,
+    tiles_down: u32,
+    number_of_frames: u32,
+    grid: DicomGrid,
+    pixel_spacing: Option<(f64, f64)>,
+    objective_lens_power: Option<f64>,
+    encapsulated_frames: Mutex<Option<Arc<DicomEncapsulatedFrames>>>,
+    encapsulated_frame_cache: Mutex<LruCache<u32, Arc<Vec<u8>>>>,
+    decoded_frame_cache: Mutex<LruCache<u32, Arc<CpuTile>>>,
+    file: Mutex<Option<File>>,
+}
+
+#[derive(Debug)]
+enum DicomGrid {
+    Full,
+    Sparse(HashMap<(u32, u32), u32>),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DicomFragmentRef {
+    payload_offset: u64,
+    item_offset: u64,
+    len: u32,
+}
+
+#[derive(Debug)]
+struct DicomEncapsulatedFrames {
+    fragments: Vec<DicomFragmentRef>,
+    frame_ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl DicomImage {
+    fn from_metadata(meta: ParsedDicomMetadata) -> Result<Self, WsiError> {
+        let width = meta.total_pixel_matrix_columns.unwrap_or(meta.columns);
+        let height = meta.total_pixel_matrix_rows.unwrap_or(meta.rows);
+        let tile_width = meta.columns;
+        let tile_height = meta.rows;
+        let tiles_across = width.div_ceil(tile_width);
+        let tiles_down = height.div_ceil(tile_height);
+        let grid = if meta.dimension_organization_type.as_deref() == Some("TILED_SPARSE") {
+            DicomGrid::Sparse(parse_sparse_tile_map(&meta.obj, tile_width, tile_height)?)
+        } else {
+            DicomGrid::Full
+        };
+        let frame_cache_entries =
+            if JP2K_TRANSFER_SYNTAXES.contains(&meta.transfer_syntax_uid.as_str()) {
+                2
+            } else {
+                1
+            };
+        Ok(Self {
+            path: meta.path,
+            sop_instance_uid: meta.sop_instance_uid,
+            transfer_syntax_uid: meta.transfer_syntax_uid,
+            photometric_interpretation: meta.photometric_interpretation,
+            samples_per_pixel: meta.samples_per_pixel,
+            planar_configuration: meta.planar_configuration,
+            width,
+            height,
+            tile_width,
+            tile_height,
+            tiles_across,
+            tiles_down,
+            number_of_frames: meta.number_of_frames,
+            grid,
+            pixel_spacing: meta.pixel_spacing,
+            objective_lens_power: meta.objective_lens_power,
+            encapsulated_frames: Mutex::new(None),
+            encapsulated_frame_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(frame_cache_entries).unwrap(),
+            )),
+            decoded_frame_cache: Mutex::new(LruCache::new(
+                NonZeroUsize::new(frame_cache_entries).unwrap(),
+            )),
+            file: Mutex::new(None),
+        })
+    }
+
+    fn read_tile(
+        &self,
+        col: i64,
+        row: i64,
+        level: u32,
+        backend: BackendRequest,
+    ) -> Result<CpuTile, WsiError> {
+        let span = tracing::info_span!(
+            "dicom_read_tile",
+            reader = "ziggurat",
+            transfer_syntax = %self.transfer_syntax_uid,
+        );
+        let _guard = span.enter();
+        if col < 0 || row < 0 || col >= self.tiles_across as i64 || row >= self.tiles_down as i64 {
+            return Err(WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!(
+                    "tile ({col},{row}) out of range ({}x{})",
+                    self.tiles_across, self.tiles_down
+                ),
+            });
+        }
+
+        let col_u32 = col as u32;
+        let row_u32 = row as u32;
+        let Some(frame_index) = self.frame_index(col_u32, row_u32) else {
+            let (width, height) = self.actual_tile_dimensions(col_u32, row_u32);
+            return Ok(black_sample_buffer(width, height));
+        };
+
+        let (actual_width, actual_height) = self.actual_tile_dimensions(col_u32, row_u32);
+        let buffer = self.decode_frame_sample_buffer(frame_index, level, col, row, backend)?;
+        Ok(crop_sample_buffer_rgb(buffer, actual_width, actual_height))
+    }
+
+    fn read_associated(&self, name: &str) -> Result<CpuTile, WsiError> {
+        let buffer = self
+            .decode_frame_sample_buffer(0, 0, 0, 0, BackendRequest::Auto)
+            .map_err(|err| match err {
+                WsiError::TileRead { reason, .. } => {
+                    WsiError::AssociatedImageNotFound(format!("{name}: {reason}"))
+                }
+                other => other,
+            })?;
+        Ok(crop_sample_buffer_rgb(buffer, self.width, self.height))
+    }
+
+    fn frame_index(&self, col: u32, row: u32) -> Option<u32> {
+        match &self.grid {
+            DicomGrid::Full => Some(row * self.tiles_across + col),
+            DicomGrid::Sparse(map) => map.get(&(col, row)).copied(),
+        }
+    }
+
+    fn actual_tile_dimensions(&self, col: u32, row: u32) -> (u32, u32) {
+        let tile_x = col * self.tile_width;
+        let tile_y = row * self.tile_height;
+        let width = self.width.saturating_sub(tile_x).min(self.tile_width);
+        let height = self.height.saturating_sub(tile_y).min(self.tile_height);
+        (width, height)
+    }
+
+    fn decode_uncompressed_frame_sample_buffer(
+        &self,
+        frame_index: u32,
+        level: u32,
+        col: i64,
+        row: i64,
+    ) -> Result<CpuTile, WsiError> {
+        let obj = reopen_dicom_object(&self.path)?;
+        let pixel_data = obj
+            .element(tags::PIXEL_DATA)
+            .map_err(|err| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!("missing pixel data: {err}"),
+            })?
+            .to_bytes()
+            .map_err(|err| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!("failed to read DICOM pixel data: {err}"),
+            })?;
+        let frame_len = (self.tile_width as usize)
+            .checked_mul(self.tile_height as usize)
+            .and_then(|pixels| pixels.checked_mul(self.samples_per_pixel as usize))
+            .ok_or_else(|| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: "DICOM frame size overflow".into(),
+            })?;
+        let start = (frame_index as usize)
+            .checked_mul(frame_len)
+            .ok_or_else(|| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: "DICOM frame offset overflow".into(),
+            })?;
+        let end = start
+            .checked_add(frame_len)
+            .ok_or_else(|| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: "DICOM frame byte range overflow".into(),
+            })?;
+        if end > pixel_data.len() {
+            return Err(WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!(
+                    "DICOM frame {frame_index} byte range {}..{} exceeds pixel data length {}",
+                    start,
+                    end,
+                    pixel_data.len()
+                ),
+            });
+        }
+        frame_bytes_to_rgb_tile(
+            &pixel_data[start..end],
+            self.tile_width,
+            self.tile_height,
+            self.samples_per_pixel,
+            self.planar_configuration.unwrap_or(0),
+            &self.photometric_interpretation,
+        )
+        .map_err(|err| WsiError::TileRead {
+            col,
+            row,
+            level,
+            reason: err.to_string(),
+        })
+    }
+
+    fn decode_frame_sample_buffer(
+        &self,
+        frame_index: u32,
+        level: u32,
+        col: i64,
+        row: i64,
+        backend: BackendRequest,
+    ) -> Result<CpuTile, WsiError> {
+        let use_decoded_cache = is_encapsulated_transfer_syntax(&self.transfer_syntax_uid);
+        if use_decoded_cache {
+            if let Some(cached) = self
+                .decoded_frame_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&frame_index)
+                .cloned()
+            {
+                return Ok(cached.as_ref().clone());
+            }
+        }
+
+        let buffer = if self.transfer_syntax_uid == JPEG_TRANSFER_SYNTAX {
+            let bytes =
+                self.extract_encapsulated_frame(frame_index, level, col, row, !use_decoded_cache)?;
+            decode_batch_jpeg(&[JpegDecodeJob {
+                data: Cow::Borrowed(bytes.as_slice()),
+                tables: None,
+                expected_width: self.tile_width,
+                expected_height: self.tile_height,
+                color_transform: ashlar_jpeg::ColorTransform::Auto,
+                force_dimensions: false,
+                requested_size: None,
+            }])
+            .into_iter()
+            .next()
+            .expect("1-element JPEG facade batch")
+            .map_err(|err| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: err.to_string(),
+            })?
+        } else if JP2K_TRANSFER_SYNTAXES.contains(&self.transfer_syntax_uid.as_str()) {
+            let bytes =
+                self.extract_encapsulated_frame(frame_index, level, col, row, !use_decoded_cache)?;
+            decode_batch_jp2k(&[Jp2kDecodeJob {
+                data: Cow::Borrowed(bytes.as_slice()),
+                expected_width: self.tile_width,
+                expected_height: self.tile_height,
+                rgb_color_space: self.photometric_interpretation != "YBR_ICT",
+                backend,
+            }])
+            .into_iter()
+            .next()
+            .expect("1-element JP2K facade batch")
+            .map_err(|err| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: err.to_string(),
+            })?
+        } else if self.transfer_syntax_uid == RLE_TRANSFER_SYNTAX {
+            let bytes =
+                self.extract_encapsulated_frame(frame_index, level, col, row, !use_decoded_cache)?;
+            decode_rle_lossless_frame(
+                bytes.as_slice(),
+                self.tile_width,
+                self.tile_height,
+                self.samples_per_pixel,
+                &self.photometric_interpretation,
+            )
+            .map_err(|err| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: err.to_string(),
+            })?
+        } else {
+            self.decode_uncompressed_frame_sample_buffer(frame_index, level, col, row)?
+        };
+
+        let arc = Arc::new(buffer);
+        if use_decoded_cache {
+            self.decoded_frame_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .put(frame_index, arc.clone());
+        }
+        Ok(arc.as_ref().clone())
+    }
+
+    fn extract_encapsulated_frame(
+        &self,
+        frame_index: u32,
+        level: u32,
+        col: i64,
+        row: i64,
+        cache_result: bool,
+    ) -> Result<Arc<Vec<u8>>, WsiError> {
+        if is_encapsulated_transfer_syntax(&self.transfer_syntax_uid) {
+            if cache_result {
+                if let Some(bytes) = self
+                    .encapsulated_frame_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&frame_index)
+                    .cloned()
+                {
+                    return Ok(bytes);
+                }
+            }
+            let encapsulated_frames = self.ensure_encapsulated_frames()?;
+            let frame_range = encapsulated_frames
+                .frame_ranges
+                .get(frame_index as usize)
+                .ok_or_else(|| WsiError::TileRead {
+                    col,
+                    row,
+                    level,
+                    reason: format!(
+                        "encapsulated frame {frame_index} out of range for {} frames",
+                        encapsulated_frames.frame_ranges.len()
+                    ),
+                })?;
+            let bytes = Arc::new(self.read_encapsulated_fragments(
+                &encapsulated_frames.fragments[frame_range.start..frame_range.end],
+            )?);
+            if cache_result {
+                self.encapsulated_frame_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .put(frame_index, bytes.clone());
+            }
+            return Ok(bytes);
+        }
+
+        let obj = reopen_dicom_object(&self.path)?;
+        let pixel_data = obj
+            .element(tags::PIXEL_DATA)
+            .map_err(|err| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!("missing pixel data: {err}"),
+            })?;
+        let fragments = pixel_data.fragments().ok_or_else(|| WsiError::TileRead {
+            col,
+            row,
+            level,
+            reason: "pixel data is not encapsulated".into(),
+        })?;
+        let number_of_frames = optional_u32(&obj, tags::NUMBER_OF_FRAMES)
+            .map_err(|err| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: err.to_string(),
+            })?
+            .unwrap_or(1);
+
+        if number_of_frames == 1 && fragments.len() > 1 {
+            let total_len = fragments.iter().map(Vec::len).sum();
+            let mut data = Vec::with_capacity(total_len);
+            for fragment in fragments {
+                data.extend_from_slice(fragment);
+            }
+            return Ok(Arc::new(data));
+        }
+
+        fragments
+            .get(frame_index as usize)
+            .map(|fragment| Arc::new(fragment.as_slice().to_vec()))
+            .ok_or_else(|| WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!(
+                    "encapsulated frame {frame_index} out of range for {} fragments",
+                    fragments.len()
+                ),
+            })
+    }
+
+    fn ensure_encapsulated_frames(&self) -> Result<Arc<DicomEncapsulatedFrames>, WsiError> {
+        let mut guard = self
+            .encapsulated_frames
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(frames) = &*guard {
+            return Ok(frames.clone());
+        }
+        let frames = Arc::new(scan_encapsulated_frames(
+            &self.path,
+            &self.transfer_syntax_uid,
+            self.number_of_frames,
+        )?);
+        *guard = Some(frames.clone());
+        Ok(frames)
+    }
+
+    fn read_encapsulated_fragments(
+        &self,
+        fragments: &[DicomFragmentRef],
+    ) -> Result<Vec<u8>, WsiError> {
+        let total_len: usize = fragments.iter().map(|fragment| fragment.len as usize).sum();
+        let mut data = Vec::with_capacity(total_len);
+        self.with_open_file(|file| {
+            for fragment in fragments {
+                file.seek(SeekFrom::Start(fragment.payload_offset))
+                    .map_err(|source| WsiError::IoWithPath {
+                        source: Arc::new(source),
+                        path: self.path.clone(),
+                    })?;
+                let start = data.len();
+                data.resize(start + fragment.len as usize, 0);
+                file.read_exact(&mut data[start..])
+                    .map_err(|source| WsiError::IoWithPath {
+                        source: Arc::new(source),
+                        path: self.path.clone(),
+                    })?;
+            }
+            Ok(())
+        })?;
+        Ok(data)
+    }
+
+    fn with_open_file<T>(
+        &self,
+        f: impl FnOnce(&mut File) -> Result<T, WsiError>,
+    ) -> Result<T, WsiError> {
+        let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let file = File::open(&self.path).map_err(|source| WsiError::IoWithPath {
+                source: Arc::new(source),
+                path: self.path.clone(),
+            })?;
+            *guard = Some(file);
+        }
+        let file = guard.as_mut().expect("file must be initialized");
+        f(file)
+    }
+}
+
+fn reopen_dicom_object(path: &Path) -> Result<DefaultDicomObject, WsiError> {
+    dicom_object::open_file(path).map_err(|source| WsiError::InvalidSlide {
+        path: path.to_path_buf(),
+        message: format!("failed to reopen DICOM object: {source}"),
+    })
+}
+
+fn scan_encapsulated_frames(
+    path: &Path,
+    transfer_syntax_uid: &str,
+    number_of_frames: u32,
+) -> Result<DicomEncapsulatedFrames, WsiError> {
+    let transfer_syntax = TransferSyntaxRegistry
+        .get(transfer_syntax_uid)
+        .ok_or_else(|| {
+            invalid_slide(
+                path,
+                format!("unknown transfer syntax {transfer_syntax_uid}"),
+            )
+        })?;
+    let mut reader = BufReader::new(File::open(path).map_err(|source| WsiError::IoWithPath {
+        source: Arc::new(source),
+        path: path.to_path_buf(),
+    })?);
+    position_reader_for_dicom_magic(&mut reader, path)?;
+    let _meta = FileMetaTable::from_reader(&mut reader)
+        .map_err(|source| invalid_slide(path, format!("cannot parse DICOM file meta: {source}")))?;
+    let mut tokens = LazyDataSetReader::new_with_ts(reader, transfer_syntax)
+        .map_err(|source| invalid_slide(path, format!("cannot stream DICOM dataset: {source}")))?;
+
+    let mut in_pixel_sequence = false;
+    let mut awaiting_offset_table = false;
+    let mut offset_table = Vec::new();
+    let mut fragments = Vec::new();
+
+    while let Some(token) = tokens.advance() {
+        let token = token
+            .map_err(|source| invalid_slide(path, format!("cannot read DICOM token: {source}")))?;
+        match token {
+            LazyDataToken::PixelSequenceStart => {
+                in_pixel_sequence = true;
+                awaiting_offset_table = true;
+            }
+            LazyDataToken::ItemStart { len }
+                if in_pixel_sequence && awaiting_offset_table && len.0 == 0 =>
+            {
+                awaiting_offset_table = false;
+            }
+            LazyDataToken::LazyItemValue { len, decoder }
+                if in_pixel_sequence && awaiting_offset_table =>
+            {
+                decoder
+                    .read_u32_to_vec(len, &mut offset_table)
+                    .map_err(|source| {
+                        invalid_slide(
+                            path,
+                            format!("cannot read DICOM basic offset table: {source}"),
+                        )
+                    })?;
+                awaiting_offset_table = false;
+            }
+            LazyDataToken::LazyItemValue { len, decoder } if in_pixel_sequence => {
+                let payload_offset = decoder.position();
+                let item_offset = payload_offset.saturating_sub(8);
+                decoder.skip_bytes(len).map_err(|source| {
+                    invalid_slide(path, format!("cannot skip DICOM fragment: {source}"))
+                })?;
+                fragments.push(DicomFragmentRef {
+                    payload_offset,
+                    item_offset,
+                    len,
+                });
+            }
+            LazyDataToken::ItemStart { len } if in_pixel_sequence && len.0 == 0 => {
+                return Err(invalid_slide(
+                    path,
+                    "zero-length DICOM pixel fragment is not supported",
+                ));
+            }
+            LazyDataToken::SequenceEnd if in_pixel_sequence => break,
+            other => {
+                other.skip().map_err(|source| {
+                    invalid_slide(path, format!("cannot skip DICOM token: {source}"))
+                })?;
+            }
+        }
+    }
+
+    build_encapsulated_frame_index(path, fragments, offset_table, number_of_frames)
+}
+
+fn build_encapsulated_frame_index(
+    path: &Path,
+    fragments: Vec<DicomFragmentRef>,
+    offset_table: Vec<u32>,
+    number_of_frames: u32,
+) -> Result<DicomEncapsulatedFrames, WsiError> {
+    if number_of_frames == 0 {
+        return Err(invalid_slide(path, "DICOM reported zero frames"));
+    }
+    if fragments.is_empty() {
+        return Err(invalid_slide(
+            path,
+            "DICOM encapsulated pixel data has no fragments",
+        ));
+    }
+
+    let frame_ranges = if number_of_frames == 1 {
+        std::iter::once(0..fragments.len()).collect()
+    } else if !offset_table.is_empty() {
+        let base_item_offset = fragments[0].item_offset;
+        let mut start_indices = Vec::with_capacity(offset_table.len());
+        for offset in &offset_table {
+            let target = base_item_offset + *offset as u64;
+            let index = fragments
+                .iter()
+                .position(|fragment| fragment.item_offset == target)
+                .ok_or_else(|| {
+                    invalid_slide(
+                        path,
+                        format!(
+                            "DICOM basic offset table points to missing fragment offset {offset}"
+                        ),
+                    )
+                })?;
+            start_indices.push(index);
+        }
+        if start_indices.len() != number_of_frames as usize {
+            return Err(invalid_slide(
+                path,
+                format!(
+                    "DICOM basic offset table length {} does not match number_of_frames {}",
+                    start_indices.len(),
+                    number_of_frames
+                ),
+            ));
+        }
+        let mut ranges = Vec::with_capacity(start_indices.len());
+        for (frame, start) in start_indices.iter().copied().enumerate() {
+            let end = start_indices
+                .get(frame + 1)
+                .copied()
+                .unwrap_or(fragments.len());
+            ranges.push(start..end);
+        }
+        ranges
+    } else if fragments.len() == number_of_frames as usize {
+        (0..fragments.len()).map(|index| index..index + 1).collect()
+    } else {
+        return Err(invalid_slide(
+            path,
+            format!(
+                "cannot map {} DICOM fragments to {} frames without a basic offset table",
+                fragments.len(),
+                number_of_frames
+            ),
+        ));
+    };
+
+    Ok(DicomEncapsulatedFrames {
+        fragments,
+        frame_ranges,
+    })
+}
+
+fn position_reader_for_dicom_magic<R: Read + Seek>(
+    reader: &mut R,
+    path: &Path,
+) -> Result<(), WsiError> {
+    let mut preamble = [0u8; 132];
+    reader
+        .read_exact(&mut preamble)
+        .map_err(|source| WsiError::IoWithPath {
+            source: Arc::new(source),
+            path: path.to_path_buf(),
+        })?;
+    let start = if &preamble[128..] == b"DICM" { 128 } else { 0 };
+    reader
+        .seek(SeekFrom::Start(start))
+        .map_err(|source| WsiError::IoWithPath {
+            source: Arc::new(source),
+            path: path.to_path_buf(),
+        })?;
+    Ok(())
+}
+
+struct ParsedDicomMetadata {
+    path: PathBuf,
+    obj: DefaultDicomObject,
+    series_instance_uid: String,
+    sop_instance_uid: String,
+    transfer_syntax_uid: String,
+    photometric_interpretation: String,
+    samples_per_pixel: u16,
+    planar_configuration: Option<u16>,
+    image_type: Vec<String>,
+    rows: u32,
+    columns: u32,
+    number_of_frames: u32,
+    total_pixel_matrix_columns: Option<u32>,
+    total_pixel_matrix_rows: Option<u32>,
+    dimension_organization_type: Option<String>,
+    pixel_spacing: Option<(f64, f64)>,
+    objective_lens_power: Option<f64>,
+}
+
+impl ParsedDicomMetadata {
+    fn classify(&self) -> Result<ImageRole, WsiError> {
+        let image_type_refs = self
+            .image_type
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if matches_type(&image_type_refs, LEVEL_IMAGE_TYPES) {
+            validate_supported_pixel_format(self)?;
+            return Ok(ImageRole::Level);
+        }
+        if matches_type(&image_type_refs, LABEL_IMAGE_TYPES) {
+            validate_supported_pixel_format(self)?;
+            return Ok(ImageRole::Associated(AssociatedKind::Label));
+        }
+        if matches_type(&image_type_refs, OVERVIEW_IMAGE_TYPES) {
+            validate_supported_pixel_format(self)?;
+            return Ok(ImageRole::Associated(AssociatedKind::Macro));
+        }
+        if matches_type(&image_type_refs, THUMBNAIL_IMAGE_TYPES) {
+            validate_supported_pixel_format(self)?;
+            return Ok(ImageRole::Associated(AssociatedKind::Thumbnail));
+        }
+        Ok(ImageRole::Ignore)
+    }
+}
+
+fn parse_metadata_object(path: &Path) -> Result<ParsedDicomMetadata, WsiError> {
+    // Stop after the top-level matrix geometry is available, but before pixel
+    // data. This keeps cold-open cheap while still building the correct
+    // pyramid geometry for tiled DICOM pyramids.
+    let meta = parse_metadata_object_until(path, tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE)?;
+    if meta.dimension_organization_type.as_deref() == Some("TILED_SPARSE") {
+        return parse_metadata_object_full(path);
+    }
+    Ok(meta)
+}
+
+fn parse_metadata_object_full(path: &Path) -> Result<ParsedDicomMetadata, WsiError> {
+    parse_metadata_object_until(path, tags::PIXEL_DATA)
+}
+
+type Level0Properties = (Option<(f64, f64)>, Option<f64>);
+
+fn parse_level0_properties(path: &Path) -> Result<Level0Properties, WsiError> {
+    let obj = OpenFileOptions::new()
+        .read_until(tags::PIXEL_DATA)
+        .open_file(path)
+        .map_err(|source| invalid_slide(path, format!("cannot parse DICOM metadata: {source}")))?;
+    let pixel_spacing = optional_pixel_spacing_mpp(&obj)?;
+    let objective_lens_power = optional_f64_at(
+        &obj,
+        (tags::OPTICAL_PATH_SEQUENCE, 0, tags::OBJECTIVE_LENS_POWER),
+    )?;
+    Ok((pixel_spacing, objective_lens_power))
+}
+
+fn parse_level0_properties_from_metadata(
+    meta: &ParsedDicomMetadata,
+) -> (Option<(f64, f64)>, Option<f64>) {
+    let pixel_spacing = optional_pixel_spacing_mpp(&meta.obj).unwrap_or(None);
+    let objective_lens_power = optional_f64_at(
+        &meta.obj,
+        (tags::OPTICAL_PATH_SEQUENCE, 0, tags::OBJECTIVE_LENS_POWER),
+    )
+    .unwrap_or(None);
+    (pixel_spacing, objective_lens_power)
+}
+
+fn optional_pixel_spacing_mpp(obj: &DefaultDicomObject) -> Result<Option<(f64, f64)>, WsiError> {
+    if let Some(spacing) = optional_pair_f64_at(
+        obj,
+        (
+            tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE,
+            0,
+            tags::PIXEL_MEASURES_SEQUENCE,
+            0,
+            tags::PIXEL_SPACING,
+        ),
+    )? {
+        return Ok(Some(spacing));
+    }
+    optional_pair_f64_at(obj, tags::PIXEL_SPACING)
+}
+
+fn parse_metadata_object_until(
+    path: &Path,
+    stop_tag: dicom_core::Tag,
+) -> Result<ParsedDicomMetadata, WsiError> {
+    if matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some(ext) if ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff")
+    ) {
+        return Err(WsiError::UnsupportedFormat(format!(
+            "Dual-personality DICOM-TIFF with TIFF extension: {}",
+            path.display()
+        )));
+    }
+
+    let obj = OpenFileOptions::new()
+        .read_until(stop_tag)
+        .open_file(path)
+        .map_err(|source| invalid_slide(path, format!("cannot parse DICOM metadata: {source}")))?;
+
+    if !is_vl_wsi(obj.meta().media_storage_sop_class_uid()) {
+        return Err(WsiError::UnsupportedFormat(path.display().to_string()));
+    }
+
+    let series_instance_uid =
+        required_string(&obj, tags::SERIES_INSTANCE_UID, "SeriesInstanceUID")?;
+    let sop_instance_uid = required_string(&obj, tags::SOP_INSTANCE_UID, "SOPInstanceUID")?;
+    let image_type = required_multi_string(&obj, tags::IMAGE_TYPE, "ImageType")?;
+    let rows = required_u32(&obj, tags::ROWS, "Rows")?;
+    let columns = required_u32(&obj, tags::COLUMNS, "Columns")?;
+    let number_of_frames = optional_u32(&obj, tags::NUMBER_OF_FRAMES)?.unwrap_or(1);
+    let photometric_interpretation = required_string(
+        &obj,
+        tags::PHOTOMETRIC_INTERPRETATION,
+        "PhotometricInterpretation",
+    )?;
+    let total_pixel_matrix_columns = optional_u32(&obj, tags::TOTAL_PIXEL_MATRIX_COLUMNS)?;
+    let total_pixel_matrix_rows = optional_u32(&obj, tags::TOTAL_PIXEL_MATRIX_ROWS)?;
+    let dimension_organization_type = optional_string(&obj, tags::DIMENSION_ORGANIZATION_TYPE)?;
+    let pixel_spacing = if stop_tag == tags::PIXEL_DATA {
+        optional_pixel_spacing_mpp(&obj)?
+    } else {
+        None
+    };
+    let samples_per_pixel = optional_u32(&obj, tags::SAMPLES_PER_PIXEL)?
+        .unwrap_or(1)
+        .try_into()
+        .map_err(|_| WsiError::DisplayConversion("SamplesPerPixel out of range".into()))?;
+    let planar_configuration = optional_u32(&obj, tags::PLANAR_CONFIGURATION)?
+        .map(u16::try_from)
+        .transpose()
+        .map_err(|_| WsiError::DisplayConversion("PlanarConfiguration out of range".into()))?;
+    let objective_lens_power = optional_f64_at(
+        &obj,
+        (tags::OPTICAL_PATH_SEQUENCE, 0, tags::OBJECTIVE_LENS_POWER),
+    )?;
+
+    let transfer_syntax_uid = String::from(obj.meta().transfer_syntax());
+
+    Ok(ParsedDicomMetadata {
+        path: path.to_path_buf(),
+        obj,
+        series_instance_uid,
+        sop_instance_uid,
+        transfer_syntax_uid,
+        photometric_interpretation,
+        samples_per_pixel,
+        planar_configuration,
+        image_type,
+        rows,
+        columns,
+        number_of_frames,
+        total_pixel_matrix_columns,
+        total_pixel_matrix_rows,
+        dimension_organization_type,
+        pixel_spacing,
+        objective_lens_power,
+    })
+}
+
+fn build_levels(path: &Path, images: Vec<Arc<DicomImage>>) -> Result<Vec<DicomLevel>, WsiError> {
+    let mut by_dimensions = HashMap::<(u32, u32), usize>::new();
+    let mut levels = Vec::<DicomLevel>::new();
+    for image in images {
+        let key = (image.width, image.height);
+        if let Some(&level_index) = by_dimensions.get(&key) {
+            levels[level_index].push_part(path, image)?;
+            continue;
+        }
+        by_dimensions.insert(key, levels.len());
+        levels.push(DicomLevel::from_image(image));
+    }
+    Ok(levels)
+}
+
+fn dedupe_associated(
+    path: &Path,
+    associated: &mut Vec<(String, Arc<DicomImage>)>,
+) -> Result<(), WsiError> {
+    let mut seen = HashMap::<String, Arc<DicomImage>>::new();
+    let mut deduped = Vec::new();
+    for (name, image) in associated.drain(..) {
+        if let Some(previous) = seen.get(&name) {
+            ensure_same_sop(path, &image.sop_instance_uid, &previous.sop_instance_uid)?;
+            continue;
+        }
+        seen.insert(name.clone(), image.clone());
+        deduped.push((name, image));
+    }
+    *associated = deduped;
+    Ok(())
+}
+
+fn ensure_same_sop(path: &Path, current: &str, previous: &str) -> Result<(), WsiError> {
+    if current == previous {
+        Ok(())
+    } else {
+        Err(invalid_slide(
+            path,
+            format!("Slide contains unexpected image ({current} vs. {previous})"),
+        ))
+    }
+}
+
+fn validate_supported_pixel_format(meta: &ParsedDicomMetadata) -> Result<(), WsiError> {
+    if !SUPPORTED_TRANSFER_SYNTAXES.contains(&meta.transfer_syntax_uid.as_str()) {
+        return Err(invalid_slide(
+            &meta.path,
+            format!("Unsupported transfer syntax {}", meta.transfer_syntax_uid),
+        ));
+    }
+    verify_required_int(
+        &meta.obj,
+        tags::BITS_ALLOCATED,
+        8,
+        "BitsAllocated",
+        &meta.path,
+    )?;
+    verify_required_int(&meta.obj, tags::BITS_STORED, 8, "BitsStored", &meta.path)?;
+    verify_required_int(&meta.obj, tags::HIGH_BIT, 7, "HighBit", &meta.path)?;
+    match meta.samples_per_pixel {
+        1 | 3 => {}
+        value => {
+            return Err(invalid_slide(
+                &meta.path,
+                format!("Attribute SamplesPerPixel value {value} is not supported"),
+            ));
+        }
+    }
+    verify_required_int(
+        &meta.obj,
+        tags::PIXEL_REPRESENTATION,
+        0,
+        "PixelRepresentation",
+        &meta.path,
+    )?;
+    match (meta.samples_per_pixel, meta.planar_configuration) {
+        (1, _) | (3, None | Some(0) | Some(1)) => {}
+        (3, Some(value)) => {
+            return Err(invalid_slide(
+                &meta.path,
+                format!("Attribute PlanarConfiguration value {value} is not supported"),
+            ));
+        }
+        _ => {}
+    }
+    verify_optional_int(
+        &meta.obj,
+        tags::TOTAL_PIXEL_MATRIX_FOCAL_PLANES,
+        1,
+        "TotalPixelMatrixFocalPlanes",
+        &meta.path,
+    )?;
+
+    let supported = if meta.samples_per_pixel == 1 {
+        matches!(
+            meta.photometric_interpretation.as_str(),
+            "MONOCHROME1" | "MONOCHROME2"
+        )
+    } else if meta.transfer_syntax_uid == JPEG_TRANSFER_SYNTAX {
+        meta.photometric_interpretation == "YBR_FULL_422"
+            || meta.photometric_interpretation == "RGB"
+    } else if JP2K_TRANSFER_SYNTAXES.contains(&meta.transfer_syntax_uid.as_str()) {
+        meta.photometric_interpretation == "YBR_ICT" || meta.photometric_interpretation == "RGB"
+    } else {
+        meta.photometric_interpretation == "RGB"
+    };
+    if supported {
+        Ok(())
+    } else {
+        Err(invalid_slide(
+            &meta.path,
+            format!(
+                "Unsupported photometric interpretation {photometric} for {}",
+                meta.transfer_syntax_uid,
+                photometric = meta.photometric_interpretation
+            ),
+        ))
+    }
+}
+
+fn parse_sparse_tile_map(
+    obj: &DefaultDicomObject,
+    tile_width: u32,
+    tile_height: u32,
+) -> Result<HashMap<(u32, u32), u32>, WsiError> {
+    let mut map = HashMap::new();
+    let items = obj
+        .element(tags::PER_FRAME_FUNCTIONAL_GROUPS_SEQUENCE)
+        .map_err(|_| {
+            WsiError::DisplayConversion("missing PerFrameFunctionalGroupsSequence".into())
+        })?
+        .items()
+        .ok_or_else(|| {
+            WsiError::DisplayConversion("PerFrameFunctionalGroupsSequence is not a sequence".into())
+        })?;
+
+    for (frame_index, item) in items.iter().enumerate() {
+        let col_position = required_u32_at_item(
+            item,
+            (
+                tags::PLANE_POSITION_SLIDE_SEQUENCE,
+                0,
+                tags::COLUMN_POSITION_IN_TOTAL_IMAGE_PIXEL_MATRIX,
+            ),
+            "ColumnPositionInTotalImagePixelMatrix",
+        )?;
+        let row_position = required_u32_at_item(
+            item,
+            (
+                tags::PLANE_POSITION_SLIDE_SEQUENCE,
+                0,
+                tags::ROW_POSITION_IN_TOTAL_IMAGE_PIXEL_MATRIX,
+            ),
+            "RowPositionInTotalImagePixelMatrix",
+        )?;
+        if col_position == 0 || row_position == 0 {
+            return Err(WsiError::DisplayConversion(
+                "DICOM sparse tile positions are 1-based and must be non-zero".into(),
+            ));
+        }
+        let col = (col_position - 1) / tile_width;
+        let row = (row_position - 1) / tile_height;
+        map.insert((col, row), frame_index as u32);
+    }
+    Ok(map)
+}
+
+fn is_vl_wsi(sop_class_uid: &str) -> bool {
+    sop_class_uid == uids::VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE
+}
+
+fn matches_type(image_type: &[&str], allowed: &[&[&str]]) -> bool {
+    allowed.contains(&image_type)
+}
+
+fn quickhash_for_series_uid(series_uid: &str) -> Result<String, WsiError> {
+    let mut quickhash = Quickhash1::new();
+    quickhash.hash_string(series_uid);
+    quickhash
+        .finish()
+        .ok_or_else(|| WsiError::DisplayConversion("failed to compute DICOM quickhash".into()))
+}
+
+fn dataset_id_from_quickhash(path: &Path, quickhash: &str) -> Result<DatasetId, WsiError> {
+    if quickhash.len() < 32 {
+        return Err(invalid_slide(path, "quickhash too short"));
+    }
+    let value = u128::from_str_radix(&quickhash[..32], 16)
+        .map_err(|_| invalid_slide(path, "quickhash is not valid hex"))?;
+    Ok(DatasetId(value))
+}
+
+fn canonicalize_or_fallback(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn invalid_slide(path: &Path, message: impl Into<String>) -> WsiError {
+    WsiError::InvalidSlide {
+        path: path.to_path_buf(),
+        message: message.into(),
+    }
+}
+
+fn required_string(
+    obj: &DefaultDicomObject,
+    tag: dicom_core::Tag,
+    name: &str,
+) -> Result<String, WsiError> {
+    obj.element(tag)
+        .map_err(|_| WsiError::DisplayConversion(format!("missing {name}")))?
+        .to_str()
+        .map(|value| value.trim_end_matches('\0').to_string())
+        .map_err(|err| WsiError::DisplayConversion(format!("invalid {name}: {err}")))
+}
+
+fn required_multi_string(
+    obj: &DefaultDicomObject,
+    tag: dicom_core::Tag,
+    name: &str,
+) -> Result<Vec<String>, WsiError> {
+    let raw = required_string(obj, tag, name)?;
+    let values = raw
+        .split('\\')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if values.len() == 4 {
+        Ok(values)
+    } else {
+        Err(WsiError::DisplayConversion(format!(
+            "{name} must have 4 values, got {}",
+            values.len()
+        )))
+    }
+}
+
+fn optional_string(
+    obj: &DefaultDicomObject,
+    tag: dicom_core::Tag,
+) -> Result<Option<String>, WsiError> {
+    obj.get(tag)
+        .map(|elem| {
+            elem.to_str()
+                .map(|value| value.trim_end_matches('\0').to_string())
+                .map_err(|err| {
+                    WsiError::DisplayConversion(format!("invalid DICOM string tag {tag:?}: {err}"))
+                })
+        })
+        .transpose()
+}
+
+fn required_u32(
+    obj: &DefaultDicomObject,
+    tag: dicom_core::Tag,
+    name: &str,
+) -> Result<u32, WsiError> {
+    obj.element(tag)
+        .map_err(|_| WsiError::DisplayConversion(format!("missing {name}")))?
+        .to_int::<u32>()
+        .map_err(|err| WsiError::DisplayConversion(format!("invalid {name}: {err}")))
+}
+
+fn optional_u32(obj: &DefaultDicomObject, tag: dicom_core::Tag) -> Result<Option<u32>, WsiError> {
+    obj.get(tag)
+        .map(|elem| {
+            elem.to_int::<u32>().map_err(|err| {
+                WsiError::DisplayConversion(format!("invalid DICOM integer tag {tag:?}: {err}"))
+            })
+        })
+        .transpose()
+}
+
+fn verify_required_int(
+    obj: &DefaultDicomObject,
+    tag: dicom_core::Tag,
+    expected: u32,
+    name: &str,
+    path: &Path,
+) -> Result<(), WsiError> {
+    let value = required_u32(obj, tag, name)?;
+    if value == expected {
+        Ok(())
+    } else {
+        Err(invalid_slide(
+            path,
+            format!("Attribute {name} value {value} != {expected}"),
+        ))
+    }
+}
+
+fn verify_optional_int(
+    obj: &DefaultDicomObject,
+    tag: dicom_core::Tag,
+    expected: u32,
+    name: &str,
+    path: &Path,
+) -> Result<(), WsiError> {
+    match optional_u32(obj, tag)? {
+        Some(value) if value != expected => Err(invalid_slide(
+            path,
+            format!("Attribute {name} value {value} != {expected}"),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn required_u32_at_item(
+    obj: &dicom_object::InMemDicomObject,
+    selector: impl Into<dicom_core::ops::AttributeSelector>,
+    name: &str,
+) -> Result<u32, WsiError> {
+    obj.entry_at(selector)
+        .map_err(|_| WsiError::DisplayConversion(format!("missing {name}")))?
+        .to_int::<u32>()
+        .map_err(|err| WsiError::DisplayConversion(format!("invalid {name}: {err}")))
+}
+
+fn optional_f64_at(
+    obj: &DefaultDicomObject,
+    selector: impl Into<dicom_core::ops::AttributeSelector>,
+) -> Result<Option<f64>, WsiError> {
+    match obj.entry_at(selector) {
+        Ok(entry) => entry
+            .to_float64()
+            .map(Some)
+            .map_err(|err| WsiError::DisplayConversion(format!("invalid DICOM float: {err}"))),
+        Err(_) => Ok(None),
+    }
+}
+
+fn optional_pair_f64_at(
+    obj: &DefaultDicomObject,
+    selector: impl Into<dicom_core::ops::AttributeSelector>,
+) -> Result<Option<(f64, f64)>, WsiError> {
+    let entry = match obj.entry_at(selector) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(None),
+    };
+    let value = entry
+        .to_str()
+        .map_err(|err| WsiError::DisplayConversion(format!("invalid DICOM string pair: {err}")))?;
+    let mut parts = value.split('\\');
+    let first = parts
+        .next()
+        .and_then(|part| part.parse::<f64>().ok())
+        .ok_or_else(|| WsiError::DisplayConversion("invalid DICOM float pair".into()))?;
+    let second = parts
+        .next()
+        .and_then(|part| part.parse::<f64>().ok())
+        .ok_or_else(|| WsiError::DisplayConversion("invalid DICOM float pair".into()))?;
+    Ok(Some((second * 1000.0, first * 1000.0)))
+}
+
+fn frame_bytes_to_rgb_tile(
+    frame_bytes: &[u8],
+    width: u32,
+    height: u32,
+    samples_per_pixel: u16,
+    planar_configuration: u16,
+    photometric_interpretation: &str,
+) -> Result<CpuTile, WsiError> {
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| WsiError::DisplayConversion("DICOM frame dimensions overflow".into()))?;
+    let rgb = match (samples_per_pixel, photometric_interpretation) {
+        (3, "RGB") if planar_configuration == 0 => {
+            let expected = pixel_count.checked_mul(3).ok_or_else(|| {
+                WsiError::DisplayConversion("DICOM RGB frame size overflow".into())
+            })?;
+            if frame_bytes.len() != expected {
+                return Err(WsiError::DisplayConversion(format!(
+                    "DICOM RGB frame has {} bytes, expected {expected}",
+                    frame_bytes.len()
+                )));
+            }
+            frame_bytes.to_vec()
+        }
+        (3, "RGB") if planar_configuration == 1 => {
+            let expected = pixel_count.checked_mul(3).ok_or_else(|| {
+                WsiError::DisplayConversion("DICOM planar RGB frame size overflow".into())
+            })?;
+            if frame_bytes.len() != expected {
+                return Err(WsiError::DisplayConversion(format!(
+                    "DICOM planar RGB frame has {} bytes, expected {expected}",
+                    frame_bytes.len()
+                )));
+            }
+            let (r_plane, rest) = frame_bytes.split_at(pixel_count);
+            let (g_plane, b_plane) = rest.split_at(pixel_count);
+            let mut rgb = vec![0; expected];
+            for idx in 0..pixel_count {
+                let offset = idx * 3;
+                rgb[offset] = r_plane[idx];
+                rgb[offset + 1] = g_plane[idx];
+                rgb[offset + 2] = b_plane[idx];
+            }
+            rgb
+        }
+        (1, "MONOCHROME1" | "MONOCHROME2") => {
+            if frame_bytes.len() != pixel_count {
+                return Err(WsiError::DisplayConversion(format!(
+                    "DICOM monochrome frame has {} bytes, expected {pixel_count}",
+                    frame_bytes.len()
+                )));
+            }
+            let mut rgb = Vec::with_capacity(pixel_count * 3);
+            for &gray in frame_bytes {
+                // Preserve the legacy sv-slide behavior for consolidation:
+                // MONOCHROME1 and MONOCHROME2 are both expanded without inversion.
+                rgb.extend_from_slice(&[gray, gray, gray]);
+            }
+            rgb
+        }
+        _ => {
+            return Err(WsiError::DisplayConversion(format!(
+                "unsupported DICOM pixel format: samples_per_pixel={samples_per_pixel}, photometric={photometric_interpretation}, planar_configuration={planar_configuration}"
+            )));
+        }
+    };
+
+    CpuTile::new(
+        width,
+        height,
+        3,
+        ColorSpace::Rgb,
+        CpuTileLayout::Interleaved,
+        CpuTileData::u8(rgb),
+    )
+}
+
+fn decode_rle_lossless_frame(
+    frame_bytes: &[u8],
+    width: u32,
+    height: u32,
+    samples_per_pixel: u16,
+    photometric_interpretation: &str,
+) -> Result<CpuTile, WsiError> {
+    if frame_bytes.len() < 64 {
+        return Err(WsiError::DisplayConversion(
+            "DICOM RLE frame is shorter than its 64-byte header".into(),
+        ));
+    }
+    let segment_count = u32::from_le_bytes(frame_bytes[0..4].try_into().unwrap()) as usize;
+    if segment_count == 0 || segment_count > 15 {
+        return Err(WsiError::DisplayConversion(format!(
+            "DICOM RLE segment count {segment_count} is invalid"
+        )));
+    }
+    let expected_segments = samples_per_pixel as usize;
+    if segment_count < expected_segments {
+        return Err(WsiError::DisplayConversion(format!(
+            "DICOM RLE has {segment_count} segments, expected at least {expected_segments}"
+        )));
+    }
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| WsiError::DisplayConversion("DICOM RLE dimensions overflow".into()))?;
+    let mut planes = Vec::with_capacity(expected_segments);
+    for segment in 0..expected_segments {
+        let offset_start = 4 + segment * 4;
+        let segment_start = u32::from_le_bytes(
+            frame_bytes[offset_start..offset_start + 4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        let segment_end = if segment + 1 < segment_count {
+            let next_offset_start = 4 + (segment + 1) * 4;
+            u32::from_le_bytes(
+                frame_bytes[next_offset_start..next_offset_start + 4]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        } else {
+            frame_bytes.len()
+        };
+        if segment_start < 64 || segment_start > segment_end || segment_end > frame_bytes.len() {
+            return Err(WsiError::DisplayConversion(format!(
+                "DICOM RLE segment {segment} has invalid byte range {segment_start}..{segment_end}"
+            )));
+        }
+        planes.push(decode_rle_segment(
+            &frame_bytes[segment_start..segment_end],
+            pixel_count,
+        )?);
+    }
+
+    let rgb = match (samples_per_pixel, photometric_interpretation) {
+        (3, "RGB") => {
+            let mut rgb = vec![0; pixel_count * 3];
+            for (idx, ((&red, &green), &blue)) in
+                planes[0].iter().zip(&planes[1]).zip(&planes[2]).enumerate()
+            {
+                let offset = idx * 3;
+                rgb[offset] = red;
+                rgb[offset + 1] = green;
+                rgb[offset + 2] = blue;
+            }
+            rgb
+        }
+        (1, "MONOCHROME1" | "MONOCHROME2") => {
+            let mut rgb = Vec::with_capacity(pixel_count * 3);
+            for &gray in &planes[0] {
+                rgb.extend_from_slice(&[gray, gray, gray]);
+            }
+            rgb
+        }
+        _ => {
+            return Err(WsiError::DisplayConversion(format!(
+                "unsupported DICOM RLE pixel format: samples_per_pixel={samples_per_pixel}, photometric={photometric_interpretation}"
+            )));
+        }
+    };
+
+    CpuTile::new(
+        width,
+        height,
+        3,
+        ColorSpace::Rgb,
+        CpuTileLayout::Interleaved,
+        CpuTileData::u8(rgb),
+    )
+}
+
+fn decode_rle_segment(segment: &[u8], expected_len: usize) -> Result<Vec<u8>, WsiError> {
+    let mut output = Vec::with_capacity(expected_len);
+    let mut i = 0;
+    while i < segment.len() && output.len() < expected_len {
+        let n = segment[i] as i8;
+        i += 1;
+        match n {
+            0..=127 => {
+                let count = n as usize + 1;
+                let end = i.checked_add(count).ok_or_else(|| {
+                    WsiError::DisplayConversion("DICOM RLE literal run overflow".into())
+                })?;
+                if end > segment.len() {
+                    return Err(WsiError::DisplayConversion(
+                        "DICOM RLE literal run exceeds segment length".into(),
+                    ));
+                }
+                output.extend_from_slice(&segment[i..end]);
+                i = end;
+            }
+            -127..=-1 => {
+                if i >= segment.len() {
+                    return Err(WsiError::DisplayConversion(
+                        "DICOM RLE repeat run missing value".into(),
+                    ));
+                }
+                let count = 1usize + (-n as usize);
+                output.extend(std::iter::repeat_n(segment[i], count));
+                i += 1;
+            }
+            -128 => {}
+        }
+    }
+    if output.len() != expected_len {
+        return Err(WsiError::DisplayConversion(format!(
+            "DICOM RLE segment decoded to {} bytes, expected {expected_len}",
+            output.len()
+        )));
+    }
+    Ok(output)
+}
+
+fn rgb_image_to_sample_buffer(image: image::RgbImage) -> CpuTile {
+    CpuTile::new(
+        image.width(),
+        image.height(),
+        3,
+        ColorSpace::Rgb,
+        CpuTileLayout::Interleaved,
+        CpuTileData::u8(image.into_raw()),
+    )
+    .expect("RGB image dimensions must match")
+}
+
+fn crop_sample_buffer_rgb(buffer: CpuTile, width: u32, height: u32) -> CpuTile {
+    if buffer.width == width && buffer.height == height {
+        return buffer;
+    }
+    let image = imageops::crop_imm(&buffer.into_rgb_image(), 0, 0, width, height).to_image();
+    rgb_image_to_sample_buffer(image)
+}
+
+trait IntoRgbImage {
+    fn into_rgb_image(self) -> image::RgbImage;
+}
+
+impl IntoRgbImage for CpuTile {
+    fn into_rgb_image(self) -> image::RgbImage {
+        match self {
+            CpuTile {
+                width,
+                height,
+                channels: 3,
+                color_space: ColorSpace::Rgb,
+                layout: CpuTileLayout::Interleaved,
+                data: CpuTileData::U8(bytes),
+            } => image::RgbImage::from_raw(width, height, Arc::unwrap_or_clone(bytes))
+                .expect("sample buffer must contain valid RGB dimensions"),
+            buffer => image::DynamicImage::ImageRgba8(
+                buffer
+                    .to_rgba()
+                    .expect("RGB crop fallback must produce RGBA"),
+            )
+            .into_rgb8(),
+        }
+    }
+}
+
+fn black_sample_buffer(width: u32, height: u32) -> CpuTile {
+    CpuTile::new(
+        width,
+        height,
+        3,
+        ColorSpace::Rgb,
+        CpuTileLayout::Interleaved,
+        CpuTileData::u8(vec![0; width as usize * height as usize * 3]),
+    )
+    .expect("black tile dimensions must match")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::registry::Slide;
+    use dicom_core::value::fragments::Fragments;
+    use dicom_core::value::{PixelFragmentSequence, Value};
+    use dicom_core::{DataElement, PrimitiveValue, VR};
+    use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
+
+    #[test]
+    fn level0_properties_from_metadata_match_full_parse() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let path = workspace_root
+            .join("downloads/openslide-testdata-extracted/dicom/dicom-cmu1-jp2k/DCM_0.dcm");
+        if !path.is_file() {
+            eprintln!(
+                "skipping corpus-backed DICOM metadata test; missing {}",
+                path.display()
+            );
+            return;
+        }
+        let meta = parse_metadata_object_full(&path).expect("full metadata parse");
+        assert_eq!(
+            parse_level0_properties_from_metadata(&meta),
+            parse_level0_properties(&path).expect("level0 property parse")
+        );
+    }
+
+    enum TestPixelData {
+        Native(Vec<u8>),
+        Encapsulated(Vec<u8>),
+    }
+
+    struct TestDicomOptions {
+        transfer_syntax: &'static str,
+        samples_per_pixel: u16,
+        photometric_interpretation: &'static str,
+        planar_configuration: Option<u16>,
+        pixel_spacing: Option<&'static str>,
+        pixel_data: TestPixelData,
+    }
+
+    impl TestDicomOptions {
+        fn native(pixel_data: Vec<u8>) -> Self {
+            Self {
+                transfer_syntax: uids::EXPLICIT_VR_LITTLE_ENDIAN,
+                samples_per_pixel: 3,
+                photometric_interpretation: "RGB",
+                planar_configuration: Some(0),
+                pixel_spacing: Some("0.00025\\0.00025"),
+                pixel_data: TestPixelData::Native(pixel_data),
+            }
+        }
+    }
+
+    fn write_test_dicom(path: &Path, options: TestDicomOptions) {
+        let mut object = InMemDicomObject::new_empty();
+        object.put(DataElement::new(
+            tags::SOP_CLASS_UID,
+            VR::UI,
+            uids::VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE,
+        ));
+        object.put(DataElement::new(
+            tags::SOP_INSTANCE_UID,
+            VR::UI,
+            "1.2.826.0.1.3680043.10.777.1",
+        ));
+        object.put(DataElement::new(
+            tags::SERIES_INSTANCE_UID,
+            VR::UI,
+            "1.2.826.0.1.3680043.10.777",
+        ));
+        object.put(DataElement::new(
+            tags::IMAGE_TYPE,
+            VR::CS,
+            "ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+        ));
+        object.put(DataElement::new(
+            tags::ROWS,
+            VR::US,
+            PrimitiveValue::from(2u16),
+        ));
+        object.put(DataElement::new(
+            tags::COLUMNS,
+            VR::US,
+            PrimitiveValue::from(2u16),
+        ));
+        object.put(DataElement::new(
+            tags::TOTAL_PIXEL_MATRIX_ROWS,
+            VR::UL,
+            PrimitiveValue::from(2u32),
+        ));
+        object.put(DataElement::new(
+            tags::TOTAL_PIXEL_MATRIX_COLUMNS,
+            VR::UL,
+            PrimitiveValue::from(2u32),
+        ));
+        object.put(DataElement::new(
+            tags::NUMBER_OF_FRAMES,
+            VR::IS,
+            PrimitiveValue::from(1u32),
+        ));
+        object.put(DataElement::new(
+            tags::SAMPLES_PER_PIXEL,
+            VR::US,
+            PrimitiveValue::from(options.samples_per_pixel),
+        ));
+        object.put(DataElement::new(
+            tags::PHOTOMETRIC_INTERPRETATION,
+            VR::CS,
+            options.photometric_interpretation,
+        ));
+        if let Some(planar_configuration) = options.planar_configuration {
+            object.put(DataElement::new(
+                tags::PLANAR_CONFIGURATION,
+                VR::US,
+                PrimitiveValue::from(planar_configuration),
+            ));
+        }
+        object.put(DataElement::new(
+            tags::BITS_ALLOCATED,
+            VR::US,
+            PrimitiveValue::from(8u16),
+        ));
+        object.put(DataElement::new(
+            tags::BITS_STORED,
+            VR::US,
+            PrimitiveValue::from(8u16),
+        ));
+        object.put(DataElement::new(
+            tags::HIGH_BIT,
+            VR::US,
+            PrimitiveValue::from(7u16),
+        ));
+        object.put(DataElement::new(
+            tags::PIXEL_REPRESENTATION,
+            VR::US,
+            PrimitiveValue::from(0u16),
+        ));
+        if let Some(pixel_spacing) = options.pixel_spacing {
+            object.put(DataElement::new(tags::PIXEL_SPACING, VR::DS, pixel_spacing));
+        }
+        match options.pixel_data {
+            TestPixelData::Native(pixel_data) => {
+                object.put(DataElement::new(
+                    tags::PIXEL_DATA,
+                    VR::OB,
+                    PrimitiveValue::from(pixel_data),
+                ));
+            }
+            TestPixelData::Encapsulated(frame) => {
+                let pixel_sequence = PixelFragmentSequence::from(vec![Fragments::new(frame, 0)]);
+                object.put(DataElement::<InMemDicomObject>::new(
+                    tags::PIXEL_DATA,
+                    VR::OB,
+                    Value::from(pixel_sequence),
+                ));
+            }
+        }
+        object
+            .with_meta(
+                FileMetaTableBuilder::new()
+                    .media_storage_sop_class_uid(uids::VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE)
+                    .media_storage_sop_instance_uid("1.2.826.0.1.3680043.10.777.1")
+                    .transfer_syntax(options.transfer_syntax),
+            )
+            .unwrap()
+            .write_to_file(path)
+            .unwrap();
+    }
+
+    fn read_first_tile(path: &Path) -> CpuTile {
+        let slide = Slide::open(path).expect("open DICOM slide");
+        match slide
+            .read_tile(
+                &TileRequest {
+                    scene: 0,
+                    series: 0,
+                    level: 0,
+                    plane: PlaneSelection::default(),
+                    col: 0,
+                    row: 0,
+                },
+                TileOutputPreference::cpu(),
+            )
+            .expect("read first tile")
+        {
+            TilePixels::Cpu(tile) => tile,
+            TilePixels::Device(_) => panic!("DICOM tests request CPU output"),
+        }
+    }
+
+    fn test_dicom_image(sop_instance_uid: &str, grid: DicomGrid) -> Arc<DicomImage> {
+        Arc::new(DicomImage {
+            path: PathBuf::from(format!("{sop_instance_uid}.dcm")),
+            sop_instance_uid: sop_instance_uid.into(),
+            transfer_syntax_uid: uids::EXPLICIT_VR_LITTLE_ENDIAN.into(),
+            photometric_interpretation: "RGB".into(),
+            samples_per_pixel: 3,
+            planar_configuration: Some(0),
+            width: 4096,
+            height: 4096,
+            tile_width: 512,
+            tile_height: 512,
+            tiles_across: 8,
+            tiles_down: 8,
+            number_of_frames: 1,
+            grid,
+            pixel_spacing: None,
+            objective_lens_power: None,
+            encapsulated_frames: Mutex::new(None),
+            encapsulated_frame_cache: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(1).unwrap(),
+            )),
+            decoded_frame_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(1).unwrap())),
+            file: Mutex::new(None),
+        })
+    }
+
+    fn rgb_bytes(tile: &CpuTile) -> Vec<u8> {
+        assert_eq!(tile.width, 2);
+        assert_eq!(tile.height, 2);
+        assert_eq!(tile.channels, 3);
+        assert_eq!(tile.color_space, ColorSpace::Rgb);
+        assert_eq!(tile.layout, CpuTileLayout::Interleaved);
+        tile.data.as_u8().expect("u8 RGB tile").to_vec()
+    }
+
+    #[test]
+    fn build_levels_groups_split_sparse_instances() {
+        let mut first_tiles = HashMap::new();
+        first_tiles.insert((0, 0), 0);
+        let mut second_tiles = HashMap::new();
+        second_tiles.insert((1, 0), 0);
+
+        let levels = build_levels(
+            Path::new("split.dcm"),
+            vec![
+                test_dicom_image("1.2.3.1", DicomGrid::Sparse(first_tiles)),
+                test_dicom_image("1.2.3.2", DicomGrid::Sparse(second_tiles)),
+            ],
+        )
+        .expect("split sparse parts should form one logical level");
+
+        assert_eq!(levels.len(), 1);
+        assert_eq!(levels[0].parts.len(), 2);
+        assert_eq!(levels[0].tiles_across, 8);
+        assert_eq!(levels[0].tiles_down, 8);
+    }
+
+    #[test]
+    fn opens_3dhistech_split_sparse_level_when_corpus_is_available() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let path =
+            workspace_root.join("downloads/openslide-testdata-extracted/full/DICOM/3DHISTECH-2/2");
+        if !path.exists() {
+            return;
+        }
+
+        let slide = Slide::open(&path).expect("open split-level DICOM slide");
+        let dataset = slide.dataset();
+        assert_eq!(dataset.scenes.len(), 1);
+        assert!(!dataset.scenes[0].series[0].levels.is_empty());
+        let tile = slide
+            .read_tile(
+                &TileRequest {
+                    scene: 0,
+                    series: 0,
+                    level: 0,
+                    plane: PlaneSelection::default(),
+                    col: 0,
+                    row: 0,
+                },
+                TileOutputPreference::cpu(),
+            )
+            .expect("read first split-level tile");
+        assert!(matches!(tile, TilePixels::Cpu(_)));
+    }
+
+    fn literal_rle_segment(bytes: &[u8]) -> Vec<u8> {
+        assert!((1..=128).contains(&bytes.len()));
+        let mut encoded = Vec::with_capacity(bytes.len() + 1);
+        encoded.push((bytes.len() - 1) as u8);
+        encoded.extend_from_slice(bytes);
+        encoded
+    }
+
+    fn rle_rgb_frame(r: &[u8], g: &[u8], b: &[u8]) -> Vec<u8> {
+        let segments = [
+            literal_rle_segment(r),
+            literal_rle_segment(g),
+            literal_rle_segment(b),
+        ];
+        let mut frame = vec![0; 64];
+        frame[0..4].copy_from_slice(&3u32.to_le_bytes());
+        let mut offset = 64u32;
+        for (idx, segment) in segments.iter().enumerate() {
+            let start = 4 + idx * 4;
+            frame[start..start + 4].copy_from_slice(&offset.to_le_bytes());
+            offset += segment.len() as u32;
+        }
+        for segment in segments {
+            frame.extend_from_slice(&segment);
+        }
+        frame
+    }
+
+    #[test]
+    fn opens_implicit_vr_little_endian_native_rgb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("implicit.dcm");
+        let mut options =
+            TestDicomOptions::native(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+        options.transfer_syntax = uids::IMPLICIT_VR_LITTLE_ENDIAN;
+        write_test_dicom(&path, options);
+
+        assert_eq!(
+            rgb_bytes(&read_first_tile(&path)),
+            vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]
+        );
+    }
+
+    #[test]
+    fn opens_explicit_vr_big_endian_native_rgb_8bit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big-endian.dcm");
+        let mut options =
+            TestDicomOptions::native(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+        options.transfer_syntax = EXPLICIT_VR_BIG_ENDIAN_TRANSFER_SYNTAX;
+        write_test_dicom(&path, options);
+
+        assert_eq!(
+            rgb_bytes(&read_first_tile(&path)),
+            vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]
+        );
+    }
+
+    #[test]
+    fn converts_planar_rgb_native_frames_to_interleaved_rgb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("planar.dcm");
+        let mut options = TestDicomOptions::native(vec![
+            255, 0, 0, 255, // R plane
+            0, 255, 0, 255, // G plane
+            0, 0, 255, 0, // B plane
+        ]);
+        options.planar_configuration = Some(1);
+        write_test_dicom(&path, options);
+
+        assert_eq!(
+            rgb_bytes(&read_first_tile(&path)),
+            vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]
+        );
+    }
+
+    #[test]
+    fn expands_monochrome_8bit_native_frames_to_rgb() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mono.dcm");
+        let mut options = TestDicomOptions::native(vec![0, 64, 128, 255]);
+        options.samples_per_pixel = 1;
+        options.photometric_interpretation = "MONOCHROME2";
+        options.planar_configuration = None;
+        write_test_dicom(&path, options);
+
+        assert_eq!(
+            rgb_bytes(&read_first_tile(&path)),
+            vec![0, 0, 0, 64, 64, 64, 128, 128, 128, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn top_level_pixel_spacing_is_mpp_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("spacing.dcm");
+        let mut options =
+            TestDicomOptions::native(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+        options.pixel_spacing = Some("0.0005\\0.00025");
+        write_test_dicom(&path, options);
+
+        let slide = Slide::open(&path).expect("open DICOM slide");
+        assert_eq!(
+            slide.dataset().properties.get("openslide.mpp-x"),
+            Some("0.25")
+        );
+        assert_eq!(
+            slide.dataset().properties.get("openslide.mpp-y"),
+            Some("0.5")
+        );
+    }
+
+    #[test]
+    fn decodes_rle_lossless_rgb_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rle.dcm");
+        write_test_dicom(
+            &path,
+            TestDicomOptions {
+                transfer_syntax: uids::RLE_LOSSLESS,
+                samples_per_pixel: 3,
+                photometric_interpretation: "RGB",
+                planar_configuration: Some(1),
+                pixel_spacing: Some("0.00025\\0.00025"),
+                pixel_data: TestPixelData::Encapsulated(rle_rgb_frame(
+                    &[255, 0, 0, 255],
+                    &[0, 255, 0, 255],
+                    &[0, 0, 255, 0],
+                )),
+            },
+        );
+
+        assert_eq!(
+            rgb_bytes(&read_first_tile(&path)),
+            vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]
+        );
+    }
+}

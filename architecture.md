@@ -1,0 +1,162 @@
+# ziggurat — Architecture
+
+Crate-local **map** and **invariants** for `ziggurat`. For the workspace-level picture and
+this crate's place in it, see `/architecture.md` (root).
+
+`ziggurat` is a **leaf crate** (no in-workspace deps). It is a pure-Rust whole-slide image
+reader: detect format → open dataset → read tiles → optionally surface device-resident
+output. The crate forbids `unsafe`.
+
+## 1. Module map
+
+```
+src/
+├── lib.rs                    re-exports + #![forbid(unsafe_code)]
+├── error.rs                  WsiError
+├── properties.rs             Properties (key/value metadata)
+├── core/                     types, registry, cache, content hash
+│   ├── types.rs              Dataset / Scene / Series / Level / TileLayout / TilePixels / requests
+│   ├── registry.rs           FormatProbe / DatasetReader / SlideReader / FormatRegistry
+│   ├── cache.rs              TileCache + CacheKey
+│   └── hash.rs               quickhash1 (slide content hashing)
+├── decode/                   codec backends (ashlar wrappers)
+│   ├── jpeg.rs               JPEG via ashlar_jpeg
+│   ├── jp2k.rs               JPEG2000 (J2K codestream) via ashlar_j2k_metal
+│   ├── jp2k_backend.rs       narrow-subset validation, YCbCr→RGB
+│   └── jp2k_codestream.rs    J2K header / tile-part parsing
+├── formats/                  per-vendor backends; each implements core/registry traits
+│   ├── dicom.rs              DICOM WSI (JP2K, JPEG, RLE, native transfer syntaxes)
+│   ├── mirax.rs              Mirax / 3DHistech (.mrxs)
+│   ├── hamamatsu_vms.rs      Hamamatsu VMS
+│   └── tiff_family/          umbrella for TIFF-shaped vendors
+│       ├── container.rs      TiffContainer (full IFD chain)
+│       ├── pixel_access.rs   TiffPixelReader
+│       ├── error.rs
+│       └── layout/           per-vendor interpreters (Aperio SVS, NDPI, Leica SCN, Philips, Ventana BIF)
+├── output/
+│   └── metal.rs              MetalDeviceTile + ashlar Metal sessions (feature `metal`)
+└── build.rs                  conditional libopenslide link (feature `openslide-bench` only)
+```
+
+### Internal dependency layers
+
+```
+       core::types
+            │
+   ┌────────┼─────────┐
+   ▼        ▼         ▼
+core::cache  core::registry  (defines FormatProbe / DatasetReader / SlideReader)
+                  │
+        ┌─────────┼──────────┐
+        ▼         ▼          ▼
+   decode/    formats/    output/   (formats use decode; output is feature-gated)
+        └─────────┬──────────┘
+                  ▼
+                lib.rs (re-exports)
+```
+
+A module may only `use` items from modules at or below its level. `formats/*` may use
+`decode/*` and `core/*`; `decode/*` may use `core/*`; nothing under `core/` imports from
+`formats/`, `decode/`, or `output/`.
+
+## 2. Public surface
+
+### 2.1 Traits — `core::registry`
+
+| Trait | Contract |
+|---|---|
+| `FormatProbe` | `probe(&Path) -> ProbeResult` returning `{detected, vendor, confidence}`. **Must be cheap** — header sniffing only, no full parse. (`registry.rs:20`) |
+| `DatasetReader` | `open(&Path) -> Box<dyn SlideReader>`. Constructs the full `Dataset` (scenes/series/levels/layouts). May be expensive; results should be cacheable across reopens. (`registry.rs:38`) |
+| `SlideReader` | `dataset()`, `read_tile_cpu`, `read_tiles` (default impl loops `read_tile_cpu`), `read_region`. Backends override `read_tiles`/`read_region` when batching is cheaper. (`registry.rs:98`) |
+
+### 2.2 Types — `core::types`
+
+- **Dataset hierarchy:** `Dataset` → `Scene` → `Series` → `Level`, with `TileLayout`
+  (`Regular { tile_w, tile_h, cols, rows }`, `Irregular { ... }`, `WholeLevel`),
+  multi-dim axes (`AxesShape { z, c, t }`, `ChannelInfo`).
+- **Tile request:** `TileRequest { scene, series, level, plane, col, row }`.
+- **Region request:** `RegionRequest { scene, series, level, plane, origin_px, size_px }`.
+- **Tile output:** `CpuTile { width, height, channels, color_space, layout, data: CpuTileData }`
+  with `CpuTileData::{U8, U16, F32}`, `ColorSpace::{Grayscale, Rgb, Rgba, YCbCr, Unknown}`,
+  `CpuTileLayout::{Interleaved, Planar}`.
+- **Output preference:** `TileOutputPreference::{Cpu, PreferDevice, RequireDevice}`.
+- **Device tile (feature `metal`):** `MetalDeviceTile { width, height, pitch_bytes, format, storage }`, where storage is currently a Metal buffer plus byte offset.
+
+### 2.3 Registry — `FormatRegistry`
+
+`FormatRegistry::builtin()` registers backends *in this order* (`registry.rs:834+`):
+
+1. `DicomBackend`
+2. `MiraxBackend`
+3. `HamamatsuVmsBackend`
+4. `TiffFamilyBackend`
+
+`FormatRegistry::open(path)` probes all backends, picks the highest `ProbeConfidence`
+(`Definite > Likely`), and on a tie returns the **first registered** match.
+
+## 3. Format → decode → output flow
+
+```
+path  ──► FormatProbe (each backend, cheap)
+            │
+            ▼  highest confidence wins
+        DatasetReader::open  ──► Dataset (scenes/series/levels/layouts)
+            │
+            ▼
+        SlideReader::read_tiles(&[TileRequest], TileOutputPreference)
+            │
+            ├── TIFF-family ──► tiff_family::pixel_access ──► decode::jpeg / decode::jp2k
+            ├── DICOM       ──► decode::jp2k / decode::jpeg / RLE / native (per transfer syntax)
+            ├── Mirax       ──► decode::jpeg (zlib-decompressed JPEG tiles)
+            └── Hamamatsu   ──► decode::jpeg (fixed pyramid scales [2, 4, 8])
+            │
+            ▼
+        TilePixels {Cpu(CpuTile) | Device(MetalDeviceTile)}
+            │
+            ▼  optional region composite via TileCache (registry.rs)
+        Region returned to caller (sv-slide)
+```
+
+## 4. Invariants
+
+| # | Invariant | Where |
+|---|---|---|
+| W1 | **Crate forbids `unsafe`.** | `src/lib.rs:1` (`#![forbid(unsafe_code)]`) |
+| W2 | **Module dependency direction is one-way:** `core` → `decode`/`formats` → `output` → `lib`. Reverse imports are forbidden. | Convention; verifiable by inspection of `use` statements. |
+| W3 | **`FormatProbe::probe` must not perform a full parse.** Probes run for every backend on every open; cost should be bounded by header bytes. | Doc-contract on `FormatProbe`. |
+| W4 | **Confidence priority is `Definite > Likely`, ties broken by registration order.** | `registry.rs` `FormatRegistry::open` (~`:884–913`). |
+| W5 | **JPEG decode is bounded.** `MAX_JPEG_DECODE_BYTES = 512 MiB`, `JPEG_MAX_DIMENSION = 65500` to prevent OOM from crafted headers. | `src/decode/jpeg.rs:25–26`. |
+| W6 | **`SlideReader::read_tile` is a default thin wrapper over `read_tiles`.** Backends override `read_tiles` when batching is cheaper; semantics for a 1-element batch must equal a single `read_tile`. | `registry.rs:114–135`. |
+| W7 | **`CacheKey` must include all addressing dims:** `(dataset_id, scene, series, level, z, c, t, col, row)`. Dropping a dim is a correctness bug. | `core/registry.rs:251–270` / `core/cache.rs`. |
+| W8 | **`zeiss.rs` is not registered.** It exists in `src/formats/zeiss.rs` but is not declared in `formats/mod.rs`, so it is unreachable from `FormatRegistry`. Either wire it up + register it, or delete it. | `src/formats/mod.rs` (1–4). |
+
+## 5. Tests, examples, benches
+
+| Area | Path | Purpose |
+|---|---|---|
+| Tests | `tests/ashlar_parity.rs` | CPU vs reference oracle tolerance. |
+| Tests | `tests/openslide_parity.rs` | Parity with libopenslide (gated by `openslide-bench` feature). |
+| Tests | `tests/real_wsi_behavior.rs` | Real-slide behavioural checks. |
+| Tests | `tests/metal_surface_smoke.rs` | Metal device-tile smoke (feature `metal`). |
+| Tests | `tests/phase3_prereq.rs` | Phase-3 prerequisite checks. |
+| Examples | `examples/fw01_trace_pattern.rs` | Trace-pattern usage example. |
+| Benches | `benches/wsi_pipeline.rs`, `decode_throughput.rs`, `read_paths.rs`, `openslide_parity.rs` | End-to-end throughput, decode-only throughput, read-path comparison, OpenSlide parity benchmark. |
+
+## 6. Recipe — adding a new format
+
+For an agent or engineer adding a new vendor:
+
+1. **Create the backend module.** `src/formats/<vendor>.rs` (or `src/formats/<vendor>/mod.rs` if multi-file). Define `<Vendor>Backend` and any vendor-specific parsers.
+2. **Implement `FormatProbe`** on `<Vendor>Backend`. Read only the bytes needed to recognise the format. Return `Definite` only when the bytes are unambiguous; otherwise `Likely`.
+3. **Implement `DatasetReader`** on `<Vendor>Backend`. Construct the full `Dataset` — every scene, series, level, and `TileLayout` must be present; lazy fields are an anti-pattern here.
+4. **Implement `SlideReader`** for the per-file reader you return from `open`. At minimum override `read_tile_cpu`. Override `read_tiles` and `read_region` only if batching is cheaper than the default loop.
+5. **Wire the module** in `src/formats/mod.rs`: `pub(crate) mod <vendor>;`.
+6. **Register the backend** in `FormatRegistry::builtin` (`src/core/registry.rs`). Insert at the position that respects the desired tie-break order (W4): more specific backends first.
+7. **Add a parity test** under `tests/` that opens a representative file and checks at least one tile against a known oracle.
+8. **Update `/architecture.md` §1.2 and W8** if this addition changes the surface (e.g., new vendor listed, `zeiss.rs` resolved).
+
+Do **not**:
+
+- Reach into `decode/` from outside `formats/` or `core/registry.rs`.
+- Introduce `unsafe` (W1).
+- Skip the registry and expose a vendor-specific public open function.

@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, rust: stable }
+          - { os: macos-latest, rust: stable }
+          - { os: ubuntu-latest, rust: "1.94" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ziggurat
+      - uses: actions/checkout@v4
+        with:
+          repository: jcwal1516/ashlar
+          path: ashlar
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt,clippy
+      - name: Patch ashlar from sibling checkout
+        working-directory: ziggurat
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          ashlar-core = { path = "../ashlar/crates/ashlar-core" }
+          ashlar-jpeg = { path = "../ashlar/crates/ashlar-jpeg" }
+          ashlar-jpeg-metal = { path = "../ashlar/crates/ashlar-jpeg-metal" }
+          ashlar-j2k = { path = "../ashlar/crates/ashlar-j2k" }
+          ashlar-j2k-native = { path = "../ashlar/crates/ashlar-j2k-native" }
+          ashlar-j2k-metal = { path = "../ashlar/crates/ashlar-j2k-metal" }
+          ashlar-tilecodec = { path = "../ashlar/crates/ashlar-tilecodec" }
+          EOF
+      - run: cargo fmt --all -- --check
+        working-directory: ziggurat
+      - run: cargo clippy --all-targets -- -D warnings
+        working-directory: ziggurat
+      - run: cargo test --lib --tests
+        working-directory: ziggurat
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ziggurat
+      - uses: actions/checkout@v4
+        with:
+          repository: jcwal1516/ashlar
+          path: ashlar
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Patch ashlar from sibling checkout
+        working-directory: ziggurat
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          ashlar-core = { path = "../ashlar/crates/ashlar-core" }
+          ashlar-jpeg = { path = "../ashlar/crates/ashlar-jpeg" }
+          ashlar-jpeg-metal = { path = "../ashlar/crates/ashlar-jpeg-metal" }
+          ashlar-j2k = { path = "../ashlar/crates/ashlar-j2k" }
+          ashlar-j2k-native = { path = "../ashlar/crates/ashlar-j2k-native" }
+          ashlar-j2k-metal = { path = "../ashlar/crates/ashlar-j2k-metal" }
+          ashlar-tilecodec = { path = "../ashlar/crates/ashlar-tilecodec" }
+          EOF
+      - run: cargo package --no-verify
+        working-directory: ziggurat

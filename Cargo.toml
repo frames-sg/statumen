@@ -1,0 +1,112 @@
+[package]
+name = "ziggurat"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Ashlar-native whole-slide image reader"
+repository = "https://github.com/jcwal1516/ziggurat"
+keywords = ["whole-slide", "microscopy", "tiff", "pathology"]
+categories = ["multimedia::images", "science"]
+rust-version = "1.94"
+readme = "README.md"
+# Disable cargo's auto-discovery of binaries from src/bin/*.rs so that the
+# shared `bench_common.rs` (which has no `main`) is not treated as a binary
+# target. The `wsi_bench` and `openslide_bench` binaries are listed
+# explicitly via [[bin]] below.
+autobins = false
+
+[features]
+default = []
+# Enables the wsi_bench binary (no system deps).
+bench = []
+# Enables the openslide_bench binary (requires libopenslide on PATH via pkg-config).
+openslide-bench = []
+# Enables OpenSlide compatibility-oracle parity tests/benches via libloading.
+# Off by default; CI matrix runs with and without.
+parity-openslide = []
+# Enables Metal-backed parity comparisons (ashlar CPU vs Metal).
+# Off by default; macOS only; CI matrix runs with and without.
+parity-metal = []
+# Enables Metal-backed device payload plumbing for Phase 5.
+metal = ["dep:metal", "dep:ashlar-jpeg-metal"]
+cuda = []
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["bmp", "png", "pnm"] }
+quick-xml = "0.36"
+lru = "0.12"
+thiserror = "2"
+sha2 = "0.10"
+byteorder = "1"
+tracing = "0.1"
+rayon = "1.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+flate2 = "1"
+tempfile = "3"
+zstd = "0.13"
+ashlar-jpeg = "=0.1.0"
+ashlar-core = "=0.1.0"
+ashlar-tilecodec = "=0.1.0"
+ashlar-jpeg-metal = { version = "=0.1.0", optional = true }
+ashlar-j2k-metal = "=0.1.0"
+metal = { version = "0.31", optional = true }
+dicom-core = "0.9"
+dicom-object = "0.9"
+dicom-dictionary-std = "0.9"
+dicom-parser = "0.9"
+dicom-transfer-syntax-registry = { version = "0.9", default-features = false }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+jpeg-decoder = "0.3.2"
+jpeg-encoder = "0.6"
+tempfile = "3"
+toml = "0.8"
+libloading = "0.8"
+ashlar-j2k-native = "=0.1.0"
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[[bench]]
+name = "read_paths"
+harness = false
+
+[[bench]]
+name = "decode_throughput"
+harness = false
+
+[[bench]]
+name = "wsi_pipeline"
+harness = false
+
+[[bench]]
+name = "openslide_parity"
+harness = false
+required-features = ["parity-openslide"]
+
+[[bin]]
+name = "wsi_bench"
+path = "src/bin/wsi_bench.rs"
+required-features = ["bench"]
+
+[[bin]]
+name = "openslide_bench"
+path = "src/bin/openslide_bench.rs"
+required-features = ["openslide-bench"]
+
+[[bin]]
+name = "bench_driver"
+path = "src/bin/bench_driver.rs"
+required-features = ["bench", "openslide-bench"]
+
+[[bin]]
+name = "release_gate"
+path = "src/bin/release_gate.rs"
+required-features = ["bench", "openslide-bench"]
+
+[[bin]]
+name = "svcache"
+path = "src/bin/svcache.rs"

@@ -1,0 +1,144 @@
+# Public, redistributable parity corpus.
+# Slides listed here are downloaded by `scripts/parity-corpus-fetch.sh` into
+# `$ZIGGURAT_PARITY_CORPUS_CACHE` (default `~/.cache/slideviewer/parity-corpus/`).
+
+[[slide]]
+name             = "aperio_svs_brightfield_he_typical"
+alias            = "svs-001"
+path             = ""
+format           = "aperio"
+codecs           = ["jpeg"]
+must_decode      = ["base", "level1", "level2", "label", "macro"]
+expected_failures = [
+  "ashlar-vs-reference:base",
+  "ashlar-vs-reference:level1",
+  "ashlar-vs-reference:level2",
+]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "00a3d54482cd707abf254fe69dccc8d06b8ff757a1663f1290c23418c480eb30"
+citation         = "Goode A. et al. OpenSlide: A vendor-neutral software foundation for digital pathology. J Pathol Inform. 2013."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1.svs"
+
+[[slide]]
+name             = "aperio_svs_brightfield_jp2k_typical"
+alias            = "svs-jp2k-001"
+path             = ""
+format           = "aperio"
+codecs           = ["j2k"]
+must_decode      = ["base", "level1"]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "6205ccf75a8fa6c32df7c5c04b7377398971a490fb6b320d50d91f7ba6a0e6fd"
+citation         = "Goode A. et al. OpenSlide..."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/JP2K-33003-1.svs"
+
+[[slide]]
+name             = "hamamatsu_ndpi_brightfield_typical"
+alias            = "ndpi-001"
+path             = ""
+format           = "ndpi"
+codecs           = ["jpeg"]
+must_decode      = ["base", "level2"]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "edf4a1ccf395c7000ae93ad3b44c07d97043810e00be0c1d167dd09bbe436e46"
+citation         = "OpenSlide testdata, Hamamatsu NDPI sample."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Hamamatsu/CMU-1.ndpi"
+
+[[slide]]
+name             = "hamamatsu_vms_brightfield_typical"
+alias            = "vms-001"
+path             = ""
+format           = "hamamatsu_vms"
+codecs           = ["jpeg"]
+must_decode      = ["base"]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "bc63f85e3de63711fd649e70ab605ef1bf81bc2e2ca2ae82e295dfaa19fddfcd"
+citation         = "OpenSlide testdata, Hamamatsu VMS sample."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Hamamatsu-vms/CMU-1.zip"
+
+[[slide]]
+name             = "leica_tiff_brightfield_typical"
+alias            = "leica-001"
+path             = ""
+format           = "leica"
+codecs           = ["jpeg"]
+must_decode      = ["base"]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "63a3c00fef5215497a9725cf19092a93f7f5ff855ce8561af74b087631831a97"
+citation         = "OpenSlide testdata, Leica sample."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Leica/Leica-1.scn"
+
+[[slide]]
+name             = "ventana_bif_brightfield_typical"
+alias            = "ventana-001"
+path             = ""
+format           = "ventana"
+codecs           = ["jpeg"]
+must_decode      = ["base"]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "8c0bcfe258574e1ec5640d280f9c5b664b76840f52b9cdcd321ec690c113dbd2"
+citation         = "OpenSlide testdata, Ventana sample."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Ventana/OS-2.bif"
+
+[[slide]]
+name             = "mirax_brightfield_typical"
+alias            = "mirax-001"
+path             = ""
+format           = "mirax"
+codecs           = ["jpeg"]
+must_decode      = ["base"]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "d9fb29b7d52318a2e61ae9f259449330cab2118026874ea33ff64fe677db3daf"
+citation         = "OpenSlide testdata, MIRAX sample."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Mirax/CMU-1.zip"
+
+[[slide]]
+name             = "dicom_wsi_jpeg_tiled_full"
+alias            = "dicom-jpeg-001"
+path             = "downloads/openslide-testdata-extracted/dicom/dicom-3dhistech-1/000001.dcm"
+format           = "dicom"
+codecs           = ["jpeg-progressive"]
+must_decode      = []
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "f7306843363c08ab86539f52acbe492917c440df50231d06b9b2e1657ac9e6a8"
+citation         = "OpenSlide testdata, DICOM WSI 3DHISTECH-1 sample."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/DICOM/3DHISTECH-1.zip"
+notes            = "Public DICOM JPEG provenance row. Non-gating because this sample uses progressive JPEG, which is a ashlar JPEG follow-on."
+
+[[slide]]
+name             = "dicom_wsi_jp2k_tiled_full"
+alias            = "dicom-jp2k-001"
+path             = "downloads/openslide-testdata-extracted/dicom/dicom-cmu1-jp2k/DCM_0.dcm"
+format           = "dicom"
+codecs           = ["j2k"]
+must_decode      = ["base"]
+source           = "openslide-testdata"
+license          = "CC0-1.0"
+redistributable  = true
+sha256           = "da02f7d18c6fe71b1f64b1ec3f0ca1a68dcae6a1aac12c102b587b36c37693f6"
+citation         = "OpenSlide testdata, DICOM WSI CMU-1-JP2K-33005 sample."
+phi_reviewed     = true
+url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/DICOM/CMU-1-JP2K-33005.zip"

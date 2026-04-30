@@ -1,0 +1,70 @@
+# Developer-local parity corpus. NEVER commit this file with real paths.
+# Copy to `parity_corpus.private.toml` and fill in `path = ...` for each slide.
+
+# [[slide]]
+# name             = "philips_tiff_brightfield_typical"
+# alias            = "philips-tiff-local-001"
+# path             = "/absolute/local/path/to/slide.tiff"
+# format           = "philips_tiff"
+# codecs           = ["jpeg"]
+# must_decode      = ["base"]
+# source           = "local-private"
+# license          = "unknown"
+# redistributable  = false
+# sha256           = ""
+# citation         = ""
+# phi_reviewed     = true
+# tolerant_regions = []
+
+# [[slide]]
+# name             = "dicom_wsi_brightfield_he_typical"
+# alias            = "dicom-wsi-001"
+# path             = "/absolute/local/path/to/series-folder-or-file.dcm"
+# format           = "dicom"
+# codecs           = ["jpeg"]
+# must_decode      = ["base"]
+# source           = "local-private"
+# license          = "unknown"
+# redistributable  = false
+# phi_reviewed     = true
+
+# [[slide]]
+# name             = "dicom_wsi_uncompressed_native"
+# alias            = "dicom-uncompressed-local-001"
+# path             = "/absolute/local/path/to/uncompressed-wsi.dcm"
+# format           = "dicom"
+# codecs           = ["uncompressed"]
+# must_decode      = ["base"]
+# source           = "local-private-or-synthetic"
+# license          = "unknown"
+# redistributable  = false
+# phi_reviewed     = true
+# notes            = "Phase 7a covers native uncompressed variants with synthetic unit fixtures; add a real WSI fixture here when available."
+
+# [[slide]]
+# name             = "dicom_wsi_rle_lossless"
+# alias            = "dicom-rle-local-001"
+# path             = "/absolute/local/path/to/rle-lossless-wsi.dcm"
+# format           = "dicom"
+# codecs           = ["rle"]
+# must_decode      = ["base"]
+# source           = "local-private-or-synthetic"
+# license          = "unknown"
+# redistributable  = false
+# phi_reviewed     = true
+# notes            = "No redistributable RLE WSI fixture is known; Phase 7a keeps RLE regression coverage synthetic."
+
+# [[slide]]
+# name             = "hamamatsu_ndpi_no_restart_markers"
+# alias            = "ndpi-no-restart-markers"
+# path             = "/absolute/local/path/to/no-restart-markers.ndpi"
+# format           = "ndpi"
+# codecs           = ["jpeg"]
+# must_decode      = ["base"]
+# source           = "local-private"
+# license          = "unknown"
+# redistributable  = false
+# sha256           = ""
+# citation         = ""
+# phi_reviewed     = true
+# notes            = "FullDecodeCache fallback parity is gated on the developer-local corpus only; no redistributable no-restart-marker NDPI row is currently available."
