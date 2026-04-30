@@ -5,8 +5,6 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use ashlar_core::BackendRequest;
@@ -307,8 +305,6 @@ type NdpiMcuStartsCache = HashMap<(IfdId, u16), Arc<Vec<u64>>>;
 type SyntheticDeepestKey = (usize, usize, u32, u32, u32);
 type SyntheticDeepestValue = (u32, u32, u32);
 const NDPI_DISPLAY_WIDE_STRIP_WIDTH: u32 = 1024;
-#[cfg(test)]
-static SYNTHETIC_ASHLAR_DOWNSCALE_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "metal")]
 fn jpeg_device_decode_enabled() -> bool {
@@ -869,16 +865,6 @@ impl TiffPixelReader {
             .put(key, image);
     }
 
-    #[cfg(test)]
-    fn reset_synthetic_ashlar_downscale_attempts_for_test() {
-        SYNTHETIC_ASHLAR_DOWNSCALE_ATTEMPTS.store(0, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    fn synthetic_ashlar_downscale_attempts_for_test() -> usize {
-        SYNTHETIC_ASHLAR_DOWNSCALE_ATTEMPTS.load(Ordering::SeqCst)
-    }
-
     fn try_decode_synthetic_level_with_ashlar(
         &self,
         req: &TileRequest,
@@ -916,8 +902,6 @@ impl TiffPixelReader {
             self.tiff_jpeg_decode_options_for_data(*ifd_id, false, &jpeg, None)
                 .color_transform,
         );
-        #[cfg(test)]
-        SYNTHETIC_ASHLAR_DOWNSCALE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
         let decoder = AshlarJpegDecoder::new_with_options(&jpeg, options)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?;
         let source_dims = decoder.info().dimensions;
@@ -5534,10 +5518,21 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_ndpi_tile_path_attempts_ashlar_downscale() {
+    fn synthetic_ndpi_tile_path_uses_ashlar_downscale_when_dimensions_match() {
         let reader = build_synthetic_ndpi_reader(8, 8, &[(4, 4, 2)]);
-        TiffPixelReader::reset_synthetic_ashlar_downscale_attempts_for_test();
-        let before = TiffPixelReader::synthetic_ashlar_downscale_attempts_for_test();
+        let direct_req = TileRequest {
+            scene: 0,
+            series: 0,
+            level: 1,
+            plane: PlaneSelection::default(),
+            col: 0,
+            row: 0,
+        };
+        let direct = reader
+            .try_decode_synthetic_level_with_ashlar(&direct_req, 0, 2)
+            .expect("ashlar synthetic downscale should decode")
+            .expect("matching synthetic dimensions should use ashlar downscale");
+        assert_eq!((direct.width, direct.height), (4, 4));
 
         let tile = reader
             .read_tile_cpu(&TileRequest {
@@ -5551,15 +5546,26 @@ mod tests {
             .unwrap();
 
         assert_eq!((tile.width, tile.height), (4, 4));
-        let after = TiffPixelReader::synthetic_ashlar_downscale_attempts_for_test();
-        assert!(after > before, "expected ashlar downscale attempt");
     }
 
     #[test]
     fn synthetic_ndpi_region_fastpath_falls_back_when_ashlar_scaled_dims_do_not_match() {
         let reader = build_synthetic_ndpi_reader(5, 5, &[(2, 2, 2)]);
-        TiffPixelReader::reset_synthetic_ashlar_downscale_attempts_for_test();
-        let before = TiffPixelReader::synthetic_ashlar_downscale_attempts_for_test();
+        let direct_req = TileRequest {
+            scene: 0,
+            series: 0,
+            level: 1,
+            plane: PlaneSelection::default(),
+            col: 0,
+            row: 0,
+        };
+        assert!(
+            reader
+                .try_decode_synthetic_level_with_ashlar(&direct_req, 0, 2)
+                .expect("ashlar synthetic downscale should decode")
+                .is_none(),
+            "odd source dimensions should reject ashlar result with mismatched target dimensions"
+        );
 
         let req = RegionRequest::legacy_xywh(0, 0, 1, PlaneSelection::default(), 0, 0, 2, 2);
         let mut ctx = crate::core::registry::SlideReadContext::new(
@@ -5573,8 +5579,6 @@ mod tests {
             .expect("odd-dimension ashlar downscale mismatch should fall back");
 
         assert_eq!((tile.width, tile.height), (2, 2));
-        let after = TiffPixelReader::synthetic_ashlar_downscale_attempts_for_test();
-        assert!(after > before, "expected ashlar downscale attempt");
     }
 
     fn le_u16(v: u16) -> [u8; 2] {
