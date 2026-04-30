@@ -1,9 +1,11 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::c_char;
 use std::path::Path;
 use std::sync::OnceLock;
+
+use libloading::{Library, Symbol};
 
 #[repr(C)]
 pub struct openslide_t {
@@ -27,16 +29,8 @@ type openslide_get_associated_image_names_fn =
 type openslide_get_associated_image_dimensions_fn =
     unsafe extern "C" fn(osr: *mut openslide_t, name: *const c_char, w: *mut i64, h: *mut i64);
 
-unsafe extern "C" {
-    fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
-    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-    fn dlerror() -> *const c_char;
-}
-
-const RTLD_NOW: c_int = 0x2;
-
 struct OpenSlideApi {
-    _handle: usize,
+    _lib: Library,
     openslide_open: openslide_open_fn,
     openslide_close: openslide_close_fn,
     openslide_get_error: openslide_get_error_fn,
@@ -45,32 +39,18 @@ struct OpenSlideApi {
     openslide_get_associated_image_dimensions: openslide_get_associated_image_dimensions_fn,
 }
 
-fn dlerror_message() -> String {
-    let err = unsafe { dlerror() };
-    if err.is_null() {
-        "unknown dlerror".to_string()
-    } else {
-        unsafe { CStr::from_ptr(err) }
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
-fn load_symbol<T: Copy>(handle: *mut c_void, symbol: &[u8]) -> Result<T, String> {
+unsafe fn load_symbol<T: Copy>(lib: &Library, symbol: &[u8]) -> Result<T, String> {
     let name = CStr::from_bytes_with_nul(symbol).expect("symbol name must be NUL terminated");
-    let ptr = unsafe { dlsym(handle, name.as_ptr()) };
-    if ptr.is_null() {
-        return Err(format!(
-            "dlsym({}) failed: {}",
-            name.to_string_lossy(),
-            dlerror_message()
-        ));
-    }
-    Ok(unsafe { std::mem::transmute_copy(&ptr) })
+    let loaded: Symbol<'_, T> = unsafe { lib.get(symbol) }
+        .map_err(|err| format!("dlsym({}) failed: {err}", name.to_string_lossy()))?;
+    Ok(*loaded)
 }
 
 fn load_openslide_api() -> Result<OpenSlideApi, String> {
     let mut candidates = Vec::new();
+    if let Some(path) = std::env::var_os("OPENSLIDE_LIB_PATH") {
+        candidates.push(path.to_string_lossy().into_owned());
+    }
     if let Some(path) = std::env::var_os("ZIGGURAT_OPENSLIDE_LIBRARY") {
         candidates.push(path.to_string_lossy().into_owned());
     }
@@ -84,6 +64,8 @@ fn load_openslide_api() -> Result<OpenSlideApi, String> {
             "libopenslide.dylib",
             "libopenslide.so.1",
             "libopenslide.so",
+            "libopenslide.dll",
+            r"C:\Program Files\OpenSlide\bin\libopenslide.dll",
         ]
         .into_iter()
         .map(str::to_owned),
@@ -91,27 +73,31 @@ fn load_openslide_api() -> Result<OpenSlideApi, String> {
 
     let mut errors = Vec::new();
     for candidate in candidates {
-        let cpath = CString::new(candidate.as_str()).map_err(|e| e.to_string())?;
-        let handle = unsafe { dlopen(cpath.as_ptr(), RTLD_NOW) };
-        if handle.is_null() {
-            errors.push(format!("{candidate}: {}", dlerror_message()));
-            continue;
-        }
+        let lib = match unsafe { Library::new(&candidate) } {
+            Ok(lib) => lib,
+            Err(err) => {
+                errors.push(format!("{candidate}: {err}"));
+                continue;
+            }
+        };
+
+        let openslide_open = unsafe { load_symbol(&lib, b"openslide_open\0")? };
+        let openslide_close = unsafe { load_symbol(&lib, b"openslide_close\0")? };
+        let openslide_get_error = unsafe { load_symbol(&lib, b"openslide_get_error\0")? };
+        let openslide_read_region = unsafe { load_symbol(&lib, b"openslide_read_region\0")? };
+        let openslide_get_associated_image_names =
+            unsafe { load_symbol(&lib, b"openslide_get_associated_image_names\0")? };
+        let openslide_get_associated_image_dimensions =
+            unsafe { load_symbol(&lib, b"openslide_get_associated_image_dimensions\0")? };
 
         return Ok(OpenSlideApi {
-            _handle: handle as usize,
-            openslide_open: load_symbol(handle, b"openslide_open\0")?,
-            openslide_close: load_symbol(handle, b"openslide_close\0")?,
-            openslide_get_error: load_symbol(handle, b"openslide_get_error\0")?,
-            openslide_read_region: load_symbol(handle, b"openslide_read_region\0")?,
-            openslide_get_associated_image_names: load_symbol(
-                handle,
-                b"openslide_get_associated_image_names\0",
-            )?,
-            openslide_get_associated_image_dimensions: load_symbol(
-                handle,
-                b"openslide_get_associated_image_dimensions\0",
-            )?,
+            _lib: lib,
+            openslide_open,
+            openslide_close,
+            openslide_get_error,
+            openslide_read_region,
+            openslide_get_associated_image_names,
+            openslide_get_associated_image_dimensions,
         });
     }
 
