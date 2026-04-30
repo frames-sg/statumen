@@ -28,28 +28,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ziggurat
-      - uses: actions/checkout@v4
-        with:
-          repository: jcwal1516/ashlar
-          path: ashlar
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt,clippy
-      - name: Patch ashlar from sibling checkout
-        working-directory: ziggurat
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          ashlar-core = { path = "../ashlar/crates/ashlar-core" }
-          ashlar-jpeg = { path = "../ashlar/crates/ashlar-jpeg" }
-          ashlar-jpeg-metal = { path = "../ashlar/crates/ashlar-jpeg-metal" }
-          ashlar-j2k = { path = "../ashlar/crates/ashlar-j2k" }
-          ashlar-j2k-native = { path = "../ashlar/crates/ashlar-j2k-native" }
-          ashlar-j2k-metal = { path = "../ashlar/crates/ashlar-j2k-metal" }
-          ashlar-tilecodec = { path = "../ashlar/crates/ashlar-tilecodec" }
-          EOF
       - run: cargo xtask fmt
         working-directory: ziggurat
       - run: cargo xtask clippy
@@ -63,25 +45,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ziggurat
-      - uses: actions/checkout@v4
-        with:
-          repository: jcwal1516/ashlar
-          path: ashlar
       - uses: dtolnay/rust-toolchain@stable
-      - name: Patch ashlar from sibling checkout
-        working-directory: ziggurat
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          ashlar-core = { path = "../ashlar/crates/ashlar-core" }
-          ashlar-jpeg = { path = "../ashlar/crates/ashlar-jpeg" }
-          ashlar-jpeg-metal = { path = "../ashlar/crates/ashlar-jpeg-metal" }
-          ashlar-j2k = { path = "../ashlar/crates/ashlar-j2k" }
-          ashlar-j2k-native = { path = "../ashlar/crates/ashlar-j2k-native" }
-          ashlar-j2k-metal = { path = "../ashlar/crates/ashlar-j2k-metal" }
-          ashlar-tilecodec = { path = "../ashlar/crates/ashlar-tilecodec" }
-          EOF
       - run: cargo xtask doc
         working-directory: ziggurat
 
@@ -101,26 +65,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ziggurat
-      - uses: actions/checkout@v4
-        with:
-          repository: jcwal1516/ashlar
-          path: ashlar
       - uses: dtolnay/rust-toolchain@stable
-      - name: Patch ashlar from sibling checkout
-        working-directory: ziggurat
-        shell: bash
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          ashlar-core = { path = "../ashlar/crates/ashlar-core" }
-          ashlar-jpeg = { path = "../ashlar/crates/ashlar-jpeg" }
-          ashlar-jpeg-metal = { path = "../ashlar/crates/ashlar-jpeg-metal" }
-          ashlar-j2k = { path = "../ashlar/crates/ashlar-j2k" }
-          ashlar-j2k-native = { path = "../ashlar/crates/ashlar-j2k-native" }
-          ashlar-j2k-metal = { path = "../ashlar/crates/ashlar-j2k-metal" }
-          ashlar-tilecodec = { path = "../ashlar/crates/ashlar-tilecodec" }
-          EOF
       - run: cargo xtask release-test
         working-directory: ziggurat
 
@@ -130,25 +75,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ziggurat
-      - uses: actions/checkout@v4
-        with:
-          repository: jcwal1516/ashlar
-          path: ashlar
       - uses: dtolnay/rust-toolchain@stable
-      - name: Patch ashlar from sibling checkout
-        working-directory: ziggurat
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          ashlar-core = { path = "../ashlar/crates/ashlar-core" }
-          ashlar-jpeg = { path = "../ashlar/crates/ashlar-jpeg" }
-          ashlar-jpeg-metal = { path = "../ashlar/crates/ashlar-jpeg-metal" }
-          ashlar-j2k = { path = "../ashlar/crates/ashlar-j2k" }
-          ashlar-j2k-native = { path = "../ashlar/crates/ashlar-j2k-native" }
-          ashlar-j2k-metal = { path = "../ashlar/crates/ashlar-j2k-metal" }
-          ashlar-tilecodec = { path = "../ashlar/crates/ashlar-tilecodec" }
-          EOF
       - run: cargo xtask package
         working-directory: ziggurat
 
@@ -159,26 +86,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: ziggurat
-      - uses: actions/checkout@v4
-        with:
-          repository: jcwal1516/ashlar
-          path: ashlar
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Patch ashlar from sibling checkout
-        working-directory: ziggurat
-        run: |
-          mkdir -p .cargo
-          cat >> .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          ashlar-core = { path = "../ashlar/crates/ashlar-core" }
-          ashlar-jpeg = { path = "../ashlar/crates/ashlar-jpeg" }
-          ashlar-jpeg-metal = { path = "../ashlar/crates/ashlar-jpeg-metal" }
-          ashlar-j2k = { path = "../ashlar/crates/ashlar-j2k" }
-          ashlar-j2k-native = { path = "../ashlar/crates/ashlar-j2k-native" }
-          ashlar-j2k-metal = { path = "../ashlar/crates/ashlar-j2k-metal" }
-          ashlar-tilecodec = { path = "../ashlar/crates/ashlar-tilecodec" }
-          EOF
       - run: cargo xtask coverage
         working-directory: ziggurat
       - uses: actions/upload-artifact@v4
