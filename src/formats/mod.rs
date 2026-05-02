@@ -4,3 +4,5 @@ pub(crate) mod mirax;
 pub(crate) mod olympus_vsi;
 pub(crate) mod svcache;
 pub(crate) mod tiff_family;
+pub(crate) mod zeiss;
+pub(crate) mod zeiss_zvi;

@@ -103,10 +103,7 @@ fn aperio_jpeg_rgb_regression_path() -> Option<PathBuf> {
         return Some(resolve_compare_path(PathBuf::from(path)));
     }
 
-    let local = PathBuf::from(
-        "/Users/user/Downloads/gdc_download_20260222_000619.992001/dfc7216d-a42b-40a7-87fa-29b207fdcb66/Metastatic Melanoma.svs",
-    );
-    local.is_file().then_some(local)
+    None
 }
 
 fn resolve_compare_path(path: PathBuf) -> PathBuf {

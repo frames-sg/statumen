@@ -29,6 +29,8 @@ use crate::properties::Properties;
 const FILE_MAGIC: &[u8; 16] = b"ZISRAWFILE\0\0\0\0\0\0";
 const DEFAULT_TILE_PX: u32 = 256;
 const ASSOCIATED_JPEG_PROBE_BYTES: u64 = 256 << 10;
+type LevelImageCache = Mutex<LruCache<(usize, usize), Arc<CpuTile>>>;
+type LocalTileCache = Mutex<LruCache<(usize, usize, i64, i64), Arc<CpuTile>>>;
 
 static TEMP_BLOB_COUNTER: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
@@ -100,12 +102,6 @@ impl FormatProbe for ZeissBackend {
             });
         }
 
-        let slide = self.parse(path)?;
-        self.probe_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .put(key, slide);
-
         Ok(ProbeResult {
             detected: true,
             vendor: "zeiss".into(),
@@ -125,7 +121,14 @@ impl DatasetReader for ZeissBackend {
             .cloned();
         let slide = match cached {
             Some(slide) => slide,
-            None => self.parse(path)?,
+            None => {
+                let slide = self.parse(path)?;
+                self.probe_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .put(key, slide.clone());
+                slide
+            }
         };
         Ok(Box::new(ZeissReader { slide }))
     }
@@ -186,11 +189,10 @@ impl ZeissReader {
 struct ZeissSlide {
     dataset: Dataset,
     czi: Mutex<CziFile>,
-    level_cache: Mutex<LruCache<(usize, usize), Arc<CpuTile>>>,
-    tile_cache: Mutex<LruCache<(usize, usize, i64, i64), Arc<CpuTile>>>,
+    level_cache: LevelImageCache,
+    tile_cache: LocalTileCache,
     associated_cache: Mutex<LruCache<String, Arc<CpuTile>>>,
     associated_sources: HashMap<String, czi_rs::AttachmentInfo>,
-    scene_indices: Vec<usize>,
     subblock_origin: (i32, i32),
     canvas_level_subblocks: Vec<Vec<usize>>,
     canvas_level_tile_subblocks: Vec<StdHashMap<(i64, i64), Vec<usize>>>,
@@ -357,7 +359,6 @@ impl ZeissSlide {
             tile_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(8).unwrap())),
             associated_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(4).unwrap())),
             associated_sources,
-            scene_indices,
             subblock_origin,
             canvas_level_subblocks,
             canvas_level_tile_subblocks,
@@ -567,8 +568,7 @@ impl ZeissSlide {
         );
         let subblocks: Vec<_> = candidate_infos
             .iter()
-            .cloned()
-            .filter(|info| {
+            .filter(|&info| {
                 let global_rect = IntRect::new(
                     (info.rect.x - self.subblock_origin.0).div_euclid(_level_ratio),
                     (info.rect.y - self.subblock_origin.1).div_euclid(_level_ratio),
@@ -577,6 +577,7 @@ impl ZeissSlide {
                 );
                 global_rect.intersect(tile_rect).is_some()
             })
+            .cloned()
             .collect();
         if subblocks.is_empty() {
             #[cfg(test)]
@@ -648,13 +649,13 @@ impl ZeissSlide {
                 (info.rect.y - self.subblock_origin.1).div_euclid(_level_ratio) - tile_origin_y;
             blit_rgb_sample(
                 &mut destination,
-                tile_w,
-                tile_h,
-                sample.width,
-                sample.height,
-                sample_data,
-                blit_x,
-                blit_y,
+                (tile_w, tile_h),
+                RgbSample {
+                    width: sample.width,
+                    height: sample.height,
+                    data: sample_data,
+                },
+                (blit_x, blit_y),
             )?;
         }
 
@@ -906,48 +907,6 @@ fn subblock_matches_default_plane(
     _statistics: &czi_rs::SubBlockStatistics,
 ) -> bool {
     true
-}
-
-fn scene_dimensions(
-    statistics: &czi_rs::SubBlockStatistics,
-    scene: usize,
-    summary: &czi_rs::MetadataSummary,
-    path: &Path,
-) -> Result<(u64, u64), WsiError> {
-    if let Some(bounding_boxes) = statistics.scene_bounding_boxes.get(&(scene as i32)) {
-        if bounding_boxes.layer0.is_valid() {
-            return Ok((
-                bounding_boxes.layer0.w.max(0) as u64,
-                bounding_boxes.layer0.h.max(0) as u64,
-            ));
-        }
-        if bounding_boxes.all.is_valid() {
-            return Ok((
-                bounding_boxes.all.w.max(0) as u64,
-                bounding_boxes.all.h.max(0) as u64,
-            ));
-        }
-    }
-
-    let w = summary
-        .image
-        .sizes
-        .get(&CziDimension::X)
-        .copied()
-        .unwrap_or(0) as u64;
-    let h = summary
-        .image
-        .sizes
-        .get(&CziDimension::Y)
-        .copied()
-        .unwrap_or(0) as u64;
-    if w == 0 || h == 0 {
-        return Err(invalid_slide(
-            path,
-            format!("missing scene {} dimensions", scene),
-        ));
-    }
-    Ok((w, h))
 }
 
 fn canvas_dimensions(
@@ -1250,23 +1209,32 @@ fn blit_tile(
     Ok(())
 }
 
+struct RgbSample<'a> {
+    width: u32,
+    height: u32,
+    data: &'a [u8],
+}
+
 fn blit_rgb_sample(
     destination: &mut [u8],
-    dest_width: u32,
-    dest_height: u32,
-    src_width: u32,
-    src_height: u32,
-    source: &[u8],
-    offset_x: i32,
-    offset_y: i32,
+    dest_size: (u32, u32),
+    source: RgbSample<'_>,
+    offset: (i32, i32),
 ) -> Result<(), WsiError> {
-    let source_rect = IntRect::new(offset_x, offset_y, src_width as i32, src_height as i32);
+    let (dest_width, dest_height) = dest_size;
+    let (offset_x, offset_y) = offset;
+    let source_rect = IntRect::new(
+        offset_x,
+        offset_y,
+        source.width as i32,
+        source.height as i32,
+    );
     let destination_rect = IntRect::new(0, 0, dest_width as i32, dest_height as i32);
     let Some(intersection) = source_rect.intersect(destination_rect) else {
         return Ok(());
     };
 
-    let src_stride = src_width as usize * 3;
+    let src_stride = source.width as usize * 3;
     let dest_stride = dest_width as usize * 3;
     for row in 0..intersection.h as usize {
         let src_x = (intersection.x - offset_x) as usize;
@@ -1288,7 +1256,7 @@ fn blit_rgb_sample(
                 WsiError::DisplayConversion("Zeiss destination RGB tile offset overflow".into())
             })?;
         destination[dst_offset..dst_offset + row_bytes]
-            .copy_from_slice(&source[src_offset..src_offset + row_bytes]);
+            .copy_from_slice(&source.data[src_offset..src_offset + row_bytes]);
     }
 
     Ok(())
@@ -1636,19 +1604,45 @@ fn invalid_slide(path: &Path, message: impl Into<String>) -> WsiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     static ZEISS_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn zeiss_uncompressed_fixture() -> Option<PathBuf> {
+        if let Some(path) = env::var_os("STATUMEN_ZEISS_CZI_PATH").map(PathBuf::from) {
+            return path.is_file().then_some(path);
+        }
+
+        let local = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("SlideViewer")
+            .join("downloads")
+            .join("openslide-testdata")
+            .join("Zeiss")
+            .join("Zeiss-5-Uncompressed.czi");
+        local.is_file().then_some(local)
+    }
+
+    fn zeiss_fixture_or_skip() -> Option<PathBuf> {
+        let path = zeiss_uncompressed_fixture();
+        if path.is_none() {
+            eprintln!("[zeiss] skipping: set STATUMEN_ZEISS_CZI_PATH to Zeiss-5-Uncompressed.czi");
+        }
+        path
+    }
 
     #[test]
     fn uncompressed_sentinel_hits_local_tile_path() {
         let _guard = ZEISS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         ZEISS_LOCAL_TILE_HITS.store(0, Ordering::Relaxed);
         ZEISS_DIRECT_UNCOMPRESSED_BLIT_HITS.store(0, Ordering::Relaxed);
-        let path = Path::new(
-            "/Users/user/Bench/SlideViewer/downloads/openslide-testdata/Zeiss/Zeiss-5-Uncompressed.czi",
-        );
-        let handle = crate::core::registry::Slide::open(path).expect("open Zeiss sentinel");
+        let Some(path) = zeiss_fixture_or_skip() else {
+            return;
+        };
+        let handle = crate::core::registry::Slide::open(&path).expect("open Zeiss sentinel");
         assert_eq!(handle.dataset().scenes.len(), 1);
         assert_eq!(handle.dataset().scenes[0].series.len(), 1);
         assert_eq!(handle.dataset().scenes[0].series[0].levels.len(), 5);
@@ -1692,10 +1686,10 @@ mod tests {
     #[test]
     fn uncompressed_sentinel_pan_trace_l0_reads_successfully() {
         let _guard = ZEISS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let path = Path::new(
-            "/Users/user/Bench/SlideViewer/downloads/openslide-testdata/Zeiss/Zeiss-5-Uncompressed.czi",
-        );
-        let handle = crate::core::registry::Slide::open(path).expect("open Zeiss sentinel");
+        let Some(path) = zeiss_fixture_or_skip() else {
+            return;
+        };
+        let handle = crate::core::registry::Slide::open(&path).expect("open Zeiss sentinel");
         let dims = handle.dataset().scenes[0].series[0].levels[0].dimensions;
         let tile_px = 256i64;
         let center = ((dims.0 / 2) as i64, (dims.1 / 2) as i64);
@@ -1730,10 +1724,10 @@ mod tests {
     #[test]
     fn uncompressed_sentinel_gap_tile_is_blank() {
         let _guard = ZEISS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
-        let path = Path::new(
-            "/Users/user/Bench/SlideViewer/downloads/openslide-testdata/Zeiss/Zeiss-5-Uncompressed.czi",
-        );
-        let handle = crate::core::registry::Slide::open(path).expect("open Zeiss sentinel");
+        let Some(path) = zeiss_fixture_or_skip() else {
+            return;
+        };
+        let handle = crate::core::registry::Slide::open(&path).expect("open Zeiss sentinel");
         let req = crate::core::types::TileViewRequest {
             scene: 0,
             series: 0,
@@ -1755,16 +1749,16 @@ mod tests {
     fn uncompressed_sentinel_top_left_tile_is_not_blank() {
         let _guard = ZEISS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         ZEISS_DIRECT_UNCOMPRESSED_BLIT_HITS.store(0, Ordering::Relaxed);
-        let path = Path::new(
-            "/Users/user/Bench/SlideViewer/downloads/openslide-testdata/Zeiss/Zeiss-5-Uncompressed.czi",
-        );
-        let slide = ZeissSlide::parse(path).expect("parse Zeiss sentinel");
+        let Some(path) = zeiss_fixture_or_skip() else {
+            return;
+        };
+        let slide = ZeissSlide::parse(&path).expect("parse Zeiss sentinel");
         let candidate_indices = slide.canvas_level_subblocks[0].clone();
         assert!(
             !candidate_indices.is_empty(),
             "expected level-0 Zeiss subblocks on the shared canvas"
         );
-        let handle = crate::core::registry::Slide::open(path).expect("open Zeiss sentinel");
+        let handle = crate::core::registry::Slide::open(&path).expect("open Zeiss sentinel");
         let req = crate::core::types::TileViewRequest {
             scene: 0,
             series: 0,
@@ -1790,10 +1784,10 @@ mod tests {
         let _guard = ZEISS_TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         ZEISS_DIRECT_LEVEL_COMPOSE_HITS.store(0, Ordering::Relaxed);
         ZEISS_DIRECT_UNCOMPRESSED_BLIT_HITS.store(0, Ordering::Relaxed);
-        let path = Path::new(
-            "/Users/user/Bench/SlideViewer/downloads/openslide-testdata/Zeiss/Zeiss-5-Uncompressed.czi",
-        );
-        let slide = ZeissSlide::parse(path).expect("parse Zeiss sentinel");
+        let Some(path) = zeiss_fixture_or_skip() else {
+            return;
+        };
+        let slide = ZeissSlide::parse(&path).expect("parse Zeiss sentinel");
         let scene = 0;
         let level = slide.dataset.scenes[scene].series[0].levels.len() - 1;
         let image = slide

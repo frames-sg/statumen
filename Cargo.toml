@@ -1,6 +1,6 @@
 [package]
 name = "statumen"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 description = "Statumen whole-slide image reader"
@@ -28,7 +28,7 @@ parity-openslide = []
 # Off by default; macOS only; CI matrix runs with and without.
 parity-metal = []
 # Enables Metal-backed device payload plumbing for Phase 5.
-metal = ["dep:metal", "dep:signinum-jpeg-metal"]
+metal = ["dep:metal", "dep:signinum-jpeg-metal", "dep:signinum-j2k-metal"]
 cuda = []
 
 [dependencies]
@@ -49,14 +49,17 @@ zstd = "0.13"
 signinum-jpeg = "=1.0.0"
 signinum-core = "=1.0.0"
 signinum-tilecodec = "=1.0.0"
+signinum-j2k = "=1.1.0"
 signinum-jpeg-metal = { version = "=0.2.0", optional = true }
-signinum-j2k-metal = "=0.2.0"
+signinum-j2k-metal = { version = "=0.3.0", optional = true }
 metal = { version = "0.31", optional = true }
 dicom-core = "0.9"
 dicom-object = "0.9"
 dicom-dictionary-std = "0.9"
 dicom-parser = "0.9"
 dicom-transfer-syntax-registry = { version = "0.9", default-features = false }
+czi-rs = "0.1.0"
+cfb = "0.14.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -65,7 +68,7 @@ jpeg-encoder = "0.6"
 tempfile = "3"
 toml = "0.8"
 libloading = "0.8"
-signinum-j2k-native = "=0.2.0"
+signinum-j2k-native = "=0.3.0"
 
 [build-dependencies]
 pkg-config = "0.3"
@@ -114,3 +117,12 @@ path = "src/bin/svcache.rs"
 [workspace]
 members = [".", "xtask"]
 resolver = "2"
+
+[patch.crates-io]
+signinum-core = { path = "../signinum/crates/signinum-core" }
+signinum-jpeg = { path = "../signinum/crates/signinum-jpeg" }
+signinum-jpeg-metal = { path = "../signinum/crates/signinum-jpeg-metal" }
+signinum-j2k = { path = "../signinum/crates/signinum-j2k" }
+signinum-j2k-metal = { path = "../signinum/crates/signinum-j2k-metal" }
+signinum-j2k-native = { path = "../signinum/crates/signinum-j2k-native" }
+signinum-tilecodec = { path = "../signinum/crates/signinum-tilecodec" }

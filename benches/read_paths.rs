@@ -3,14 +3,16 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use image::RgbImage;
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
 use statumen::{PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest, TileViewRequest};
 use tempfile::NamedTempFile;
 
 const TILE_CACHE_BYTES_ENV: &str = "STATUMEN_TILE_CACHE_BYTES";
-const DEFAULT_REAL_WSI_ROOT: &str = "/Users/user/Bench/SlideViewer/downloads/openslide-testdata";
+const DEFAULT_REAL_WSI_ROOT_RELATIVE: &[&str] = &["downloads", "openslide-testdata"];
+const DEFAULT_SLIDEVIEWER_WSI_ROOT_RELATIVE: &[&str] =
+    &["..", "SlideViewer", "downloads", "openslide-testdata"];
 
 struct EnvVarGuard {
     key: &'static str,
@@ -66,11 +68,46 @@ fn external_slide_path(env_var: &str, relative_default: &[&str]) -> Option<PathB
         }
     }
 
-    let mut path = PathBuf::from(DEFAULT_REAL_WSI_ROOT);
-    for part in relative_default {
-        path.push(part);
+    for root in [
+        DEFAULT_REAL_WSI_ROOT_RELATIVE,
+        DEFAULT_SLIDEVIEWER_WSI_ROOT_RELATIVE,
+    ] {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        for part in root {
+            path.push(part);
+        }
+        for part in relative_default {
+            path.push(part);
+        }
+        if path.is_file() {
+            return Some(path);
+        }
     }
+
+    None
+}
+
+fn external_slide_path_env_only(env_var: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(env::var_os(env_var)?);
     path.is_file().then_some(path)
+}
+
+fn external_sample_region(handle: &Slide) -> RegionRequest {
+    centered_level0_region(handle, 512)
+}
+
+fn external_sample_display_tile(handle: &Slide) -> TileViewRequest {
+    let dims = handle.dataset().scenes[0].series[0].levels[0].dimensions;
+    TileViewRequest {
+        scene: 0,
+        series: 0,
+        level: 0,
+        plane: PlaneSelection::default(),
+        col: 0,
+        row: 0,
+        tile_width: 256.min(dims.0 as u32),
+        tile_height: 256.min(dims.1 as u32),
+    }
 }
 
 fn regular_level_with_min_tiles(
@@ -372,42 +409,44 @@ fn benchmark_handle_reads(c: &mut Criterion) {
 
 fn benchmark_external_samples(c: &mut Criterion) {
     let sample_vars = [
-        ("aperio_jpeg", "STATUMEN_BENCH_APERIO_JPEG"),
-        ("aperio_jp2k", "STATUMEN_BENCH_APERIO_JP2K"),
-        ("ndpi", "STATUMEN_BENCH_NDPI"),
+        ("aperio_jpeg", "STATUMEN_BENCH_APERIO_JPEG", None),
+        ("aperio_jp2k", "STATUMEN_BENCH_APERIO_JP2K", None),
+        ("ndpi", "STATUMEN_BENCH_NDPI", None),
+        (
+            "zeiss_zvi_merged",
+            "STATUMEN_BENCH_ZEISS_ZVI",
+            Some(&["Zeiss", "Zeiss-1-Merged.zvi"][..]),
+        ),
+        (
+            "zeiss_zvi_mosaic",
+            "STATUMEN_BENCH_ZEISS_ZVI_MOSAIC",
+            Some(&["Zeiss", "Zeiss-3-Mosaic.zvi"][..]),
+        ),
+        (
+            "zeiss_czi",
+            "STATUMEN_BENCH_ZEISS_CZI",
+            Some(&["Zeiss", "Zeiss-5-Uncompressed.czi"][..]),
+        ),
     ];
 
     let mut group = c.benchmark_group("external_samples");
-    for (label, env_var) in sample_vars {
-        let Some(path) = env::var_os(env_var) else {
-            continue;
-        };
-        let path = Path::new(&path);
-        if !path.is_file() {
-            continue;
-        }
+    for (label, env_var, relative_default) in sample_vars {
+        let path = relative_default
+            .and_then(|relative_default| external_slide_path(env_var, relative_default))
+            .or_else(|| external_slide_path_env_only(env_var));
+        let Some(path) = path else { continue };
 
-        let handle = Slide::open(path).expect("open external benchmark slide");
-        let tile_req = TileViewRequest {
-            scene: 0,
-            series: 0,
-            level: 0,
-            plane: PlaneSelection::default(),
-            col: 0,
-            row: 0,
-            tile_width: 256,
-            tile_height: 256,
-        };
-        let region_req =
-            RegionRequest::legacy_xywh(0, 0, 0, PlaneSelection::default(), 512, 512, 512, 512);
+        let handle = Slide::open(&path).expect("open external benchmark slide");
+        let tile_req = external_sample_display_tile(&handle);
+        let region_req = external_sample_region(&handle);
 
         group.bench_with_input(
             BenchmarkId::new(label, "display_tile"),
             &handle,
-            |b, handle| b.iter(|| handle.read_display_tile(&tile_req).unwrap()),
+            |b, handle| b.iter(|| black_box(handle.read_display_tile(&tile_req).unwrap())),
         );
         group.bench_with_input(BenchmarkId::new(label, "region"), &handle, |b, handle| {
-            b.iter(|| handle.read_region(&region_req).unwrap())
+            b.iter(|| black_box(handle.read_region(&region_req).unwrap()))
         });
     }
     group.finish();

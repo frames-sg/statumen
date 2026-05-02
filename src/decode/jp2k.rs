@@ -10,11 +10,13 @@ use crate::error::WsiError;
 use image::RgbaImage;
 use std::borrow::Cow;
 
-use signinum_core::{
-    BackendRequest as SigninumBackendRequest, DeviceSurface as SigninumDeviceSurface,
-    ImageDecodeDevice as SigninumImageDecodeDevice, PixelFormat as SigninumPixelFormat,
-};
-use signinum_j2k_metal::{J2kDecoder as SigninumJp2kDecoder, MetalTileBatch};
+#[cfg(feature = "metal")]
+use signinum_core::DeviceSurface as SigninumDeviceSurface;
+use signinum_core::{BackendRequest as SigninumBackendRequest, PixelFormat as SigninumPixelFormat};
+use signinum_j2k::J2kDecoder as SigninumJp2kDecoder;
+#[cfg(feature = "metal")]
+use signinum_j2k_metal::{J2kDecoder as SigninumMetalJp2kDecoder, MetalTileBatch};
+#[cfg(feature = "metal")]
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,12 +83,21 @@ fn decode_jp2k_to_sample_buffer_with_backend(
 ) -> Result<CpuTile, WsiError> {
     let header = validate_jp2k_decode_request(data, expected_width, expected_height)?;
     let output_colorspace = effective_output_colorspace(&header, colorspace);
-    let mut decoder =
-        SigninumJp2kDecoder::new(data).map_err(|err| WsiError::Jp2k(err.to_string()))?;
-    let surface = decoder
-        .decode_to_device(SigninumPixelFormat::Rgb8, backend)
-        .map_err(|err| WsiError::Jp2k(format!("signinum JP2K decode failed: {err}")))?;
-    sample_buffer_from_signinum_surface(surface, expected_width, expected_height, output_colorspace)
+    match backend {
+        SigninumBackendRequest::Auto | SigninumBackendRequest::Cpu => {
+            decode_jp2k_to_sample_buffer_cpu(
+                data,
+                expected_width,
+                expected_height,
+                output_colorspace,
+            )
+        }
+        SigninumBackendRequest::Metal | SigninumBackendRequest::Cuda => {
+            Err(WsiError::Unsupported {
+                reason: "device backend not available for CPU JP2K sample-buffer decode".into(),
+            })
+        }
+    }
 }
 
 pub(crate) fn decode_jp2k_tile_batch_to_sample_buffers(
@@ -169,7 +180,7 @@ fn decode_one_jp2k_pixels(
             Jp2kColorSpace::YCbCr
         },
     );
-    let mut decoder = SigninumJp2kDecoder::new(job.data.as_ref())
+    let mut decoder = SigninumMetalJp2kDecoder::new(job.data.as_ref())
         .map_err(|err| WsiError::Jp2k(err.to_string()))?;
     let surface = decoder
         .decode_to_device_with_session(SigninumPixelFormat::Rgb8, metal_sessions.j2k())
@@ -215,49 +226,42 @@ fn validate_jp2k_decode_request(
     Ok(header)
 }
 
+fn decode_jp2k_to_sample_buffer_cpu(
+    data: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+    colorspace: Jp2kColorSpace,
+) -> Result<CpuTile, WsiError> {
+    let mut decoder =
+        SigninumJp2kDecoder::new(data).map_err(|err| WsiError::Jp2k(err.to_string()))?;
+    let (width, height) = decoder.info().dimensions;
+    let row_bytes = (width as usize)
+        .checked_mul(SigninumPixelFormat::Rgb8.bytes_per_pixel())
+        .ok_or_else(|| WsiError::Jp2k("signinum JP2K row byte count overflow".into()))?;
+    let len = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(|| WsiError::Jp2k("signinum JP2K output size overflow".into()))?;
+    let mut rgb = vec![0; len];
+
+    decoder
+        .decode_into(&mut rgb, row_bytes, SigninumPixelFormat::Rgb8)
+        .map_err(|err| WsiError::Jp2k(format!("signinum JP2K decode failed: {err}")))?;
+
+    sample_buffer_from_rgb8_bytes(
+        rgb,
+        width,
+        height,
+        expected_width,
+        expected_height,
+        colorspace,
+    )
+}
+
 #[allow(dead_code)]
 fn decode_jp2k_tile_batch_with_signinum(
     reqs: &[Jp2kDecodeJob<'_>],
 ) -> Result<Vec<CpuTile>, WsiError> {
-    let headers = reqs
-        .iter()
-        .map(|req| {
-            validate_jp2k_decode_request(req.data.as_ref(), req.expected_width, req.expected_height)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut batch = MetalTileBatch::with_capacity(reqs.len());
-    for req in reqs {
-        batch
-            .push_shared_tile(
-                Arc::<[u8]>::from(req.data.as_ref()),
-                SigninumPixelFormat::Rgb8,
-                req.backend,
-            )
-            .map_err(|err| WsiError::Jp2k(format!("signinum JP2K batch submit failed: {err}")))?;
-    }
-
-    let surfaces = batch
-        .decode_all()
-        .map_err(|err| WsiError::Jp2k(format!("signinum JP2K batch decode failed: {err}")))?;
-    surfaces
-        .into_iter()
-        .zip(reqs.iter().zip(headers.iter()))
-        .map(|(surface, (req, header))| {
-            sample_buffer_from_signinum_surface(
-                surface,
-                req.expected_width,
-                req.expected_height,
-                effective_output_colorspace(
-                    header,
-                    if req.rgb_color_space {
-                        Jp2kColorSpace::Rgb
-                    } else {
-                        Jp2kColorSpace::YCbCr
-                    },
-                ),
-            )
-        })
-        .collect()
+    reqs.iter().map(decode_one_jp2k_job).collect()
 }
 
 #[cfg(feature = "metal")]
@@ -291,7 +295,7 @@ fn decode_jp2k_tile_batch_to_pixels(
     let surfaces = reqs
         .iter()
         .map(|req| {
-            let mut decoder = SigninumJp2kDecoder::new(req.data.as_ref())
+            let mut decoder = SigninumMetalJp2kDecoder::new(req.data.as_ref())
                 .map_err(|err| WsiError::Jp2k(err.to_string()))?;
             decoder
                 .decode_to_device_with_session(SigninumPixelFormat::Rgb8, metal_sessions.j2k())
@@ -413,6 +417,27 @@ fn tile_pixels_from_jp2k_surface(
         .map(TilePixels::Cpu)
 }
 
+fn sample_buffer_from_rgb8_bytes(
+    bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+    expected_width: u32,
+    expected_height: u32,
+    colorspace: Jp2kColorSpace,
+) -> Result<CpuTile, WsiError> {
+    crop_sample_buffer(
+        interleaved_image_to_sample_buffer(DecodedInterleavedImage {
+            width: width as usize,
+            height: height as usize,
+            colorspace,
+            pixels: bytes,
+        })?,
+        expected_width,
+        expected_height,
+    )
+}
+
+#[cfg(feature = "metal")]
 fn sample_buffer_from_signinum_surface(
     surface: signinum_j2k_metal::Surface,
     expected_width: u32,
@@ -437,15 +462,13 @@ fn sample_buffer_from_signinum_surface(
         )));
     }
 
-    crop_sample_buffer(
-        interleaved_image_to_sample_buffer(DecodedInterleavedImage {
-            width: width as usize,
-            height: height as usize,
-            colorspace,
-            pixels: bytes.to_vec(),
-        })?,
+    sample_buffer_from_rgb8_bytes(
+        bytes.to_vec(),
+        width,
+        height,
         expected_width,
         expected_height,
+        colorspace,
     )
 }
 

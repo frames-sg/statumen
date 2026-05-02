@@ -28,6 +28,10 @@ src/
 │   ├── dicom.rs              DICOM WSI (JP2K, JPEG, RLE, native transfer syntaxes)
 │   ├── mirax.rs              Mirax / 3DHistech (.mrxs)
 │   ├── hamamatsu_vms.rs      Hamamatsu VMS
+│   ├── olympus_vsi.rs        Olympus VSI/ETS
+│   ├── svcache.rs            statumen tile cache container
+│   ├── zeiss.rs              Zeiss CZI
+│   ├── zeiss_zvi.rs          Zeiss ZVI
 │   └── tiff_family/          umbrella for TIFF-shaped vendors
 │       ├── container.rs      TiffContainer (full IFD chain)
 │       ├── pixel_access.rs   TiffPixelReader
@@ -89,7 +93,13 @@ A module may only `use` items from modules at or below its level. `formats/*` ma
 1. `DicomBackend`
 2. `MiraxBackend`
 3. `HamamatsuVmsBackend`
-4. `TiffFamilyBackend`
+4. `OlympusVsiBackend`
+5. `ZeissZviBackend`
+6. `ZeissBackend`
+7. `TiffFamilyBackend`
+
+`FormatRegistry::builtin()` registers `SvcacheBackend` before the native
+backends so explicit `.svcache` opens are handled first.
 
 `FormatRegistry::open(path)` probes all backends, picks the highest `ProbeConfidence`
 (`Definite > Likely`), and on a tie returns the **first registered** match.
@@ -108,7 +118,11 @@ path  ──► FormatProbe (each backend, cheap)
             ├── TIFF-family ──► tiff_family::pixel_access ──► decode::jpeg / decode::jp2k
             ├── DICOM       ──► decode::jp2k / decode::jpeg / RLE / native (per transfer syntax)
             ├── Mirax       ──► decode::jpeg (zlib-decompressed JPEG tiles)
-            └── Hamamatsu   ──► decode::jpeg (fixed pyramid scales [2, 4, 8])
+            ├── Hamamatsu   ──► decode::jpeg (fixed pyramid scales [2, 4, 8])
+            ├── Olympus VSI ──► decode::jp2k
+            ├── Zeiss CZI   ──► czi-rs + decode::jpeg
+            ├── Zeiss ZVI   ──► CFB/OLE + raw/zlib/JPEG plane payloads
+            └── .svcache    ──► cached RGB tile payloads
             │
             ▼
         TilePixels {Cpu(CpuTile) | Device(MetalDeviceTile)}
@@ -128,7 +142,7 @@ path  ──► FormatProbe (each backend, cheap)
 | W5 | **JPEG decode is bounded.** `MAX_JPEG_DECODE_BYTES = 512 MiB`, `JPEG_MAX_DIMENSION = 65500` to prevent OOM from crafted headers. | `src/decode/jpeg.rs:25–26`. |
 | W6 | **`SlideReader::read_tile` is a default thin wrapper over `read_tiles`.** Backends override `read_tiles` when batching is cheaper; semantics for a 1-element batch must equal a single `read_tile`. | `registry.rs:114–135`. |
 | W7 | **`CacheKey` must include all addressing dims:** `(dataset_id, scene, series, level, z, c, t, col, row)`. Dropping a dim is a correctness bug. | `core/registry.rs:251–270` / `core/cache.rs`. |
-| W8 | **`zeiss.rs` is not registered.** It exists in `src/formats/zeiss.rs` but is not declared in `formats/mod.rs`, so it is unreachable from `FormatRegistry`. Either wire it up + register it, or delete it. | `src/formats/mod.rs` (1–4). |
+| W8 | **Every source backend module must be registered or intentionally absent.** Dead format modules are public-surface risk because they can advertise unsupported behavior and may be packaged accidentally. | `src/formats/mod.rs`, `core/registry.rs`. |
 
 ## 5. Tests, examples, benches
 
@@ -137,6 +151,8 @@ path  ──► FormatProbe (each backend, cheap)
 | Tests | `tests/signinum_parity.rs` | CPU vs reference oracle tolerance. |
 | Tests | `tests/openslide_parity.rs` | Parity with libopenslide (gated by `openslide-bench` feature). |
 | Tests | `tests/real_wsi_behavior.rs` | Real-slide behavioural checks. |
+| Tests | `tests/zeiss_czi.rs` | Native Zeiss CZI open and tile-read coverage. |
+| Tests | `tests/zeiss_zvi.rs` | Native Zeiss ZVI merged, stacked, and mosaic coverage. |
 | Tests | `tests/metal_surface_smoke.rs` | Metal device-tile smoke (feature `metal`). |
 | Tests | `tests/phase3_prereq.rs` | Phase-3 prerequisite checks. |
 | Examples | `examples/fw01_trace_pattern.rs` | Trace-pattern usage example. |
@@ -153,7 +169,7 @@ For an agent or engineer adding a new vendor:
 5. **Wire the module** in `src/formats/mod.rs`: `pub(crate) mod <vendor>;`.
 6. **Register the backend** in `FormatRegistry::builtin` (`src/core/registry.rs`). Insert at the position that respects the desired tie-break order (W4): more specific backends first.
 7. **Add a parity test** under `tests/` that opens a representative file and checks at least one tile against a known oracle.
-8. **Update `/architecture.md` §1.2 and W8** if this addition changes the surface (e.g., new vendor listed, `zeiss.rs` resolved).
+8. **Update `/architecture.md` §1.2 and W8** if this addition changes the surface.
 
 Do **not**:
 
