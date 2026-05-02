@@ -1,4 +1,4 @@
-//! Ashlar, reference, and OpenSlide oracle helpers.
+//! Signinum, reference, and OpenSlide oracle helpers.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jpeg_decoder::{Decoder as ReferenceJpegDecoder, PixelFormat as ReferenceJpegPixelFormat};
-use ziggurat::{
+use statumen::{
     CpuTile, FormatRegistry, PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest,
 };
 
@@ -93,15 +93,15 @@ pub fn is_reference_oracle_unsupported(err: &str) -> bool {
     err.starts_with("reference oracle unsupported")
 }
 
-pub struct AshlarOracle;
+pub struct SigninumOracle;
 
-impl Oracle for AshlarOracle {
+impl Oracle for SigninumOracle {
     fn name(&self) -> &'static str {
-        "ashlar"
+        "signinum"
     }
 
     fn open(&self, slide_path: &Path) -> Result<OpenedSlide, String> {
-        open_via_ziggurat(slide_path, "ashlar", false)
+        open_via_statumen(slide_path, "signinum", false)
     }
 }
 
@@ -113,18 +113,18 @@ impl Oracle for ReferenceOracle {
     }
 
     fn open(&self, slide_path: &Path) -> Result<OpenedSlide, String> {
-        open_via_ziggurat(slide_path, "reference", true)
+        open_via_statumen(slide_path, "reference", true)
     }
 }
 
-fn open_via_ziggurat(
+fn open_via_statumen(
     slide_path: &Path,
     name: &'static str,
     use_reference_jpeg: bool,
 ) -> Result<OpenedSlide, String> {
     let registry = FormatRegistry::builtin();
     let handle = Slide::open_with_cache_bytes(slide_path, &registry, 64 * 1024 * 1024)
-        .map_err(|e| format!("ziggurat::open_with({}): {e}", slide_path.display()))?;
+        .map_err(|e| format!("statumen::open_with({}): {e}", slide_path.display()))?;
     let levels = &handle.dataset().scenes[0].series[0].levels;
     let level_count = levels.len() as u32;
     let level_dimensions: Vec<(u64, u64)> = levels.iter().map(|level| level.dimensions).collect();
@@ -867,11 +867,11 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
     #[allow(unused_imports)]
-    use ziggurat::{ColorSpace, CpuTileData, CpuTileLayout};
+    use statumen::{ColorSpace, CpuTileData, CpuTileLayout};
 
     #[test]
-    fn ashlar_oracle_name() {
-        assert_eq!(AshlarOracle.name(), "ashlar");
+    fn signinum_oracle_name() {
+        assert_eq!(SigninumOracle.name(), "signinum");
     }
 
     #[test]

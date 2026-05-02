@@ -50,7 +50,7 @@ pub enum WsiError {
     #[error("display conversion error: {0}")]
     DisplayConversion(String),
 
-    /// Codec-layer error from ashlar or the transitional facade.
+    /// Codec-layer error from signinum or the transitional facade.
     #[error("codec error in {codec}: {source}")]
     Codec {
         codec: &'static str,

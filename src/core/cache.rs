@@ -6,9 +6,9 @@ use crate::core::types::{CpuTile, DatasetId};
 // ── TileCache (axis-aware) ────────────────────────────────────────
 
 pub(crate) const DEFAULT_TILE_CACHE_SIZE: u64 = 8 * 1024 * 1024; // 8 MB
-const TILE_CACHE_BYTES_ENV: &str = "ZIGGURAT_TILE_CACHE_BYTES";
+const TILE_CACHE_BYTES_ENV: &str = "STATUMEN_TILE_CACHE_BYTES";
 pub(crate) const DEFAULT_DISPLAY_TILE_CACHE_SIZE: u64 = 1024 * 1024; // 1 MB
-const DISPLAY_TILE_CACHE_BYTES_ENV: &str = "ZIGGURAT_DISPLAY_TILE_CACHE_BYTES";
+const DISPLAY_TILE_CACHE_BYTES_ENV: &str = "STATUMEN_DISPLAY_TILE_CACHE_BYTES";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheConfig {

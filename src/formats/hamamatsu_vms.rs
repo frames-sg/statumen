@@ -6,12 +6,12 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ashlar_core::BackendRequest;
-use ashlar_jpeg::{
-    Decoder as AshlarJpegDecoder, Downscale as AshlarDownscale, PixelFormat as AshlarPixelFormat,
-    Rect as AshlarRect,
-};
 use lru::LruCache;
+use signinum_core::BackendRequest;
+use signinum_jpeg::{
+    Decoder as SigninumJpegDecoder, Downscale as SigninumDownscale,
+    PixelFormat as SigninumPixelFormat, Rect as SigninumRect,
+};
 
 use crate::core::hash::Quickhash1;
 use crate::core::registry::{
@@ -152,7 +152,7 @@ impl SlideReader for VmsReader {
                 });
             }
         })
-        .to_ashlar();
+        .to_signinum();
         reqs.iter()
             .map(|req| {
                 self.read_tile_with_backend(req, backend)
@@ -180,7 +180,7 @@ impl SlideReader for VmsReader {
             tables: None,
             expected_width: 0,
             expected_height: 0,
-            color_transform: ashlar_jpeg::ColorTransform::Auto,
+            color_transform: signinum_jpeg::ColorTransform::Auto,
             force_dimensions: false,
             requested_size: None,
         }])
@@ -547,21 +547,21 @@ impl VmsJpeg {
             path: self.path.clone(),
         })?;
         let decoder =
-            AshlarJpegDecoder::new(&data).map_err(|err| WsiError::Jpeg(err.to_string()))?;
+            SigninumJpegDecoder::new(&data).map_err(|err| WsiError::Jpeg(err.to_string()))?;
         let scale = match scale_denom {
-            1 => AshlarDownscale::None,
-            2 => AshlarDownscale::Half,
-            4 => AshlarDownscale::Quarter,
-            8 => AshlarDownscale::Eighth,
+            1 => SigninumDownscale::None,
+            2 => SigninumDownscale::Half,
+            4 => SigninumDownscale::Quarter,
+            8 => SigninumDownscale::Eighth,
             other => {
                 return Err(WsiError::Jpeg(format!(
-                    "unsupported VMS ashlar downscale denominator {other}"
+                    "unsupported VMS signinum downscale denominator {other}"
                 )));
             }
         };
         let tile_col = tile_index as u32 % self.tiles_across;
         let tile_row = tile_index as u32 / self.tiles_across;
-        let roi = AshlarRect {
+        let roi = SigninumRect {
             x: tile_col * self.tile_width,
             y: tile_row * self.tile_height,
             w: self
@@ -572,7 +572,7 @@ impl VmsJpeg {
                 .min(self.height.saturating_sub(tile_row * self.tile_height)),
         };
         let (pixels, _outcome) = decoder
-            .decode_region_scaled(AshlarPixelFormat::Rgb8, roi, scale)
+            .decode_region_scaled(SigninumPixelFormat::Rgb8, roi, scale)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?;
         let scale_denom = scale.denominator();
         let width = roi.w.div_ceil(scale_denom);
@@ -818,7 +818,7 @@ fn jpeg_geometry_from_file(path: &Path) -> Result<JpegTileGeometry, WsiError> {
 }
 
 fn jpeg_geometry_from_bytes(data: &[u8]) -> Result<JpegTileGeometry, WsiError> {
-    let info = AshlarJpegDecoder::inspect(data).map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    let info = SigninumJpegDecoder::inspect(data).map_err(|err| WsiError::Jpeg(err.to_string()))?;
     let restart_interval = info.restart_interval.ok_or_else(|| {
         WsiError::Jpeg("VMS JPEG missing restart interval required for tile geometry".into())
     })?;

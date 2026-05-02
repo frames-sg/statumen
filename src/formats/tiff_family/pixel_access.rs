@@ -7,12 +7,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use ashlar_core::BackendRequest;
-use ashlar_jpeg::{
-    ColorTransform as AshlarColorTransform, DecodeOptions as AshlarDecodeOptions,
-    Decoder as AshlarJpegDecoder, Downscale as AshlarDownscale, PixelFormat as AshlarPixelFormat,
+use signinum_core::BackendRequest;
+use signinum_jpeg::{
+    ColorTransform as SigninumColorTransform, DecodeOptions as SigninumDecodeOptions,
+    Decoder as SigninumJpegDecoder, Downscale as SigninumDownscale,
+    PixelFormat as SigninumPixelFormat,
 };
-use ashlar_tilecodec::{
+use signinum_tilecodec::{
     DeflateCodec, DeflatePool, LzwCodec, LzwPool, TileDecompress, ZstdCodec, ZstdPool,
 };
 
@@ -37,8 +38,8 @@ use crate::formats::tiff_family::layout::{
 use lru::LruCache;
 use rayon::prelude::*;
 
-fn ashlar_decode_options(color_transform: AshlarColorTransform) -> AshlarDecodeOptions {
-    AshlarDecodeOptions::default().with_color_transform(color_transform)
+fn signinum_decode_options(color_transform: SigninumColorTransform) -> SigninumDecodeOptions {
+    SigninumDecodeOptions::default().with_color_transform(color_transform)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,22 +54,22 @@ fn tiff_jpeg_color_transform(
     photometric: u32,
     samples_per_pixel: u32,
     bitstream_hint: JpegBitstreamColorHint,
-) -> AshlarColorTransform {
+) -> SigninumColorTransform {
     if samples_per_pixel == 3 {
         match bitstream_hint {
-            JpegBitstreamColorHint::Rgb => return AshlarColorTransform::ForceRgb,
+            JpegBitstreamColorHint::Rgb => return SigninumColorTransform::ForceRgb,
             JpegBitstreamColorHint::RgbComponentIds012 if photometric != 6 => {
-                return AshlarColorTransform::ForceRgb;
+                return SigninumColorTransform::ForceRgb;
             }
-            JpegBitstreamColorHint::YCbCr => return AshlarColorTransform::ForceYCbCr,
+            JpegBitstreamColorHint::YCbCr => return SigninumColorTransform::ForceYCbCr,
             JpegBitstreamColorHint::RgbComponentIds012 | JpegBitstreamColorHint::Unknown => {}
         }
     }
 
     match (photometric, samples_per_pixel) {
-        (2, 3) => AshlarColorTransform::ForceRgb,
-        (6, 3) => AshlarColorTransform::ForceYCbCr,
-        _ => AshlarColorTransform::Auto,
+        (2, 3) => SigninumColorTransform::ForceRgb,
+        (6, 3) => SigninumColorTransform::ForceYCbCr,
+        _ => SigninumColorTransform::Auto,
     }
 }
 
@@ -178,12 +179,12 @@ fn jpeg_sof_color_hint(payload: &[u8]) -> JpegBitstreamColorHint {
     JpegBitstreamColorHint::Unknown
 }
 
-fn ashlar_downscale_for_factor(factor: u32) -> Option<AshlarDownscale> {
+fn signinum_downscale_for_factor(factor: u32) -> Option<SigninumDownscale> {
     match factor {
-        1 => Some(AshlarDownscale::None),
-        2 => Some(AshlarDownscale::Half),
-        4 => Some(AshlarDownscale::Quarter),
-        8 => Some(AshlarDownscale::Eighth),
+        1 => Some(SigninumDownscale::None),
+        2 => Some(SigninumDownscale::Half),
+        4 => Some(SigninumDownscale::Quarter),
+        8 => Some(SigninumDownscale::Eighth),
         _ => None,
     }
 }
@@ -192,7 +193,7 @@ fn cpu_tile_from_rgb_pixels(width: u32, height: u32, pixels: Vec<u8>) -> Result<
     let expected_len = width as usize * height as usize * 3;
     if pixels.len() != expected_len {
         return Err(WsiError::Jpeg(format!(
-            "ashlar JPEG decode produced {} bytes, expected {} for {}x{} RGB",
+            "signinum JPEG decode produced {} bytes, expected {} for {}x{} RGB",
             pixels.len(),
             expected_len,
             width,
@@ -280,7 +281,7 @@ fn validate_tile_coords(col: i64, row: i64, level: u32) -> Result<(u32, u32), Ws
 
 /// Default maximum cache size: 128 MB.
 const DEFAULT_FULL_DECODE_CACHE_BYTES: u64 = 128 * 1024 * 1024;
-const FULL_DECODE_CACHE_BYTES_ENV: &str = "ZIGGURAT_FULL_DECODE_CACHE_BYTES";
+const FULL_DECODE_CACHE_BYTES_ENV: &str = "STATUMEN_FULL_DECODE_CACHE_BYTES";
 /// Default maximum cache size for decoded NDPI strips: 8 MB.
 ///
 /// Large NDPI display traces are effectively one-way walks through the strip
@@ -288,18 +289,18 @@ const FULL_DECODE_CACHE_BYTES_ENV: &str = "ZIGGURAT_FULL_DECODE_CACHE_BYTES";
 /// the measured tail. Keep the budget tight and allow local override for
 /// targeted tuning.
 const DEFAULT_NDPI_STRIP_CACHE_BYTES: u64 = 1024 * 1024;
-const NDPI_STRIP_CACHE_BYTES_ENV: &str = "ZIGGURAT_NDPI_STRIP_CACHE_BYTES";
+const NDPI_STRIP_CACHE_BYTES_ENV: &str = "STATUMEN_NDPI_STRIP_CACHE_BYTES";
 /// Default maximum cache size for synthetic NDPI tail levels: 16 MB.
 const DEFAULT_SYNTHETIC_LEVEL_CACHE_BYTES: u64 = 2 * 1024 * 1024;
-const SYNTHETIC_LEVEL_CACHE_BYTES_ENV: &str = "ZIGGURAT_SYNTHETIC_LEVEL_CACHE_BYTES";
+const SYNTHETIC_LEVEL_CACHE_BYTES_ENV: &str = "STATUMEN_SYNTHETIC_LEVEL_CACHE_BYTES";
 const DEFAULT_JP2K_SHARED_TILE_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_STITCHED_COMPONENT_TILE_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 const NDPI_DISPLAY_WIDE_STRIP_BATCH: usize = 4;
 const NDPI_DISPLAY_NARROW_STRIP_BATCH: usize = 8;
 #[cfg(feature = "metal")]
-const JPEG_DEVICE_DECODE_ENV: &str = "ZIGGURAT_JPEG_DEVICE_DECODE";
+const JPEG_DEVICE_DECODE_ENV: &str = "STATUMEN_JPEG_DEVICE_DECODE";
 #[cfg(feature = "metal")]
-const JP2K_DEVICE_DECODE_ENV: &str = "ZIGGURAT_JP2K_DEVICE_DECODE";
+const JP2K_DEVICE_DECODE_ENV: &str = "STATUMEN_JP2K_DEVICE_DECODE";
 
 type NdpiMcuStartsCache = HashMap<(IfdId, u16), Arc<Vec<u64>>>;
 type SyntheticDeepestKey = (usize, usize, u32, u32, u32);
@@ -703,7 +704,7 @@ enum CodecBatchJob<'a> {
 #[derive(Clone, Copy, Debug)]
 struct TiffJpegDecodeOptions {
     force_dimensions: bool,
-    color_transform: AshlarColorTransform,
+    color_transform: SigninumColorTransform,
 }
 
 fn decode_one_jpeg(job: JpegDecodeJob<'_>) -> Result<CpuTile, WsiError> {
@@ -865,13 +866,13 @@ impl TiffPixelReader {
             .put(key, image);
     }
 
-    fn try_decode_synthetic_level_with_ashlar(
+    fn try_decode_synthetic_level_with_signinum(
         &self,
         req: &TileRequest,
         base_level: u32,
         factor: u32,
     ) -> Result<Option<CpuTile>, WsiError> {
-        let Some(scale) = ashlar_downscale_for_factor(factor) else {
+        let Some(scale) = signinum_downscale_for_factor(factor) else {
             return Ok(None);
         };
         let target =
@@ -898,18 +899,18 @@ impl TiffPixelReader {
             .container
             .pread(*strip_offset, *strip_byte_count)
             .map_err(|e| e.into_wsi_error(self.container.path()))?;
-        let options = ashlar_decode_options(
+        let options = signinum_decode_options(
             self.tiff_jpeg_decode_options_for_data(*ifd_id, false, &jpeg, None)
                 .color_transform,
         );
-        let decoder = AshlarJpegDecoder::new_with_options(&jpeg, options)
+        let decoder = SigninumJpegDecoder::new_with_options(&jpeg, options)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?;
         let source_dims = decoder.info().dimensions;
         let scale_denom = scale.denominator();
         let scaled_width = source_dims.0.div_ceil(scale_denom);
         let scaled_height = source_dims.1.div_ceil(scale_denom);
         let (pixels, _outcome) = decoder
-            .decode_scaled(AshlarPixelFormat::Rgb8, scale)
+            .decode_scaled(SigninumPixelFormat::Rgb8, scale)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?;
         let scaled = cpu_tile_from_rgb_pixels(scaled_width, scaled_height, pixels)?;
 
@@ -951,7 +952,7 @@ impl TiffPixelReader {
                 continue;
             }
             if let Ok(Some(image)) =
-                self.try_decode_synthetic_level_with_ashlar(&req, base_level, factor)
+                self.try_decode_synthetic_level_with_signinum(&req, base_level, factor)
             {
                 self.put_synthetic_level_cache(key, Arc::new(image));
             }
@@ -1269,7 +1270,7 @@ impl TiffPixelReader {
         if self.layout.dataset.properties.vendor() == Some("philips") {
             return TiffJpegDecodeOptions {
                 force_dimensions,
-                color_transform: AshlarColorTransform::Auto,
+                color_transform: SigninumColorTransform::Auto,
             };
         }
 
@@ -1332,14 +1333,14 @@ impl TiffPixelReader {
         let level =
             &self.layout.dataset.scenes[req.scene].series[req.series].levels[req.level as usize];
         let (level_w, level_h) = level.dimensions;
-        let options = ashlar_decode_options(
+        let options = signinum_decode_options(
             self.tiff_jpeg_decode_options_for_data(ifd_id, false, &data, None)
                 .color_transform,
         );
-        let decoder = AshlarJpegDecoder::new_with_options(&data, options)
+        let decoder = SigninumJpegDecoder::new_with_options(&data, options)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?;
         let (pixels, outcome) = decoder
-            .decode(AshlarPixelFormat::Rgb8)
+            .decode(SigninumPixelFormat::Rgb8)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?;
         let decoded = cpu_tile_from_rgb_pixels(outcome.decoded.w, outcome.decoded.h, pixels)?;
         let decoded = if decoded.width > level_w as u32 || decoded.height > level_h as u32 {
@@ -1945,7 +1946,9 @@ impl TiffPixelReader {
             });
         }
 
-        if let Some(image) = self.try_decode_synthetic_level_with_ashlar(req, base_level, factor)? {
+        if let Some(image) =
+            self.try_decode_synthetic_level_with_signinum(req, base_level, factor)?
+        {
             return Ok(Arc::new(image));
         }
 
@@ -2076,7 +2079,7 @@ impl TiffPixelReader {
             row: 0,
         };
         let scaled = if let Some(image) =
-            self.try_decode_synthetic_level_with_ashlar(&tile_req, base_level, factor)?
+            self.try_decode_synthetic_level_with_signinum(&tile_req, base_level, factor)?
         {
             image
         } else {
@@ -4230,7 +4233,7 @@ impl SlideReader for TiffPixelReader {
         reqs: &[TileRequest],
         output: TileOutputPreference,
     ) -> Result<Vec<TilePixels>, WsiError> {
-        let backend = output.backend().to_ashlar();
+        let backend = output.backend().to_signinum();
         let require_device = output.requires_device();
         #[cfg(feature = "metal")]
         let prefer_device = output.prefers_device();
@@ -4290,7 +4293,7 @@ impl SlideReader for TiffPixelReader {
                         tracing::debug!(
                             error = %err,
                             fallback_to_cpu = true,
-                            fallback_reason = "ashlar_auto_chose_cpu",
+                            fallback_reason = "signinum_auto_chose_cpu",
                             "device tile path failed; retrying through CPU output"
                         );
                     }
@@ -4462,14 +4465,14 @@ impl SlideReader for TiffPixelReader {
                     .get(name)
                     .ok_or_else(|| WsiError::AssociatedImageNotFound(name.into()))?;
 
-                let options = ashlar_decode_options(
+                let options = signinum_decode_options(
                     self.tiff_jpeg_decode_options_for_data(*ifd_id, false, &data, None)
                         .color_transform,
                 );
-                let decoder = AshlarJpegDecoder::new_with_options(&data, options)
+                let decoder = SigninumJpegDecoder::new_with_options(&data, options)
                     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
                 let (pixels, outcome) = decoder
-                    .decode(AshlarPixelFormat::Rgb8)
+                    .decode(SigninumPixelFormat::Rgb8)
                     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
                 let decoded =
                     cpu_tile_from_rgb_pixels(outcome.decoded.w, outcome.decoded.h, pixels)?;
@@ -4517,7 +4520,7 @@ impl SlideReader for TiffPixelReader {
                     tables: None,
                     expected_width: 0,
                     expected_height: 0,
-                    color_transform: AshlarColorTransform::Auto,
+                    color_transform: SigninumColorTransform::Auto,
                     force_dimensions: false,
                     requested_size: None,
                 })
@@ -4594,11 +4597,11 @@ mod tests {
         );
         assert_eq!(
             tiff_jpeg_color_transform(2, 3, jpeg_bitstream_color_hint(&jpeg, None)),
-            AshlarColorTransform::ForceRgb
+            SigninumColorTransform::ForceRgb
         );
         assert_eq!(
             tiff_jpeg_color_transform(6, 3, jpeg_bitstream_color_hint(&jpeg, None)),
-            AshlarColorTransform::ForceYCbCr
+            SigninumColorTransform::ForceYCbCr
         );
     }
 
@@ -4612,7 +4615,7 @@ mod tests {
         );
         assert_eq!(
             tiff_jpeg_color_transform(6, 3, jpeg_bitstream_color_hint(&jpeg, None)),
-            AshlarColorTransform::ForceRgb
+            SigninumColorTransform::ForceRgb
         );
     }
 
@@ -4626,7 +4629,7 @@ mod tests {
         );
         assert_eq!(
             tiff_jpeg_color_transform(2, 3, jpeg_bitstream_color_hint(&jpeg, None)),
-            AshlarColorTransform::ForceYCbCr
+            SigninumColorTransform::ForceYCbCr
         );
     }
 
@@ -4634,11 +4637,11 @@ mod tests {
     fn jpeg_unknown_bitstream_falls_back_to_tiff_photometric() {
         assert_eq!(
             tiff_jpeg_color_transform(2, 3, JpegBitstreamColorHint::Unknown),
-            AshlarColorTransform::ForceRgb
+            SigninumColorTransform::ForceRgb
         );
         assert_eq!(
             tiff_jpeg_color_transform(6, 3, JpegBitstreamColorHint::Unknown),
-            AshlarColorTransform::ForceYCbCr
+            SigninumColorTransform::ForceYCbCr
         );
     }
 
@@ -5518,7 +5521,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_ndpi_tile_path_uses_ashlar_downscale_when_dimensions_match() {
+    fn synthetic_ndpi_tile_path_uses_signinum_downscale_when_dimensions_match() {
         let reader = build_synthetic_ndpi_reader(8, 8, &[(4, 4, 2)]);
         let direct_req = TileRequest {
             scene: 0,
@@ -5529,9 +5532,9 @@ mod tests {
             row: 0,
         };
         let direct = reader
-            .try_decode_synthetic_level_with_ashlar(&direct_req, 0, 2)
-            .expect("ashlar synthetic downscale should decode")
-            .expect("matching synthetic dimensions should use ashlar downscale");
+            .try_decode_synthetic_level_with_signinum(&direct_req, 0, 2)
+            .expect("signinum synthetic downscale should decode")
+            .expect("matching synthetic dimensions should use signinum downscale");
         assert_eq!((direct.width, direct.height), (4, 4));
 
         let tile = reader
@@ -5549,7 +5552,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_ndpi_region_fastpath_falls_back_when_ashlar_scaled_dims_do_not_match() {
+    fn synthetic_ndpi_region_fastpath_falls_back_when_signinum_scaled_dims_do_not_match() {
         let reader = build_synthetic_ndpi_reader(5, 5, &[(2, 2, 2)]);
         let direct_req = TileRequest {
             scene: 0,
@@ -5561,10 +5564,10 @@ mod tests {
         };
         assert!(
             reader
-                .try_decode_synthetic_level_with_ashlar(&direct_req, 0, 2)
-                .expect("ashlar synthetic downscale should decode")
+                .try_decode_synthetic_level_with_signinum(&direct_req, 0, 2)
+                .expect("signinum synthetic downscale should decode")
                 .is_none(),
-            "odd source dimensions should reject ashlar result with mismatched target dimensions"
+            "odd source dimensions should reject signinum result with mismatched target dimensions"
         );
 
         let req = RegionRequest::legacy_xywh(0, 0, 1, PlaneSelection::default(), 0, 0, 2, 2);
@@ -5576,7 +5579,7 @@ mod tests {
         let tile = reader
             .read_region_fastpath(&mut ctx, &req)
             .expect("synthetic fast path should handle whole-level region")
-            .expect("odd-dimension ashlar downscale mismatch should fall back");
+            .expect("odd-dimension signinum downscale mismatch should fall back");
 
         assert_eq!((tile.width, tile.height), (2, 2));
     }

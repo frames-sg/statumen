@@ -6,7 +6,6 @@ use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ashlar_core::BackendRequest;
 use dicom_dictionary_std::{tags, uids};
 use dicom_object::{meta::FileMetaTable, DefaultDicomObject, OpenFileOptions};
 use dicom_parser::dataset::{lazy_read::LazyDataSetReader, LazyDataToken};
@@ -14,6 +13,7 @@ use dicom_parser::stateful::decode::StatefulDecode;
 use dicom_transfer_syntax_registry::{TransferSyntaxIndex, TransferSyntaxRegistry};
 use image::imageops;
 use lru::LruCache;
+use signinum_core::BackendRequest;
 
 use crate::core::hash::Quickhash1;
 use crate::core::registry::{
@@ -175,7 +175,7 @@ impl SlideReader for DicomReader {
                 });
             }
         })
-        .to_ashlar();
+        .to_signinum();
         reqs.iter()
             .map(|req| {
                 self.read_tile_with_backend(req, backend)
@@ -599,7 +599,7 @@ impl DicomImage {
     ) -> Result<CpuTile, WsiError> {
         let span = tracing::info_span!(
             "dicom_read_tile",
-            reader = "ziggurat",
+            reader = "statumen",
             transfer_syntax = %self.transfer_syntax_uid,
         );
         let _guard = span.enter();
@@ -760,7 +760,7 @@ impl DicomImage {
                 tables: None,
                 expected_width: self.tile_width,
                 expected_height: self.tile_height,
-                color_transform: ashlar_jpeg::ColorTransform::Auto,
+                color_transform: signinum_jpeg::ColorTransform::Auto,
                 force_dimensions: false,
                 requested_size: None,
             }])

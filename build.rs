@@ -1,4 +1,4 @@
-//! Build script for ziggurat.
+//! Build script for statumen.
 //!
 //! Only emits link instructions for libopenslide when the
 //! `openslide-bench` feature is enabled. This keeps default builds

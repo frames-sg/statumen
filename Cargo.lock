@@ -1340,6 +1340,44 @@ dependencies = [
 ]
 
 [[package]]
+name = "statumen"
+version = "0.1.0"
+dependencies = [
+ "ashlar-core",
+ "ashlar-j2k-metal",
+ "ashlar-j2k-native",
+ "ashlar-jpeg",
+ "ashlar-jpeg-metal",
+ "ashlar-tilecodec",
+ "base64",
+ "byteorder",
+ "criterion",
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
+ "dicom-parser",
+ "dicom-transfer-syntax-registry",
+ "flate2",
+ "image",
+ "jpeg-decoder",
+ "jpeg-encoder",
+ "libloading",
+ "lru",
+ "metal",
+ "pkg-config",
+ "quick-xml",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "tracing",
+ "zstd",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1820,44 +1858,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "ziggurat"
-version = "0.1.0"
-dependencies = [
- "ashlar-core",
- "ashlar-j2k-metal",
- "ashlar-j2k-native",
- "ashlar-jpeg",
- "ashlar-jpeg-metal",
- "ashlar-tilecodec",
- "base64",
- "byteorder",
- "criterion",
- "dicom-core",
- "dicom-dictionary-std",
- "dicom-object",
- "dicom-parser",
- "dicom-transfer-syntax-registry",
- "flate2",
- "image",
- "jpeg-decoder",
- "jpeg-encoder",
- "libloading",
- "lru",
- "metal",
- "pkg-config",
- "quick-xml",
- "rayon",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "toml",
- "tracing",
- "zstd",
 ]
 
 [[package]]

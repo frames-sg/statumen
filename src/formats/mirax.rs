@@ -8,9 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ashlar_core::BackendRequest;
 use flate2::read::ZlibDecoder;
 use lru::LruCache;
+use signinum_core::BackendRequest;
 
 use crate::core::hash::Quickhash1;
 use crate::core::registry::{
@@ -178,7 +178,7 @@ impl SlideReader for MiraxReader {
                 });
             }
         })
-        .to_ashlar();
+        .to_signinum();
         reqs.iter()
             .map(|req| {
                 self.read_tile_with_backend(req, backend)
@@ -730,7 +730,7 @@ impl MiraxSlide {
                     tables: None,
                     expected_width,
                     expected_height,
-                    color_transform: ashlar_jpeg::ColorTransform::Auto,
+                    color_transform: signinum_jpeg::ColorTransform::Auto,
                     force_dimensions: false,
                     requested_size: None,
                 }])

@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use ziggurat::{
+use statumen::{
     CpuTile, FormatRegistry, PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest,
 };
 
@@ -21,7 +21,7 @@ fn require_corpus_slide(alias: &str) -> PathBuf {
         Some(path) => path,
         None => {
             eprintln!(
-                "[real_wsi] corpus slide '{alias}' not found; run scripts/parity-corpus-fetch.sh or set ZIGGURAT_PARITY_CORPUS_CACHE"
+                "[real_wsi] corpus slide '{alias}' not found; run scripts/parity-corpus-fetch.sh or set STATUMEN_PARITY_CORPUS_CACHE"
             );
             panic!("corpus slide missing: {alias}");
         }
@@ -133,7 +133,7 @@ fn region_hits(handle: &Slide, req: &RegionRequest) -> HashSet<(i64, i64)> {
 }
 
 #[test]
-#[ignore = "requires real OpenSlide testdata; set ZIGGURAT_REAL_WSI_ROOT or use the local default"]
+#[ignore = "requires real OpenSlide testdata; set STATUMEN_REAL_WSI_ROOT or use the local default"]
 fn aperio_jpeg_distinct_tile_batch_matches_sequential_tile_reads() {
     let handle = Slide::open(aperio_jpeg_slide()).expect("open Aperio JPEG slide");
     let level = regular_level_with_min_tiles(&handle, 8, 8);
@@ -157,7 +157,7 @@ fn aperio_jpeg_distinct_tile_batch_matches_sequential_tile_reads() {
 }
 
 #[test]
-#[ignore = "requires real OpenSlide testdata; set ZIGGURAT_REAL_WSI_ROOT or use the local default"]
+#[ignore = "requires real OpenSlide testdata; set STATUMEN_REAL_WSI_ROOT or use the local default"]
 fn aperio_jpeg_viewport_pan_populates_and_reuses_distinct_tile_cache_entries() {
     let handle = open_with_large_cache(&aperio_jpeg_slide());
     let level = regular_level_with_min_tiles(&handle, 10, 8);
@@ -214,7 +214,7 @@ fn aperio_jpeg_viewport_pan_populates_and_reuses_distinct_tile_cache_entries() {
 }
 
 #[test]
-#[ignore = "requires real OpenSlide testdata; set ZIGGURAT_REAL_WSI_ROOT or use the local default"]
+#[ignore = "requires real OpenSlide testdata; set STATUMEN_REAL_WSI_ROOT or use the local default"]
 fn aperio_jp2k_distinct_tile_batch_matches_sequential_tile_reads() {
     let handle = Slide::open(aperio_jp2k_slide()).expect("open Aperio JP2K slide");
     let level = regular_level_with_min_tiles(&handle, 4, 4);

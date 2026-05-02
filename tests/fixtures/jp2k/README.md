@@ -1,5 +1,5 @@
 These fixtures are generated locally with OpenJPEG tools for the exact raw-J2K subset that
-`ziggurat` supports in production:
+`statumen` supports in production:
 
 - raw codestream only (`.j2k`)
 - 3 components
@@ -20,7 +20,7 @@ Files:
 Regenerate with:
 
 ```bash
-./.venv/bin/python crates/ziggurat/tests/fixtures/jp2k/generate.py
+./.venv/bin/python crates/statumen/tests/fixtures/jp2k/generate.py
 ```
 
 The generator requires `opj_compress` and `opj_decompress` on `PATH`.

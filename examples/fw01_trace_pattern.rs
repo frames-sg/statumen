@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ziggurat::{Slide, TileLayout};
+use statumen::{Slide, TileLayout};
 
 const NDPI_BAND_HEIGHT: u32 = 256;
 const TILE_PX: i64 = 256;

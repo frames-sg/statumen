@@ -6,8 +6,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ashlar_core::BackendRequest;
 use byteorder::{LittleEndian, ReadBytesExt};
+use signinum_core::BackendRequest;
 
 use crate::core::hash::Quickhash1;
 use crate::core::registry::{
@@ -67,7 +67,7 @@ impl SlideReader for OlympusVsiReader {
     ) -> Result<Vec<TilePixels>, WsiError> {
         let backend = match output {
             TileOutputPreference::Cpu { backend }
-            | TileOutputPreference::PreferDevice { backend, .. } => backend.to_ashlar(),
+            | TileOutputPreference::PreferDevice { backend, .. } => backend.to_signinum(),
             TileOutputPreference::RequireDevice { .. } => {
                 return Err(WsiError::Unsupported {
                     reason: "RequireDevice not supported for Olympus VSI".into(),

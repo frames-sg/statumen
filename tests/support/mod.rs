@@ -1,4 +1,4 @@
-//! Shared test-support helpers for the ziggurat parity harness.
+//! Shared test-support helpers for the statumen parity harness.
 
 #![allow(dead_code)]
 

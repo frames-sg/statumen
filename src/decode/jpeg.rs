@@ -4,19 +4,20 @@ use crate::core::types::{ColorSpace, CpuTile};
 #[cfg(feature = "metal")]
 use crate::core::types::{DeviceTile, TilePixels};
 use crate::error::WsiError;
-#[cfg(feature = "metal")]
-use ashlar_core::{
-    BackendKind as AshlarBackendKind, BackendRequest as AshlarBackendRequest,
-    DeviceSurface as AshlarDeviceSurface,
-};
-#[cfg(feature = "metal")]
-use ashlar_jpeg::JpegView as AshlarJpegView;
-use ashlar_jpeg::{
-    ColorTransform as AshlarColorTransform, DecodeOptions as AshlarDecodeOptions,
-    Decoder as AshlarJpegDecoder, Downscale as AshlarDownscale, PixelFormat as AshlarPixelFormat,
-};
 use image::RgbaImage;
 use rayon::prelude::*;
+#[cfg(feature = "metal")]
+use signinum_core::{
+    BackendKind as SigninumBackendKind, BackendRequest as SigninumBackendRequest,
+    DeviceSurface as SigninumDeviceSurface,
+};
+#[cfg(feature = "metal")]
+use signinum_jpeg::JpegView as SigninumJpegView;
+use signinum_jpeg::{
+    ColorTransform as SigninumColorTransform, DecodeOptions as SigninumDecodeOptions,
+    Decoder as SigninumJpegDecoder, Downscale as SigninumDownscale,
+    PixelFormat as SigninumPixelFormat,
+};
 
 /// Maximum total bytes allowed for a single JPEG decode allocation.
 /// Set to 512 MB to cover large NDPI full-decode levels while preventing
@@ -46,7 +47,7 @@ pub(crate) struct JpegDecodeJob<'a> {
     pub tables: Option<Cow<'a, [u8]>>,
     pub expected_width: u32,
     pub expected_height: u32,
-    pub color_transform: AshlarColorTransform,
+    pub color_transform: SigninumColorTransform,
     pub force_dimensions: bool,
     pub requested_size: Option<(u32, u32)>,
 }
@@ -59,7 +60,7 @@ struct ScaledJpegDecode<'a> {
     requested_width: u32,
     requested_height: u32,
     force_dimensions: bool,
-    color_transform: AshlarColorTransform,
+    color_transform: SigninumColorTransform,
 }
 
 /// Decode JPEG data to premultiplied RGBA (alpha=255 for all decoded pixels).
@@ -106,7 +107,7 @@ pub fn decode_jpeg_rgb(
         tables,
         expected_width,
         expected_height,
-        AshlarColorTransform::Auto,
+        SigninumColorTransform::Auto,
     )
 }
 
@@ -117,7 +118,7 @@ pub(crate) fn decode_jpeg_rgb_with_size_override(
     image_height: u32,
     requested_width: Option<u32>,
     requested_height: Option<u32>,
-    color_transform: AshlarColorTransform,
+    color_transform: SigninumColorTransform,
 ) -> Result<DecodedJpegRgb, WsiError> {
     if image_width == 0
         || image_height == 0
@@ -179,7 +180,7 @@ pub(crate) fn decode_batch_jpeg<'a>(jobs: &[JpegDecodeJob<'a>]) -> Vec<Result<Cp
 #[cfg(feature = "metal")]
 pub(crate) fn decode_batch_jpeg_pixels<'a>(
     jobs: &[JpegDecodeJob<'a>],
-    backend: AshlarBackendRequest,
+    backend: SigninumBackendRequest,
     require_device: bool,
     metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
 ) -> Vec<Result<TilePixels, WsiError>> {
@@ -257,7 +258,7 @@ fn decode_one_jpeg_job(job: &JpegDecodeJob<'_>) -> Result<CpuTile, WsiError> {
 #[cfg(feature = "metal")]
 fn decode_one_jpeg_pixels(
     job: &JpegDecodeJob<'_>,
-    _backend: AshlarBackendRequest,
+    _backend: SigninumBackendRequest,
     require_device: bool,
     metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
 ) -> Result<TilePixels, WsiError> {
@@ -276,19 +277,19 @@ fn decode_one_jpeg_pixels(
         job.expected_height,
         job.force_dimensions,
     );
-    validate_ashlar_jpeg_output_size(input.as_ref())?;
-    let view = AshlarJpegView::parse_with_options(
+    validate_signinum_jpeg_output_size(input.as_ref())?;
+    let view = SigninumJpegView::parse_with_options(
         input.as_ref(),
-        AshlarDecodeOptions::default().with_color_transform(job.color_transform),
+        SigninumDecodeOptions::default().with_color_transform(job.color_transform),
     )
     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
-    let mut decoder = ashlar_jpeg_metal::Decoder::from_view(view)
+    let mut decoder = signinum_jpeg_metal::Decoder::from_view(view)
         .map_err(|err| WsiError::Jpeg(err.to_string()))?;
     let surface = decoder
-        .decode_to_device_with_session(AshlarPixelFormat::Rgb8, metal_sessions.jpeg())
-        .map_err(|err| WsiError::Jpeg(format!("ashlar JPEG device decode failed: {err}")))?;
+        .decode_to_device_with_session(SigninumPixelFormat::Rgb8, metal_sessions.jpeg())
+        .map_err(|err| WsiError::Jpeg(format!("signinum JPEG device decode failed: {err}")))?;
 
-    if surface.backend_kind() == AshlarBackendKind::Metal {
+    if surface.backend_kind() == SigninumBackendKind::Metal {
         if let Some(tile) = crate::output::metal::MetalDeviceTile::from_jpeg(surface) {
             return Ok(TilePixels::Device(DeviceTile::Metal(tile)));
         }
@@ -311,13 +312,13 @@ fn decode_one_jpeg_pixels(
 
 #[cfg(feature = "metal")]
 fn cpu_tile_from_jpeg_surface(
-    surface: ashlar_jpeg_metal::Surface,
+    surface: signinum_jpeg_metal::Surface,
     expected_width: u32,
     expected_height: u32,
 ) -> Result<CpuTile, WsiError> {
-    if surface.pixel_format() != AshlarPixelFormat::Rgb8 {
+    if surface.pixel_format() != SigninumPixelFormat::Rgb8 {
         return Err(WsiError::Jpeg(format!(
-            "ashlar JPEG returned unsupported pixel format {:?}",
+            "signinum JPEG returned unsupported pixel format {:?}",
             surface.pixel_format()
         )));
     }
@@ -423,7 +424,7 @@ pub(crate) fn decode_jpeg_rgb_with_color_transform(
     tables: Option<&[u8]>,
     expected_width: u32,
     expected_height: u32,
-    color_transform: AshlarColorTransform,
+    color_transform: SigninumColorTransform,
 ) -> Result<DecodedJpegRgb, WsiError> {
     decode_jpeg_rgb_with_color_transform_and_patch(
         data,
@@ -441,7 +442,7 @@ fn decode_jpeg_rgb_with_color_transform_and_patch(
     expected_width: u32,
     expected_height: u32,
     force_dimensions: bool,
-    color_transform: AshlarColorTransform,
+    color_transform: SigninumColorTransform,
 ) -> Result<DecodedJpegRgb, WsiError> {
     let input = prepare_jpeg_input(
         data,
@@ -450,14 +451,14 @@ fn decode_jpeg_rgb_with_color_transform_and_patch(
         expected_height,
         force_dimensions,
     );
-    validate_ashlar_jpeg_output_size(input.as_ref())?;
-    let decoder = AshlarJpegDecoder::new_with_options(
+    validate_signinum_jpeg_output_size(input.as_ref())?;
+    let decoder = SigninumJpegDecoder::new_with_options(
         input.as_ref(),
-        AshlarDecodeOptions::default().with_color_transform(color_transform),
+        SigninumDecodeOptions::default().with_color_transform(color_transform),
     )
     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
     let (pixels, outcome) = decoder
-        .decode(AshlarPixelFormat::Rgb8)
+        .decode(SigninumPixelFormat::Rgb8)
         .map_err(|err| WsiError::Jpeg(err.to_string()))?;
     crop_jpeg_rgb_to_expected(
         DecodedJpegRgb {
@@ -470,19 +471,19 @@ fn decode_jpeg_rgb_with_color_transform_and_patch(
     )
 }
 
-fn ashlar_downscale_for_dimensions(
+fn signinum_downscale_for_dimensions(
     expected_width: u32,
     expected_height: u32,
     requested_width: u32,
     requested_height: u32,
-) -> Option<AshlarDownscale> {
+) -> Option<SigninumDownscale> {
     if expected_width == requested_width && expected_height == requested_height {
-        return Some(AshlarDownscale::None);
+        return Some(SigninumDownscale::None);
     }
     for (scale, denom) in [
-        (AshlarDownscale::Half, 2),
-        (AshlarDownscale::Quarter, 4),
-        (AshlarDownscale::Eighth, 8),
+        (SigninumDownscale::Half, 2),
+        (SigninumDownscale::Quarter, 4),
+        (SigninumDownscale::Eighth, 8),
     ] {
         if expected_width.is_multiple_of(denom)
             && expected_height.is_multiple_of(denom)
@@ -498,7 +499,7 @@ fn ashlar_downscale_for_dimensions(
 fn try_decode_jpeg_rgb_scaled(
     req: ScaledJpegDecode<'_>,
 ) -> Result<Option<DecodedJpegRgb>, WsiError> {
-    let Some(scale) = ashlar_downscale_for_dimensions(
+    let Some(scale) = signinum_downscale_for_dimensions(
         req.expected_width,
         req.expected_height,
         req.requested_width,
@@ -514,22 +515,22 @@ fn try_decode_jpeg_rgb_scaled(
         req.expected_height,
         req.force_dimensions,
     );
-    validate_ashlar_jpeg_output_size(input.as_ref())?;
-    let decoder = AshlarJpegDecoder::new_with_options(
+    validate_signinum_jpeg_output_size(input.as_ref())?;
+    let decoder = SigninumJpegDecoder::new_with_options(
         input.as_ref(),
-        AshlarDecodeOptions::default().with_color_transform(req.color_transform),
+        SigninumDecodeOptions::default().with_color_transform(req.color_transform),
     )
     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
-    let (pixels, outcome) = if scale == AshlarDownscale::None {
+    let (pixels, outcome) = if scale == SigninumDownscale::None {
         decoder
-            .decode(AshlarPixelFormat::Rgb8)
+            .decode(SigninumPixelFormat::Rgb8)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?
     } else {
         decoder
-            .decode_scaled(AshlarPixelFormat::Rgb8, scale)
+            .decode_scaled(SigninumPixelFormat::Rgb8, scale)
             .map_err(|err| WsiError::Jpeg(err.to_string()))?
     };
-    let decoded = if scale == AshlarDownscale::None {
+    let decoded = if scale == SigninumDownscale::None {
         DecodedJpegRgb {
             width: outcome.decoded.w,
             height: outcome.decoded.h,
@@ -550,7 +551,7 @@ fn try_decode_jpeg_rgb_scaled(
 }
 
 pub(crate) fn jpeg_dimensions(data: &[u8]) -> Result<(u32, u32), WsiError> {
-    let info = AshlarJpegDecoder::inspect(data).map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    let info = SigninumJpegDecoder::inspect(data).map_err(|err| WsiError::Jpeg(err.to_string()))?;
     Ok(info.dimensions)
 }
 
@@ -707,8 +708,9 @@ fn ensure_jpeg_eoi<'a>(input: &'a [u8]) -> Cow<'a, [u8]> {
     Cow::Owned(repaired)
 }
 
-fn validate_ashlar_jpeg_output_size(input: &[u8]) -> Result<(), WsiError> {
-    let info = AshlarJpegDecoder::inspect(input).map_err(|err| WsiError::Jpeg(err.to_string()))?;
+fn validate_signinum_jpeg_output_size(input: &[u8]) -> Result<(), WsiError> {
+    let info =
+        SigninumJpegDecoder::inspect(input).map_err(|err| WsiError::Jpeg(err.to_string()))?;
     let bytes = u64::from(info.dimensions.0)
         .checked_mul(u64::from(info.dimensions.1))
         .and_then(|pixels| pixels.checked_mul(3))
@@ -943,10 +945,10 @@ mod tests {
             requested_width: 4,
             requested_height: 4,
             force_dimensions: false,
-            color_transform: AshlarColorTransform::Auto,
+            color_transform: SigninumColorTransform::Auto,
         })
         .unwrap()
-        .expect("power-of-two downscale should use ashlar IDCT scale");
+        .expect("power-of-two downscale should use signinum IDCT scale");
 
         assert_eq!(decoded.width, 4);
         assert_eq!(decoded.height, 4);

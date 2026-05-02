@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ashlar_core::PixelFormat;
+use signinum_core::PixelFormat;
 
 use crate::error::WsiError;
 use crate::properties::Properties;
@@ -510,7 +510,7 @@ impl CpuTile {
         );
         assert_eq!(
             stride_bytes, row_min,
-            "CpuTile::new_for_test currently stores packed interleaved data; use sv_tile::SlideCpuTile for padded test storage until ziggurat CpuTile is reshaped"
+            "CpuTile::new_for_test currently stores packed interleaved data; use sv_tile::SlideCpuTile for padded test storage until statumen CpuTile is reshaped"
         );
         let expected = stride_bytes
             .checked_mul(height as usize)
@@ -522,9 +522,9 @@ impl CpuTile {
             expected
         );
         let color_space = match format.layout() {
-            ashlar_core::PixelLayout::Rgb => ColorSpace::Rgb,
-            ashlar_core::PixelLayout::Rgba => ColorSpace::Rgba,
-            ashlar_core::PixelLayout::Gray => ColorSpace::Grayscale,
+            signinum_core::PixelLayout::Rgb => ColorSpace::Rgb,
+            signinum_core::PixelLayout::Rgba => ColorSpace::Rgba,
+            signinum_core::PixelLayout::Gray => ColorSpace::Grayscale,
             _ => ColorSpace::Unknown,
         };
         Self::new(
@@ -1039,12 +1039,12 @@ pub enum OutputBackendRequest {
 }
 
 impl OutputBackendRequest {
-    pub(crate) fn to_ashlar(self) -> ashlar_core::BackendRequest {
+    pub(crate) fn to_signinum(self) -> signinum_core::BackendRequest {
         match self {
-            Self::Auto => ashlar_core::BackendRequest::Auto,
-            Self::Cpu => ashlar_core::BackendRequest::Cpu,
-            Self::Metal => ashlar_core::BackendRequest::Metal,
-            Self::Cuda => ashlar_core::BackendRequest::Cuda,
+            Self::Auto => signinum_core::BackendRequest::Auto,
+            Self::Cpu => signinum_core::BackendRequest::Cpu,
+            Self::Metal => signinum_core::BackendRequest::Metal,
+            Self::Cuda => signinum_core::BackendRequest::Cuda,
         }
     }
 }

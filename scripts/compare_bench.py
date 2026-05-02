@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""compare_bench.py — join ziggurat and openslide bench JSON outputs.
+"""compare_bench.py — join statumen and openslide bench JSON outputs.
 
 Usage:
     compare_bench.py <wsi_json> <openslide_json>
@@ -37,9 +37,9 @@ def verdict(ours_p50, ours_p99, theirs_p50, theirs_p99):
     )
     if ratio > 2.0:
         return "HOTSPOT"
-    # Flag JITTER only when ziggurat is meaningfully jitterier than openslide.
-    # Two conditions must hold: (1) ziggurat absolute jitter is bad (>5x), and
-    # (2) ziggurat jitter is at least 2x worse than openslide on the same path.
+    # Flag JITTER only when statumen is meaningfully jitterier than openslide.
+    # Two conditions must hold: (1) statumen absolute jitter is bad (>5x), and
+    # (2) statumen jitter is at least 2x worse than openslide on the same path.
     # This avoids false positives on workloads where both libraries are bumpy
     # because of the underlying file format (e.g., NDPI thumbnail decode).
     if ours_jitter > 5.0 and ours_jitter > theirs_jitter * 2.0:
@@ -60,11 +60,11 @@ def main() -> int:
 
     ours_by = {w["name"]: w for w in ours["workloads"]}
     theirs_by = {w["name"]: w for w in theirs["workloads"]}
-    names = list(ours_by.keys())  # use ziggurat ordering
+    names = list(ours_by.keys())  # use statumen ordering
 
     print(f"### Slide: `{ours['slide_path']}`")
     print()
-    print("| workload | ziggurat p50 | ziggurat p99 | openslide p50 | openslide p99 | p50 ratio | verdict |")
+    print("| workload | statumen p50 | statumen p99 | openslide p50 | openslide p99 | p50 ratio | verdict |")
     print("|---|---:|---:|---:|---:|---:|---|")
     for name in names:
         o = ours_by.get(name, {})

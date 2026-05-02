@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use image::RgbImage;
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
+use statumen::{PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest, TileViewRequest};
 use tempfile::NamedTempFile;
-use ziggurat::{PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest, TileViewRequest};
 
-const TILE_CACHE_BYTES_ENV: &str = "ZIGGURAT_TILE_CACHE_BYTES";
+const TILE_CACHE_BYTES_ENV: &str = "STATUMEN_TILE_CACHE_BYTES";
 const DEFAULT_REAL_WSI_ROOT: &str = "/Users/user/Bench/SlideViewer/downloads/openslide-testdata";
 
 struct EnvVarGuard {
@@ -372,9 +372,9 @@ fn benchmark_handle_reads(c: &mut Criterion) {
 
 fn benchmark_external_samples(c: &mut Criterion) {
     let sample_vars = [
-        ("aperio_jpeg", "ZIGGURAT_BENCH_APERIO_JPEG"),
-        ("aperio_jp2k", "ZIGGURAT_BENCH_APERIO_JP2K"),
-        ("ndpi", "ZIGGURAT_BENCH_NDPI"),
+        ("aperio_jpeg", "STATUMEN_BENCH_APERIO_JPEG"),
+        ("aperio_jp2k", "STATUMEN_BENCH_APERIO_JP2K"),
+        ("ndpi", "STATUMEN_BENCH_NDPI"),
     ];
 
     let mut group = c.benchmark_group("external_samples");
@@ -414,7 +414,7 @@ fn benchmark_external_samples(c: &mut Criterion) {
 }
 
 fn benchmark_external_jp2k_backends(c: &mut Criterion) {
-    let Some(path) = env::var_os("ZIGGURAT_BENCH_APERIO_JP2K") else {
+    let Some(path) = env::var_os("STATUMEN_BENCH_APERIO_JP2K") else {
         return;
     };
     let path = Path::new(&path);
@@ -427,7 +427,7 @@ fn benchmark_external_jp2k_backends(c: &mut Criterion) {
     let handle = Slide::open(path).expect("open external JP2K benchmark slide");
     let region_req = centered_level0_region(&handle, 2048);
     group.bench_with_input(
-        BenchmarkId::new("aperio_jp2k_region", "ashlar_auto"),
+        BenchmarkId::new("aperio_jp2k_region", "signinum_auto"),
         &(handle, region_req),
         |b, (handle, region_req)| b.iter(|| handle.read_region(region_req).unwrap()),
     );
@@ -438,7 +438,7 @@ fn benchmark_external_jp2k_backends(c: &mut Criterion) {
 fn benchmark_external_wsi_tile_batches(c: &mut Criterion) {
     let mut group = c.benchmark_group("external_wsi_tile_batches");
 
-    if let Some(path) = external_slide_path("ZIGGURAT_BENCH_APERIO_JPEG", &["Aperio", "CMU-1.svs"])
+    if let Some(path) = external_slide_path("STATUMEN_BENCH_APERIO_JPEG", &["Aperio", "CMU-1.svs"])
     {
         let handle = Slide::open(&path).expect("open external Aperio JPEG benchmark slide");
         if let Some(level) = regular_level_with_min_tiles(&handle, 8, 8) {
@@ -458,7 +458,7 @@ fn benchmark_external_wsi_tile_batches(c: &mut Criterion) {
     }
 
     if let Some(path) = external_slide_path(
-        "ZIGGURAT_BENCH_APERIO_JP2K",
+        "STATUMEN_BENCH_APERIO_JP2K",
         &["Aperio", "JP2K-33003-1.svs"],
     ) {
         let handle = Slide::open(&path).expect("open external Aperio JP2K benchmark slide");

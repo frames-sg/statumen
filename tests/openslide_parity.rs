@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use support::compare::{compare_rgba, tolerance_failure, Tolerance};
 use support::corpus::{load_public, resolve_entry_path, CorpusEntry};
 use support::oracles::{
-    is_reference_oracle_unsupported, read_probe, top_left_probe, AshlarOracle, Oracle,
-    ReferenceOracle,
+    is_reference_oracle_unsupported, read_probe, top_left_probe, Oracle, ReferenceOracle,
+    SigninumOracle,
 };
 
 #[test]
@@ -58,10 +58,10 @@ fn preflight() {
                 continue;
             }
         };
-        let ashlar_report = match AshlarOracle.open(&path) {
+        let signinum_report = match SigninumOracle.open(&path) {
             Ok(slide) => Some(slide),
             Err(err) => {
-                failures.push(format!("{}: ashlar open failed: {err}", entry.alias));
+                failures.push(format!("{}: signinum open failed: {err}", entry.alias));
                 None
             }
         };
@@ -72,7 +72,7 @@ fn preflight() {
                 Ok(os_slide) => {
                     if os_slide.level_count != baseline.level_count {
                         failures.push(format!(
-                            "{}: OpenSlide level count mismatch openslide={} ziggurat={}",
+                            "{}: OpenSlide level count mismatch openslide={} statumen={}",
                             entry.alias, os_slide.level_count, baseline.level_count
                         ));
                     }
@@ -84,7 +84,7 @@ fn preflight() {
                     {
                         if ours != theirs {
                             failures.push(format!(
-                                "{}: OpenSlide dimension mismatch at level {level}: ziggurat={ours:?} openslide={theirs:?}",
+                                "{}: OpenSlide dimension mismatch at level {level}: statumen={ours:?} openslide={theirs:?}",
                                 entry.alias
                             ));
                         }
@@ -133,9 +133,9 @@ fn preflight() {
             };
 
             #[cfg(feature = "parity-openslide")]
-            let mut ashlar_buf = None;
-            if let Some(ref ashlar) = ashlar_report {
-                match read_probe(ashlar, probe) {
+            let mut signinum_buf = None;
+            if let Some(ref signinum) = signinum_report {
+                match read_probe(signinum, probe) {
                     Ok(sc_buf) => {
                         if let Some(ref baseline_buf) = baseline_buf {
                             let tolerance = tolerance_for_entry(entry);
@@ -156,32 +156,35 @@ fn preflight() {
                             if required {
                                 record_comparison_failure(
                                     entry,
-                                    "ashlar-vs-reference",
+                                    "signinum-vs-reference",
                                     level,
-                                    &format!("{} level={level}: ashlar vs reference", entry.alias),
+                                    &format!(
+                                        "{} level={level}: signinum vs reference",
+                                        entry.alias
+                                    ),
                                     &report,
                                     &mut failures,
                                 );
                             }
                         } else {
                             eprintln!(
-                                "[preflight] {} level={level}: reference oracle unsupported; ashlar read succeeded without sc-vs-ref comparison",
+                                "[preflight] {} level={level}: reference oracle unsupported; signinum read succeeded without sc-vs-ref comparison",
                                 entry.alias
                             );
                         }
                         #[cfg(feature = "parity-openslide")]
                         {
-                            ashlar_buf = Some(sc_buf.clone());
+                            signinum_buf = Some(sc_buf.clone());
                         }
                     }
                     Err(err) => {
                         eprintln!(
-                            "[preflight] {} level={level} ashlar report read failed: {err}",
+                            "[preflight] {} level={level} signinum report read failed: {err}",
                             entry.alias
                         );
                         if required {
                             failures.push(format!(
-                                "{} level={level}: required ashlar read failed: {err}",
+                                "{} level={level}: required signinum read failed: {err}",
                                 entry.alias
                             ));
                         }
@@ -221,22 +224,25 @@ fn preflight() {
                                 );
                             }
                         }
-                        if let Some(ref sc_buf) = ashlar_buf {
+                        if let Some(ref sc_buf) = signinum_buf {
                             let report = compare_rgba(
                                 &sc_buf.pixels_rgba,
                                 &os_buf.pixels_rgba,
                                 Tolerance::TOLERANT,
                             );
                             eprintln!(
-                                "[preflight] {} level={level} ashlar-vs-openslide max_abs={} mean_abs={:.4} psnr={:.2}dB",
+                                "[preflight] {} level={level} signinum-vs-openslide max_abs={} mean_abs={:.4} psnr={:.2}dB",
                                 entry.alias, report.max_abs, report.mean_abs, report.psnr_db
                             );
                             if required {
                                 record_comparison_failure(
                                     entry,
-                                    "ashlar-vs-openslide",
+                                    "signinum-vs-openslide",
                                     level,
-                                    &format!("{} level={level}: ashlar vs OpenSlide", entry.alias),
+                                    &format!(
+                                        "{} level={level}: signinum vs OpenSlide",
+                                        entry.alias
+                                    ),
                                     &report,
                                     &mut failures,
                                 );
@@ -272,7 +278,7 @@ fn preflight() {
 }
 
 fn strict_corpus_required() -> bool {
-    std::env::var_os("ZIGGURAT_PARITY_REQUIRE_CORPUS").is_some()
+    std::env::var_os("STATUMEN_PARITY_REQUIRE_CORPUS").is_some()
 }
 
 fn record_comparison_failure(

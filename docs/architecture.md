@@ -1,8 +1,8 @@
-# ziggurat Architecture
+# statumen Architecture
 
-`ziggurat` owns whole-slide container parsing, metadata normalization, tile
+`statumen` owns whole-slide container parsing, metadata normalization, tile
 addressing, region composition, and cache policy plumbing. Image-codec work is
-delegated to `ashlar`; app runtime policy is owned by SlideViewer.
+delegated to `signinum`; app runtime policy is owned by SlideViewer.
 
 ## Layers
 
@@ -11,7 +11,7 @@ delegated to `ashlar`; app runtime policy is owned by SlideViewer.
 - `formats`: container readers for TIFF-family WSI, DICOM, MIRAX, Zeiss,
   Hamamatsu VMS, and `.svcache`.
 - `decode`: JPEG/JPEG 2000/tile decompression glue that converts WSI requests
-  into ashlar calls.
+  into signinum calls.
 - `output`: optional device-output session plumbing, currently Metal.
 - `bin`: benchmark and cache-building entry points.
 
@@ -28,7 +28,7 @@ or reach into SlideViewer runtime policy.
 - `SvcachePolicy` controls read-through cache resolution. SlideViewer maps env
   vars to this policy; the library does not read `SV_SVCACHE`.
 - `TileOutputPreference` uses WSI-rs-owned `OutputBackendRequest`. Conversion to
-  `ashlar_core::BackendRequest` happens only inside codec glue.
+  `signinum_core::BackendRequest` happens only inside codec glue.
 - `SlideReadContext` is the typed path for read caches and request limits.
   `Any`/downcast-based cache tunnels are not allowed.
 

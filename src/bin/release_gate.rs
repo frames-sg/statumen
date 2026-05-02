@@ -189,7 +189,7 @@ fn ensure_sibling_binary(workspace_root: &Path, name: &str) -> Result<PathBuf, S
             let mut args = vec![
                 "build",
                 "-p",
-                "ziggurat",
+                "statumen",
                 "--features",
                 "bench openslide-bench",
             ];
@@ -242,13 +242,13 @@ fn run_parity_check(
         .args([
             "test",
             "-p",
-            "ziggurat",
+            "statumen",
             "--test",
             "openslide_compare",
             "--",
             "--nocapture",
         ])
-        .env("ZIGGURAT_OPENSLIDE_COMPARE_PATHS", joined)
+        .env("STATUMEN_OPENSLIDE_COMPARE_PATHS", joined)
         .output()
         .map_err(|err| format!("failed to run openslide_compare: {err}"))?;
 
@@ -278,7 +278,7 @@ fn run_parity_check(
             "cargo".into(),
             "test".into(),
             "-p".into(),
-            "ziggurat".into(),
+            "statumen".into(),
             "--test".into(),
             "openslide_compare".into(),
             "--".into(),
@@ -338,10 +338,10 @@ fn render_markdown(summary: &ReleaseSummary) -> String {
             slide.parity.status.to_uppercase(),
             slide.parity.output_path
         ));
-        out.push_str("| workload | status | ziggurat p50 | OpenSlide p50 | Iris p50 | ziggurat p99 | OpenSlide p99 | Iris p99 | OpenSlide RSS ratio | Iris RSS ratio |\n");
+        out.push_str("| workload | status | statumen p50 | OpenSlide p50 | Iris p50 | statumen p99 | OpenSlide p99 | Iris p99 | OpenSlide RSS ratio | Iris RSS ratio |\n");
         out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n");
         for workload in &slide.workloads {
-            let wsi = library_summary(&workload.summary, "ziggurat");
+            let wsi = library_summary(&workload.summary, "statumen");
             let openslide = library_summary(&workload.summary, "openslide");
             let iris = library_summary(&workload.summary, "iris");
             let openslide_rss_ratio = ratio_string(
