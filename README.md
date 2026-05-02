@@ -10,7 +10,7 @@ delegated to the `signinum-*` crates.
 
 ## Architecture
 
-- Container parsers: TIFF/SVS/NDPI/DICOM/Zeiss/Mirax/Hamamatsu/Philips TIFF.
+- Container parsers: TIFF/SVS/NDPI/DICOM/Zeiss CZI/ZVI/Mirax/Hamamatsu/Philips TIFF.
 - Slide geometry: `Slide`, `Dataset`, `SceneId`, `LevelIdx`, `PlaneIdx`.
 - Signinum integration: compressed tile resolution feeds `signinum_jpeg`
   and `signinum_j2k`.

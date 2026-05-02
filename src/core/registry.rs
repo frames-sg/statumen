@@ -10,6 +10,8 @@ use crate::formats::mirax::MiraxBackend;
 use crate::formats::olympus_vsi::OlympusVsiBackend;
 use crate::formats::svcache::SvcacheBackend;
 use crate::formats::tiff_family::TiffFamilyBackend;
+use crate::formats::zeiss::ZeissBackend;
+use crate::formats::zeiss_zvi::ZeissZviBackend;
 
 /// Default maximum region size in pixels. Prevents OOM from unreasonably large
 /// region requests (256 megapixels = ~768 MB for RGB8).
@@ -914,6 +916,10 @@ impl FormatRegistry {
         self.register(vms.clone(), vms);
         let vsi = Arc::new(OlympusVsiBackend::new());
         self.register(vsi.clone(), vsi);
+        let zeiss_zvi = Arc::new(ZeissZviBackend::new());
+        self.register(zeiss_zvi.clone(), zeiss_zvi);
+        let zeiss = Arc::new(ZeissBackend::new());
+        self.register(zeiss.clone(), zeiss);
         let tiff = Arc::new(TiffFamilyBackend::new());
         self.register(tiff.clone(), tiff);
     }

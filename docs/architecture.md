@@ -8,8 +8,8 @@ delegated to `signinum`; app runtime policy is owned by SlideViewer.
 
 - `core`: public WSI types, `Slide`, `SlideReader`, typed read context, and
   cache primitives.
-- `formats`: container readers for TIFF-family WSI, DICOM, MIRAX, Zeiss,
-  Hamamatsu VMS, and `.svcache`.
+- `formats`: container readers for TIFF-family WSI, DICOM, MIRAX,
+  Zeiss CZI/ZVI, Hamamatsu VMS, Olympus VSI, and `.svcache`.
 - `decode`: JPEG/JPEG 2000/tile decompression glue that converts WSI requests
   into signinum calls.
 - `output`: optional device-output session plumbing, currently Metal.
