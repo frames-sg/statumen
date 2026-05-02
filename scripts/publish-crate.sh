@@ -2,7 +2,7 @@
 set -euo pipefail
 
 dry_run="${DRY_RUN_ONLY:-false}"
-crate="ziggurat"
+crate="statumen"
 version="$(cargo pkgid | sed 's/.*#//')"
 
 if [[ "$dry_run" == "true" ]]; then

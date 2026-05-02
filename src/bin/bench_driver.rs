@@ -149,7 +149,7 @@ fn main() {
         }));
     }
 
-    let wsi = library_object(&libraries, "ziggurat").expect("ziggurat library object");
+    let wsi = library_object(&libraries, "statumen").expect("statumen library object");
     let openslide = library_object(&libraries, "openslide").expect("openslide library object");
     let iris = library_object(&libraries, "iris");
     let gate_iris = env_flag(GATE_IRIS_ENV);
@@ -233,7 +233,7 @@ fn sibling_binary(name: &str) -> Result<PathBuf, String> {
         Ok(path)
     } else {
         Err(format!(
-            "missing benchmark binary {}; build ziggurat with --features 'bench openslide-bench'",
+            "missing benchmark binary {}; build statumen with --features 'bench openslide-bench'",
             path.display()
         ))
     }
@@ -242,7 +242,7 @@ fn sibling_binary(name: &str) -> Result<PathBuf, String> {
 fn benchmark_targets(source_slide_path: &Path) -> Result<Vec<BenchmarkTarget>, String> {
     let mut targets = vec![
         BenchmarkTarget {
-            library: "ziggurat",
+            library: "statumen",
             command: BenchCommand::Binary(sibling_binary("wsi_bench")?),
             slide_path: source_slide_path.to_path_buf(),
         },
@@ -514,7 +514,7 @@ fn gate_failures(
 
     let mut failures = Vec::new();
     if wsi.status != Some("ok") {
-        failures.push("ziggurat child runs reported errors".to_string());
+        failures.push("statumen child runs reported errors".to_string());
     }
     if openslide.status != Some("ok") {
         failures.push("openslide child runs reported errors".to_string());
@@ -554,7 +554,7 @@ fn compare_metric(
     match (wsi, openslide) {
         (Some(wsi), Some(openslide)) if wsi <= openslide => {}
         (Some(wsi), Some(openslide)) => failures.push(format!(
-            "{label} gate failed: ziggurat {wsi} > openslide {openslide}"
+            "{label} gate failed: statumen {wsi} > openslide {openslide}"
         )),
         _ => failures.push(format!("{label} gate missing comparable values")),
     }
@@ -577,7 +577,7 @@ fn compare_rss_metric_named(
                 return;
             }
             failures.push(format!(
-                "{label} gate failed: ziggurat {wsi} > {PEAK_RSS_GATE_RATIO:.2}x baseline {baseline} (ratio {ratio:.3}x)"
+                "{label} gate failed: statumen {wsi} > {PEAK_RSS_GATE_RATIO:.2}x baseline {baseline} (ratio {ratio:.3}x)"
             ));
         }
         _ => failures.push(format!("{label} gate missing comparable values")),

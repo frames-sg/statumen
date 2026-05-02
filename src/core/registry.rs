@@ -81,7 +81,7 @@ impl<'a> SlideReadContext<'a> {
 /// `read_tile` for free:
 ///
 /// ```
-/// use ziggurat::{
+/// use statumen::{
 ///     ColorSpace, CpuTile, Dataset, SlideReader, TileOutputPreference, TilePixels, TileRequest,
 ///     WsiError,
 /// };
@@ -1145,7 +1145,7 @@ impl Slide {
         match &result {
             Ok(TilePixels::Cpu(_)) if device_decode_attempted => {
                 fallback_to_cpu = true;
-                fallback_reason = "ashlar_auto_chose_cpu";
+                fallback_reason = "signinum_auto_chose_cpu";
                 span.record("fallback_to_cpu", true);
                 span.record("fallback_reason", fallback_reason);
                 span.record("device_decoded_host_resident", false);

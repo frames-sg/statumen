@@ -1,17 +1,17 @@
-use ashlar_core::{DeviceSurface, PixelFormat};
+use signinum_core::{DeviceSurface, PixelFormat};
 use std::sync::Arc;
 
 /// Codec-specific Metal sessions allocated from one renderer-owned device.
 #[derive(Debug, Clone)]
 pub struct MetalBackendSessions {
-    pub(crate) jpeg: Arc<ashlar_jpeg_metal::MetalBackendSession>,
-    pub(crate) j2k: Arc<ashlar_j2k_metal::MetalBackendSession>,
+    pub(crate) jpeg: Arc<signinum_jpeg_metal::MetalBackendSession>,
+    pub(crate) j2k: Arc<signinum_j2k_metal::MetalBackendSession>,
 }
 
 impl MetalBackendSessions {
     pub fn new(
-        jpeg: ashlar_jpeg_metal::MetalBackendSession,
-        j2k: ashlar_j2k_metal::MetalBackendSession,
+        jpeg: signinum_jpeg_metal::MetalBackendSession,
+        j2k: signinum_j2k_metal::MetalBackendSession,
     ) -> Self {
         Self {
             jpeg: Arc::new(jpeg),
@@ -19,11 +19,11 @@ impl MetalBackendSessions {
         }
     }
 
-    pub(crate) fn jpeg(&self) -> &ashlar_jpeg_metal::MetalBackendSession {
+    pub(crate) fn jpeg(&self) -> &signinum_jpeg_metal::MetalBackendSession {
         &self.jpeg
     }
 
-    pub(crate) fn j2k(&self) -> &ashlar_j2k_metal::MetalBackendSession {
+    pub(crate) fn j2k(&self) -> &signinum_j2k_metal::MetalBackendSession {
         &self.j2k
     }
 }
@@ -48,7 +48,7 @@ pub enum MetalDeviceStorage {
 }
 
 impl MetalDeviceTile {
-    pub(crate) fn from_jpeg(surface: ashlar_jpeg_metal::Surface) -> Option<Self> {
+    pub(crate) fn from_jpeg(surface: signinum_jpeg_metal::Surface) -> Option<Self> {
         let (buffer, byte_offset) = surface.metal_buffer()?;
         Some(Self {
             width: surface.dimensions().0,
@@ -62,7 +62,7 @@ impl MetalDeviceTile {
         })
     }
 
-    pub(crate) fn from_j2k(surface: ashlar_j2k_metal::Surface) -> Option<Self> {
+    pub(crate) fn from_j2k(surface: signinum_j2k_metal::Surface) -> Option<Self> {
         let (buffer, byte_offset) = surface.metal_buffer()?;
         Some(Self {
             width: surface.dimensions().0,

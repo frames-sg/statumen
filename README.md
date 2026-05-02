@@ -1,21 +1,21 @@
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# ziggurat
+# statumen
 
 ## Overview
 
-`ziggurat` is an ashlar-native WSI reader. It owns container parsing,
+`statumen` is a Signinum-native WSI reader. It owns container parsing,
 slide/scene/level/plane geometry, and the `SlideReader` trait. Codec work is
-delegated to the `ashlar-*` crates.
+delegated to the `signinum-*` crates.
 
 ## Architecture
 
 - Container parsers: TIFF/SVS/NDPI/DICOM/Zeiss/Mirax/Hamamatsu/Philips TIFF.
 - Slide geometry: `Slide`, `Dataset`, `SceneId`, `LevelIdx`, `PlaneIdx`.
-- Ashlar integration: compressed tile resolution feeds `ashlar_jpeg`
-  and `ashlar_j2k`.
+- Signinum integration: compressed tile resolution feeds `signinum_jpeg`
+  and `signinum_j2k`.
 - DICOM is the unified reader for the workspace; `sv-slide` routes `.dcm`
-  through the same `ziggurat` adapter as other WSI formats.
+  through the same `statumen` adapter as other WSI formats.
 - Parity oracle: vendored `jpeg-decoder` and dynamically loaded compatibility
   library paths are test-only.
 
@@ -23,7 +23,7 @@ delegated to the `ashlar-*` crates.
 
 The DICOM reader supports VL Whole Slide Microscopy pyramids assembled from a
 single file or sibling instances in the same series. Phase 7a coverage includes
-JPEG baseline where ashlar supports the JPEG bitstream, JPEG 2000, RLE
+JPEG baseline where signinum supports the JPEG bitstream, JPEG 2000, RLE
 Lossless for 8-bit RGB/monochrome frames, native uncompressed Explicit VR Little
 Endian, Implicit VR Little Endian, Explicit VR Big Endian for 8-bit frames,
 row-major multi-frame tile addressing, associated image discovery, and sparse
@@ -33,7 +33,7 @@ tiled frame maps.
 
 ```rust,no_run
 use std::path::Path;
-use ziggurat::{PlaneSelection, Slide, TileOutputPreference, TilePixels, TileRequest};
+use statumen::{PlaneSelection, Slide, TileOutputPreference, TilePixels, TileRequest};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let slide = Slide::open(Path::new("sample.svs"))?;
@@ -63,12 +63,12 @@ existing `bench_driver` workloads. Iris consumes pre-encoded `.iris` slides, so
 set `WSI_BENCH_INCLUDE_IRIS=1` plus either `WSI_IRIS_SLIDE_PATH=/path/file.iris`
 for a single slide or `WSI_IRIS_SLIDE_DIR=/path/to/iris-slides` for a directory
 containing `<source-stem>.iris` files. Set `WSI_BENCH_GATE_IRIS=1` only when the
-run should fail if ziggurat is slower than Iris.
+run should fail if statumen is slower than Iris.
 
 ## Codec Library
 
 All production JPEG and JPEG 2000 decode is delegated to the sibling
-`ashlar` repository. Cite ashlar's JOSS paper
+`signinum` repository. Cite signinum's JOSS paper
 for codec methods, ROI/restart-marker APIs, batch decode, and decode-performance
 claims.
 
@@ -79,5 +79,5 @@ workspace separately until a reader-specific artifact exists.
 
 ## License
 
-Apache-2.0. See the sibling ashlar repo for codec
+Apache-2.0. See the sibling signinum repo for codec
 implementation details and its own license metadata.

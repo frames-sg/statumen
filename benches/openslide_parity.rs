@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use serde::Serialize;
-use ziggurat::{FormatRegistry, PlaneSelection, Slide, TileLayout, TileRequest};
+use statumen::{FormatRegistry, PlaneSelection, Slide, TileLayout, TileRequest};
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -19,7 +19,7 @@ struct Sample {
     alias: String,
     level: u32,
     tile_count: u32,
-    ziggurat_total_ms: f64,
+    statumen_total_ms: f64,
     openslide_total_ms: f64,
     ratio_wsirs_over_openslide: f64,
 }
@@ -98,9 +98,9 @@ fn main() {
             let _ = handle
                 .source()
                 .read_tile_cpu(req)
-                .expect("ziggurat read_tile");
+                .expect("statumen read_tile");
         }
-        let ziggurat_ms = started.elapsed().as_secs_f64() * 1e3;
+        let statumen_ms = started.elapsed().as_secs_f64() * 1e3;
 
         let started = Instant::now();
         for req in &reqs {
@@ -120,9 +120,9 @@ fn main() {
             alias: entry.alias,
             level: 0,
             tile_count: count,
-            ziggurat_total_ms: ziggurat_ms,
+            statumen_total_ms: statumen_ms,
             openslide_total_ms: openslide_ms,
-            ratio_wsirs_over_openslide: ziggurat_ms / openslide_ms.max(1e-9),
+            ratio_wsirs_over_openslide: statumen_ms / openslide_ms.max(1e-9),
         });
     }
 

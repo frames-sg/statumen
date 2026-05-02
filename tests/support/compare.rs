@@ -140,10 +140,10 @@ mod tests {
         let b = vec![12u8, 20, 30, 255, 40, 50, 60, 255];
         let report = compare_rgba(&a, &b, Tolerance::JPEG_TIGHT);
 
-        let failure = tolerance_failure("svs-001 level=0 ashlar-vs-reference", &report)
+        let failure = tolerance_failure("svs-001 level=0 signinum-vs-reference", &report)
             .expect("failed report should produce gate failure");
 
-        assert!(failure.contains("svs-001 level=0 ashlar-vs-reference"));
+        assert!(failure.contains("svs-001 level=0 signinum-vs-reference"));
         assert!(failure.contains("max_abs=2"));
     }
 }

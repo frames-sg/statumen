@@ -224,7 +224,7 @@ impl WorkloadResult {
 #[derive(Debug, Clone)]
 pub struct BenchRun {
     pub schema_version: u32,
-    pub library: String, // "ziggurat" or "openslide"
+    pub library: String, // "statumen" or "openslide"
     pub slide_path: String,
     pub host: String, // uname -a output
     pub run_mode: &'static str,
@@ -441,7 +441,7 @@ impl WorkloadPlan {
 
     /// Returns the **level-2** in-bounds coordinates derived from the SAME
     /// level-0 trace by downsampling, then filtered against level-2 bounds.
-    /// The downsampling preserves the trace shape across levels so the ziggurat
+    /// The downsampling preserves the trace shape across levels so the statumen
     /// and openslide bench binaries always read the same regions.
     pub fn pan_trace_l2(&self) -> Vec<(i64, i64)> {
         let tile_px = self.tile_px as i64;
@@ -766,7 +766,7 @@ mod tests {
     #[test]
     fn json_round_trips_through_serde_json() {
         let mut run = BenchRun::new(
-            "ziggurat",
+            "statumen",
             "/tmp/x.svs".into(),
             "test-host".into(),
             Some("single_tile_l0".into()),

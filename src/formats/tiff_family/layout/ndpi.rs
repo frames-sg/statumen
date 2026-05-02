@@ -11,7 +11,7 @@ use crate::formats::tiff_family::container::tags;
 use crate::formats::tiff_family::container::TiffContainer;
 use crate::formats::tiff_family::error::{IfdId, TiffParseError};
 use crate::properties::Properties;
-use ashlar_jpeg::Decoder as AshlarJpegDecoder;
+use signinum_jpeg::Decoder as SigninumJpegDecoder;
 
 use super::{
     compute_tiff_dataset_identity, DatasetLayout, TiffLayoutInterpreter, TileSource, TileSourceKey,
@@ -36,7 +36,7 @@ struct JpegGeometryProbe {
     mcu_h: u32,
 }
 
-fn probe_jpeg_geometry_via_ashlar(
+fn probe_jpeg_geometry_via_signinum(
     container: &TiffContainer,
     ifd_id: IfdId,
 ) -> Result<JpegGeometryProbe, TiffParseError> {
@@ -44,13 +44,13 @@ fn probe_jpeg_geometry_via_ashlar(
     let strip_byte_count = container.get_u64(ifd_id, tags::STRIP_BYTE_COUNTS)?;
     let read_len = JPEG_HEADER_PROBE_BYTES.min(strip_byte_count);
     let header = container.pread(strip_offset, read_len)?;
-    probe_jpeg_geometry_bytes_via_ashlar(header)
+    probe_jpeg_geometry_bytes_via_signinum(header)
 }
 
-fn probe_jpeg_geometry_bytes_via_ashlar(
+fn probe_jpeg_geometry_bytes_via_signinum(
     header: Vec<u8>,
 ) -> Result<JpegGeometryProbe, TiffParseError> {
-    match AshlarJpegDecoder::inspect(&header) {
+    match SigninumJpegDecoder::inspect(&header) {
         Ok(info) => Ok(JpegGeometryProbe {
             header: jpeg_header_prefix(&header)?.to_vec(),
             restart_interval: info.restart_interval.unwrap_or(0),
@@ -60,7 +60,7 @@ fn probe_jpeg_geometry_bytes_via_ashlar(
         Err(inspect_err) => {
             let probe = probe_jpeg_geometry_bytes_lenient(&header).map_err(|lenient_err| {
                 TiffParseError::Structure(format!(
-                    "cannot parse JPEG geometry with ashlar: {inspect_err}; lenient NDPI probe failed: {lenient_err}"
+                    "cannot parse JPEG geometry with signinum: {inspect_err}; lenient NDPI probe failed: {lenient_err}"
                 ))
             })?;
             Ok(probe)
@@ -491,7 +491,7 @@ impl NdpiInterpreter {
                 let representative = group[0];
 
                 let representative_probe =
-                    probe_jpeg_geometry_via_ashlar(container, representative.ifd_id)?;
+                    probe_jpeg_geometry_via_signinum(container, representative.ifd_id)?;
                 let restart_interval = representative_probe.restart_interval;
                 let (mcu_w, mcu_h) = (representative_probe.mcu_w, representative_probe.mcu_h);
 
@@ -532,7 +532,7 @@ impl NdpiInterpreter {
                     let ifd_probe = if ifd.ifd_id == representative.ifd_id {
                         representative_probe.clone()
                     } else {
-                        probe_jpeg_geometry_via_ashlar(container, ifd.ifd_id)?
+                        probe_jpeg_geometry_via_signinum(container, ifd.ifd_id)?
                     };
 
                     let plane_ri = ifd_probe.restart_interval;
@@ -767,9 +767,9 @@ mod tests {
     }
 
     #[test]
-    fn probe_jpeg_geometry_via_ashlar_matches_synthetic_header() {
-        let probe = probe_jpeg_geometry_bytes_via_ashlar(synthetic_dri_420_jpeg_header())
-            .expect("ashlar should inspect synthetic DRI JPEG header");
+    fn probe_jpeg_geometry_via_signinum_matches_synthetic_header() {
+        let probe = probe_jpeg_geometry_bytes_via_signinum(synthetic_dri_420_jpeg_header())
+            .expect("signinum should inspect synthetic DRI JPEG header");
         assert_eq!(probe.restart_interval, 10);
         assert_eq!(probe.mcu_w, 16);
         assert_eq!(probe.mcu_h, 16);
@@ -784,7 +784,7 @@ mod tests {
             .expect("synthetic header has SOF0");
         header[sof + 5..sof + 9].copy_from_slice(&[0, 0, 0, 0]);
 
-        let probe = probe_jpeg_geometry_bytes_via_ashlar(header)
+        let probe = probe_jpeg_geometry_bytes_via_signinum(header)
             .expect("NDPI lenient probe should accept zero SOF dimensions");
 
         assert_eq!(probe.restart_interval, 10);

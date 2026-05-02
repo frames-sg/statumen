@@ -3,10 +3,10 @@
 mod support;
 
 use support::corpus::{load_public, resolve_entry_path};
-use support::oracles::{read_probe, top_left_probe, AshlarOracle, Oracle};
+use support::oracles::{read_probe, top_left_probe, Oracle, SigninumOracle};
 
 #[test]
-fn dicom_public_corpus_decodes_with_ziggurat() {
+fn dicom_public_corpus_decodes_with_statumen() {
     let strict_corpus = strict_corpus_required();
     let manifest = match load_public() {
         Ok(manifest) => manifest,
@@ -44,10 +44,10 @@ fn dicom_public_corpus_decodes_with_ziggurat() {
             }
             continue;
         }
-        let slide = match AshlarOracle.open(&path) {
+        let slide = match SigninumOracle.open(&path) {
             Ok(slide) => slide,
             Err(err) => {
-                failures.push(format!("{}: open ziggurat DICOM: {err}", entry.alias));
+                failures.push(format!("{}: open statumen DICOM: {err}", entry.alias));
                 continue;
             }
         };
@@ -111,10 +111,10 @@ fn dicom_public_corpus_matches_openslide_within_tolerance() {
             ));
             continue;
         }
-        let ours = match AshlarOracle.open(&path) {
+        let ours = match SigninumOracle.open(&path) {
             Ok(slide) => slide,
             Err(err) => {
-                failures.push(format!("{}: open ziggurat DICOM: {err}", entry.alias));
+                failures.push(format!("{}: open statumen DICOM: {err}", entry.alias));
                 continue;
             }
         };
@@ -137,7 +137,7 @@ fn dicom_public_corpus_matches_openslide_within_tolerance() {
                 Ok(buf) => buf,
                 Err(err) => {
                     failures.push(format!(
-                        "{} level={level}: read ziggurat: {err}",
+                        "{} level={level}: read statumen: {err}",
                         entry.alias
                     ));
                     continue;
@@ -163,7 +163,7 @@ fn dicom_public_corpus_matches_openslide_within_tolerance() {
                 entry.alias, report.max_abs, report.mean_abs, report.passed
             );
             if let Some(failure) = tolerance_failure(
-                &format!("{} level={level}: ziggurat vs OpenSlide", entry.alias),
+                &format!("{} level={level}: statumen vs OpenSlide", entry.alias),
                 &report,
             ) {
                 failures.push(failure);
@@ -179,5 +179,5 @@ fn dicom_public_corpus_matches_openslide_within_tolerance() {
 }
 
 fn strict_corpus_required() -> bool {
-    std::env::var_os("ZIGGURAT_PARITY_REQUIRE_CORPUS").is_some()
+    std::env::var_os("STATUMEN_PARITY_REQUIRE_CORPUS").is_some()
 }

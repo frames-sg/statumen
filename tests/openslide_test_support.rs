@@ -51,7 +51,7 @@ fn load_openslide_api() -> Result<OpenSlideApi, String> {
     if let Some(path) = std::env::var_os("OPENSLIDE_LIB_PATH") {
         candidates.push(path.to_string_lossy().into_owned());
     }
-    if let Some(path) = std::env::var_os("ZIGGURAT_OPENSLIDE_LIBRARY") {
+    if let Some(path) = std::env::var_os("STATUMEN_OPENSLIDE_LIBRARY") {
         candidates.push(path.to_string_lossy().into_owned());
     }
     candidates.extend(

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use openslide_test_support::OpenSlide;
-use ziggurat::{PlaneSelection, RegionRequest, Slide};
+use statumen::{PlaneSelection, RegionRequest, Slide};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PixelCompareMode {
@@ -26,7 +26,7 @@ struct RegionCase {
 
 #[test]
 fn compare_against_openslide_for_env_paths() {
-    let Some(raw_paths) = env::var_os("ZIGGURAT_OPENSLIDE_COMPARE_PATHS") else {
+    let Some(raw_paths) = env::var_os("STATUMEN_OPENSLIDE_COMPARE_PATHS") else {
         return;
     };
 
@@ -35,7 +35,7 @@ fn compare_against_openslide_for_env_paths() {
         .collect();
     assert!(
         !paths.is_empty(),
-        "ZIGGURAT_OPENSLIDE_COMPARE_PATHS was set but contained no valid paths"
+        "STATUMEN_OPENSLIDE_COMPARE_PATHS was set but contained no valid paths"
     );
 
     for path in paths {
@@ -48,7 +48,7 @@ fn aperio_jpeg_rgb_pyramid_levels_match_openslide() {
     let Some(path) = aperio_jpeg_rgb_regression_path() else {
         return;
     };
-    let handle = Slide::open(&path).expect("open Aperio RGB regression slide with ziggurat");
+    let handle = Slide::open(&path).expect("open Aperio RGB regression slide with statumen");
     let openslide = match OpenSlide::open(&path) {
         Ok(openslide) => openslide,
         Err(err) => {
@@ -75,7 +75,7 @@ fn aperio_jpeg_rgb_pyramid_levels_match_openslide() {
         );
         let ours = handle
             .read_region_rgba(&req)
-            .unwrap_or_else(|err| panic!("ziggurat read level {level} failed: {err}"))
+            .unwrap_or_else(|err| panic!("statumen read level {level} failed: {err}"))
             .into_raw();
         let theirs = openslide
             .read_region_rgba(0, 0, level as i32, 240, 240)
@@ -99,7 +99,7 @@ fn aperio_jpeg_rgb_pyramid_levels_match_openslide() {
 }
 
 fn aperio_jpeg_rgb_regression_path() -> Option<PathBuf> {
-    if let Some(path) = env::var_os("ZIGGURAT_APERIO_JPEG_RGB_PATH") {
+    if let Some(path) = env::var_os("STATUMEN_APERIO_JPEG_RGB_PATH") {
         return Some(resolve_compare_path(PathBuf::from(path)));
     }
 
@@ -201,7 +201,7 @@ fn pixel_compare_mode_keeps_exact_for_unclassified_tiff() {
 }
 
 fn compare_slide(path: &Path) {
-    let handle = Slide::open(path).expect("open slide with ziggurat");
+    let handle = Slide::open(path).expect("open slide with statumen");
     let openslide = OpenSlide::open(path).expect("open slide with OpenSlide");
     let openslide_props = openslide_properties(path);
     let ours = handle.dataset();
@@ -331,7 +331,7 @@ fn compare_level0_regions(
             .read_region_rgba(&req)
             .unwrap_or_else(|err| {
                 panic!(
-                    "ziggurat read_region_rgba failed for {} {}: {err}",
+                    "statumen read_region_rgba failed for {} {}: {err}",
                     path.display(),
                     region.label
                 )
@@ -646,7 +646,7 @@ fn compare_float_property(
         panic!("missing property for {} key {}", path.display(), key);
     };
 
-    let ours = ours.parse::<f64>().expect("parse ziggurat float property");
+    let ours = ours.parse::<f64>().expect("parse statumen float property");
     let theirs = theirs
         .parse::<f64>()
         .expect("parse openslide float property");

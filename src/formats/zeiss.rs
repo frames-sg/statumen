@@ -13,7 +13,7 @@ use czi_rs::{
 };
 use image::imageops::{self, FilterType};
 use lru::LruCache;
-use ashlar_core::BackendRequest;
+use signinum_core::BackendRequest;
 use std::collections::HashMap as StdHashMap;
 
 use crate::core::hash::Quickhash1;
@@ -154,7 +154,7 @@ impl SlideReader for ZeissReader {
                 });
             }
         })
-        .to_ashlar();
+        .to_signinum();
         reqs.iter()
             .map(|req| {
                 self.read_tile_with_backend(req, backend)
@@ -1398,7 +1398,7 @@ fn decode_associated_attachment(
             tables: None,
             expected_width: 0,
             expected_height: 0,
-            color_transform: ashlar_jpeg::ColorTransform::Auto,
+            color_transform: signinum_jpeg::ColorTransform::Auto,
             force_dimensions: false,
             requested_size: None,
         }])
@@ -1498,7 +1498,7 @@ fn read_attachment_prefix(
 fn temp_czi_path(index: usize) -> PathBuf {
     let counter = TEMP_BLOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "ziggurat-zeiss-{}-{}-{}.czi",
+        "statumen-zeiss-{}-{}-{}.czi",
         std::process::id(),
         index,
         counter

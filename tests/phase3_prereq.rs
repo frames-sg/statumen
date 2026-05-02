@@ -1,4 +1,4 @@
-use ashlar_jpeg::{ColorTransform, DecodeOptions};
+use signinum_jpeg::{ColorTransform, DecodeOptions};
 
 #[test]
 fn ndpi_phase3_prereq_color_transform_settable() {

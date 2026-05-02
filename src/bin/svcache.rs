@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ziggurat::{
+use statumen::{
     build_svcache, build_svcache_tiles, default_svcache_path, CacheConfig, PlaneSelection, Slide,
     SlideOpenOptions, SvcacheTileSelection, TileLayout,
 };
@@ -182,7 +182,7 @@ fn parse_build_window_args(args: &[String]) -> Result<WindowArgs, String> {
     })
 }
 
-fn cache_grid(level: &ziggurat::Level) -> (u32, u32, u64, u64) {
+fn cache_grid(level: &statumen::Level) -> (u32, u32, u64, u64) {
     match level.tile_layout {
         TileLayout::Regular {
             tile_width,

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use ziggurat::{FormatRegistry, PlaneSelection, Slide, TileLayout, TileRequest};
+use statumen::{FormatRegistry, PlaneSelection, Slide, TileLayout, TileRequest};
 
 #[path = "../tests/support/mod.rs"]
 mod support;
@@ -87,7 +87,7 @@ fn bench_decode_throughput(c: &mut Criterion) {
                 batch_size as u64 * u64::from(tile_width) * u64::from(tile_height) * 4,
             ));
             group.bench_with_input(
-                BenchmarkId::new("ashlar_cpu", batch_size),
+                BenchmarkId::new("signinum_cpu", batch_size),
                 &reqs,
                 |b, reqs| {
                     b.iter(|| {
@@ -98,7 +98,7 @@ fn bench_decode_throughput(c: &mut Criterion) {
             #[cfg(feature = "parity-metal")]
             {
                 group.bench_with_input(
-                    BenchmarkId::new("ashlar_metal_stub", batch_size),
+                    BenchmarkId::new("signinum_metal_stub", batch_size),
                     &reqs,
                     |b, reqs| {
                         b.iter(|| {

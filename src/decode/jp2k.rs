@@ -10,11 +10,11 @@ use crate::error::WsiError;
 use image::RgbaImage;
 use std::borrow::Cow;
 
-use ashlar_core::{
-    BackendRequest as AshlarBackendRequest, DeviceSurface as AshlarDeviceSurface,
-    ImageDecodeDevice as AshlarImageDecodeDevice, PixelFormat as AshlarPixelFormat,
+use signinum_core::{
+    BackendRequest as SigninumBackendRequest, DeviceSurface as SigninumDeviceSurface,
+    ImageDecodeDevice as SigninumImageDecodeDevice, PixelFormat as SigninumPixelFormat,
 };
-use ashlar_j2k_metal::{J2kDecoder as AshlarJp2kDecoder, MetalTileBatch};
+use signinum_j2k_metal::{J2kDecoder as SigninumJp2kDecoder, MetalTileBatch};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +30,7 @@ pub(crate) struct Jp2kDecodeJob<'a> {
     pub expected_width: u32,
     pub expected_height: u32,
     pub rgb_color_space: bool,
-    pub backend: AshlarBackendRequest,
+    pub backend: SigninumBackendRequest,
 }
 
 #[cfg(test)]
@@ -68,7 +68,7 @@ pub(crate) fn decode_jp2k_to_sample_buffer(
         expected_width,
         expected_height,
         colorspace,
-        AshlarBackendRequest::Auto,
+        SigninumBackendRequest::Auto,
     )
 }
 
@@ -77,16 +77,16 @@ fn decode_jp2k_to_sample_buffer_with_backend(
     expected_width: u32,
     expected_height: u32,
     colorspace: Jp2kColorSpace,
-    backend: AshlarBackendRequest,
+    backend: SigninumBackendRequest,
 ) -> Result<CpuTile, WsiError> {
     let header = validate_jp2k_decode_request(data, expected_width, expected_height)?;
     let output_colorspace = effective_output_colorspace(&header, colorspace);
     let mut decoder =
-        AshlarJp2kDecoder::new(data).map_err(|err| WsiError::Jp2k(err.to_string()))?;
+        SigninumJp2kDecoder::new(data).map_err(|err| WsiError::Jp2k(err.to_string()))?;
     let surface = decoder
-        .decode_to_device(AshlarPixelFormat::Rgb8, backend)
-        .map_err(|err| WsiError::Jp2k(format!("ashlar JP2K decode failed: {err}")))?;
-    sample_buffer_from_ashlar_surface(surface, expected_width, expected_height, output_colorspace)
+        .decode_to_device(SigninumPixelFormat::Rgb8, backend)
+        .map_err(|err| WsiError::Jp2k(format!("signinum JP2K decode failed: {err}")))?;
+    sample_buffer_from_signinum_surface(surface, expected_width, expected_height, output_colorspace)
 }
 
 pub(crate) fn decode_jp2k_tile_batch_to_sample_buffers(
@@ -95,7 +95,7 @@ pub(crate) fn decode_jp2k_tile_batch_to_sample_buffers(
     if reqs.is_empty() {
         return Ok(Vec::new());
     }
-    decode_jp2k_tile_batch_with_ashlar(reqs)
+    decode_jp2k_tile_batch_with_signinum(reqs)
 }
 
 pub(crate) fn decode_batch_jp2k(jobs: &[Jp2kDecodeJob<'_>]) -> Vec<Result<CpuTile, WsiError>> {
@@ -169,11 +169,11 @@ fn decode_one_jp2k_pixels(
             Jp2kColorSpace::YCbCr
         },
     );
-    let mut decoder =
-        AshlarJp2kDecoder::new(job.data.as_ref()).map_err(|err| WsiError::Jp2k(err.to_string()))?;
+    let mut decoder = SigninumJp2kDecoder::new(job.data.as_ref())
+        .map_err(|err| WsiError::Jp2k(err.to_string()))?;
     let surface = decoder
-        .decode_to_device_with_session(AshlarPixelFormat::Rgb8, metal_sessions.j2k())
-        .map_err(|err| WsiError::Jp2k(format!("ashlar JP2K device decode failed: {err}")))?;
+        .decode_to_device_with_session(SigninumPixelFormat::Rgb8, metal_sessions.j2k())
+        .map_err(|err| WsiError::Jp2k(format!("signinum JP2K device decode failed: {err}")))?;
     tile_pixels_from_jp2k_surface(
         surface,
         job.expected_width,
@@ -216,7 +216,7 @@ fn validate_jp2k_decode_request(
 }
 
 #[allow(dead_code)]
-fn decode_jp2k_tile_batch_with_ashlar(
+fn decode_jp2k_tile_batch_with_signinum(
     reqs: &[Jp2kDecodeJob<'_>],
 ) -> Result<Vec<CpuTile>, WsiError> {
     let headers = reqs
@@ -230,20 +230,20 @@ fn decode_jp2k_tile_batch_with_ashlar(
         batch
             .push_shared_tile(
                 Arc::<[u8]>::from(req.data.as_ref()),
-                AshlarPixelFormat::Rgb8,
+                SigninumPixelFormat::Rgb8,
                 req.backend,
             )
-            .map_err(|err| WsiError::Jp2k(format!("ashlar JP2K batch submit failed: {err}")))?;
+            .map_err(|err| WsiError::Jp2k(format!("signinum JP2K batch submit failed: {err}")))?;
     }
 
     let surfaces = batch
         .decode_all()
-        .map_err(|err| WsiError::Jp2k(format!("ashlar JP2K batch decode failed: {err}")))?;
+        .map_err(|err| WsiError::Jp2k(format!("signinum JP2K batch decode failed: {err}")))?;
     surfaces
         .into_iter()
         .zip(reqs.iter().zip(headers.iter()))
         .map(|(surface, (req, header))| {
-            sample_buffer_from_ashlar_surface(
+            sample_buffer_from_signinum_surface(
                 surface,
                 req.expected_width,
                 req.expected_height,
@@ -291,11 +291,11 @@ fn decode_jp2k_tile_batch_to_pixels(
     let surfaces = reqs
         .iter()
         .map(|req| {
-            let mut decoder = AshlarJp2kDecoder::new(req.data.as_ref())
+            let mut decoder = SigninumJp2kDecoder::new(req.data.as_ref())
                 .map_err(|err| WsiError::Jp2k(err.to_string()))?;
             decoder
-                .decode_to_device_with_session(AshlarPixelFormat::Rgb8, metal_sessions.j2k())
-                .map_err(|err| WsiError::Jp2k(format!("ashlar JP2K device decode failed: {err}")))
+                .decode_to_device_with_session(SigninumPixelFormat::Rgb8, metal_sessions.j2k())
+                .map_err(|err| WsiError::Jp2k(format!("signinum JP2K device decode failed: {err}")))
         })
         .collect::<Result<Vec<_>, _>>()?;
     surfaces
@@ -322,7 +322,7 @@ fn decode_jp2k_tile_batch_to_pixels(
 
 #[cfg(feature = "metal")]
 fn jp2k_device_batch_enabled() -> bool {
-    parse_jp2k_device_batch_flag(std::env::var("ZIGGURAT_JP2K_DEVICE_BATCH").ok().as_deref())
+    parse_jp2k_device_batch_flag(std::env::var("STATUMEN_JP2K_DEVICE_BATCH").ok().as_deref())
 }
 
 #[cfg(feature = "metal")]
@@ -351,16 +351,16 @@ fn decode_jp2k_tile_batch_to_device_pixels(
         batch
             .push_shared_tile(
                 Arc::<[u8]>::from(req.data.as_ref()),
-                AshlarPixelFormat::Rgb8,
-                AshlarBackendRequest::Metal,
+                SigninumPixelFormat::Rgb8,
+                SigninumBackendRequest::Metal,
             )
             .map_err(|err| {
-                WsiError::Jp2k(format!("ashlar JP2K device batch submit failed: {err}"))
+                WsiError::Jp2k(format!("signinum JP2K device batch submit failed: {err}"))
             })?;
     }
-    let surfaces = batch
-        .decode_all()
-        .map_err(|err| WsiError::Jp2k(format!("ashlar JP2K device batch decode failed: {err}")))?;
+    let surfaces = batch.decode_all().map_err(|err| {
+        WsiError::Jp2k(format!("signinum JP2K device batch decode failed: {err}"))
+    })?;
     surfaces
         .into_iter()
         .zip(reqs.iter().zip(headers.iter()))
@@ -385,13 +385,13 @@ fn decode_jp2k_tile_batch_to_device_pixels(
 
 #[cfg(feature = "metal")]
 fn tile_pixels_from_jp2k_surface(
-    surface: ashlar_j2k_metal::Surface,
+    surface: signinum_j2k_metal::Surface,
     expected_width: u32,
     expected_height: u32,
     colorspace: Jp2kColorSpace,
     require_device: bool,
 ) -> Result<TilePixels, WsiError> {
-    if surface.backend_kind() == ashlar_core::BackendKind::Metal {
+    if surface.backend_kind() == signinum_core::BackendKind::Metal {
         if let Some(tile) = crate::output::metal::MetalDeviceTile::from_j2k(surface) {
             return Ok(TilePixels::Device(DeviceTile::Metal(tile)));
         }
@@ -401,7 +401,7 @@ fn tile_pixels_from_jp2k_surface(
             });
         }
         return Err(WsiError::Jp2k(
-            "ashlar JP2K returned Metal backend without public buffer".into(),
+            "signinum JP2K returned Metal backend without public buffer".into(),
         ));
     }
     if require_device {
@@ -409,19 +409,19 @@ fn tile_pixels_from_jp2k_surface(
             reason: "device backend not available for j2k".into(),
         });
     }
-    sample_buffer_from_ashlar_surface(surface, expected_width, expected_height, colorspace)
+    sample_buffer_from_signinum_surface(surface, expected_width, expected_height, colorspace)
         .map(TilePixels::Cpu)
 }
 
-fn sample_buffer_from_ashlar_surface(
-    surface: ashlar_j2k_metal::Surface,
+fn sample_buffer_from_signinum_surface(
+    surface: signinum_j2k_metal::Surface,
     expected_width: u32,
     expected_height: u32,
     colorspace: Jp2kColorSpace,
 ) -> Result<CpuTile, WsiError> {
-    if surface.pixel_format() != AshlarPixelFormat::Rgb8 {
+    if surface.pixel_format() != SigninumPixelFormat::Rgb8 {
         return Err(WsiError::Jp2k(format!(
-            "ashlar JP2K returned unsupported pixel format {:?}",
+            "signinum JP2K returned unsupported pixel format {:?}",
             surface.pixel_format()
         )));
     }
@@ -430,7 +430,7 @@ fn sample_buffer_from_ashlar_surface(
     let bytes = surface.as_bytes();
     if bytes.len() != expected_len {
         return Err(WsiError::Jp2k(format!(
-            "ashlar JP2K returned {} bytes for {}x{} RGB8 surface",
+            "signinum JP2K returned {} bytes for {}x{} RGB8 surface",
             bytes.len(),
             width,
             height
@@ -674,14 +674,14 @@ mod tests {
                 expected_width: header.image_width,
                 expected_height: header.image_height,
                 rgb_color_space: true,
-                backend: AshlarBackendRequest::Auto,
+                backend: SigninumBackendRequest::Auto,
             },
             Jp2kDecodeJob {
                 data: Cow::Borrowed(codestream),
                 expected_width: header.image_width,
                 expected_height: header.image_height,
                 rgb_color_space: true,
-                backend: AshlarBackendRequest::Auto,
+                backend: SigninumBackendRequest::Auto,
             },
         ];
 
@@ -696,7 +696,7 @@ mod tests {
                 (tile.width, tile.height),
                 (header.image_width, header.image_height)
             );
-            assert_eq!(tile.format, AshlarPixelFormat::Rgb8);
+            assert_eq!(tile.format, SigninumPixelFormat::Rgb8);
         }
     }
 
@@ -729,14 +729,14 @@ mod tests {
                 expected_width: first_header.image_width,
                 expected_height: first_header.image_height,
                 rgb_color_space: false,
-                backend: AshlarBackendRequest::Cpu,
+                backend: SigninumBackendRequest::Cpu,
             },
             Jp2kDecodeJob {
                 data: Cow::Borrowed(second_codestream),
                 expected_width: second_header.image_width,
                 expected_height: second_header.image_height,
                 rgb_color_space: true,
-                backend: AshlarBackendRequest::Cpu,
+                backend: SigninumBackendRequest::Cpu,
             },
         ];
 
@@ -748,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn rgb_tile_batch_ashlar_helper_decodes_in_submission_order() {
+    fn rgb_tile_batch_signinum_helper_decodes_in_submission_order() {
         let codestream = include_bytes!("../../tests/fixtures/jp2k/rgb_nomct.j2k");
         let header = parse_codestream_header(codestream).unwrap();
         let expected = load_fixture_rgb(include_bytes!("../../tests/fixtures/jp2k/rgb_nomct.ppm"));
@@ -759,18 +759,18 @@ mod tests {
                 expected_width: header.image_width,
                 expected_height: header.image_height,
                 rgb_color_space: true,
-                backend: AshlarBackendRequest::Cpu,
+                backend: SigninumBackendRequest::Cpu,
             },
             Jp2kDecodeJob {
                 data: Cow::Borrowed(codestream),
                 expected_width: header.image_width,
                 expected_height: header.image_height,
                 rgb_color_space: true,
-                backend: AshlarBackendRequest::Cpu,
+                backend: SigninumBackendRequest::Cpu,
             },
         ];
 
-        let decoded = decode_jp2k_tile_batch_with_ashlar(&requests).unwrap();
+        let decoded = decode_jp2k_tile_batch_with_signinum(&requests).unwrap();
 
         assert_eq!(decoded.len(), 2);
         assert_sample_buffer_matches_rgb_fixture(&decoded[0], &expected);

@@ -1,9 +1,9 @@
-# ziggurat — Architecture
+# statumen — Architecture
 
-Crate-local **map** and **invariants** for `ziggurat`. For the workspace-level picture and
+Crate-local **map** and **invariants** for `statumen`. For the workspace-level picture and
 this crate's place in it, see `/architecture.md` (root).
 
-`ziggurat` is a **leaf crate** (no in-workspace deps). It is a pure-Rust whole-slide image
+`statumen` is a **leaf crate** (no in-workspace deps). It is a pure-Rust whole-slide image
 reader: detect format → open dataset → read tiles → optionally surface device-resident
 output. The crate forbids `unsafe`.
 
@@ -19,9 +19,9 @@ src/
 │   ├── registry.rs           FormatProbe / DatasetReader / SlideReader / FormatRegistry
 │   ├── cache.rs              TileCache + CacheKey
 │   └── hash.rs               quickhash1 (slide content hashing)
-├── decode/                   codec backends (ashlar wrappers)
-│   ├── jpeg.rs               JPEG via ashlar_jpeg
-│   ├── jp2k.rs               JPEG2000 (J2K codestream) via ashlar_j2k_metal
+├── decode/                   codec backends (signinum wrappers)
+│   ├── jpeg.rs               JPEG via signinum_jpeg
+│   ├── jp2k.rs               JPEG2000 (J2K codestream) via signinum_j2k_metal
 │   ├── jp2k_backend.rs       narrow-subset validation, YCbCr→RGB
 │   └── jp2k_codestream.rs    J2K header / tile-part parsing
 ├── formats/                  per-vendor backends; each implements core/registry traits
@@ -34,7 +34,7 @@ src/
 │       ├── error.rs
 │       └── layout/           per-vendor interpreters (Aperio SVS, NDPI, Leica SCN, Philips, Ventana BIF)
 ├── output/
-│   └── metal.rs              MetalDeviceTile + ashlar Metal sessions (feature `metal`)
+│   └── metal.rs              MetalDeviceTile + signinum Metal sessions (feature `metal`)
 └── build.rs                  conditional libopenslide link (feature `openslide-bench` only)
 ```
 
@@ -134,7 +134,7 @@ path  ──► FormatProbe (each backend, cheap)
 
 | Area | Path | Purpose |
 |---|---|---|
-| Tests | `tests/ashlar_parity.rs` | CPU vs reference oracle tolerance. |
+| Tests | `tests/signinum_parity.rs` | CPU vs reference oracle tolerance. |
 | Tests | `tests/openslide_parity.rs` | Parity with libopenslide (gated by `openslide-bench` feature). |
 | Tests | `tests/real_wsi_behavior.rs` | Real-slide behavioural checks. |
 | Tests | `tests/metal_surface_smoke.rs` | Metal device-tile smoke (feature `metal`). |

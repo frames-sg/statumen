@@ -1,6 +1,6 @@
 # Public, redistributable parity corpus.
 # Slides listed here are downloaded by `scripts/parity-corpus-fetch.sh` into
-# `$ZIGGURAT_PARITY_CORPUS_CACHE` (default `~/.cache/slideviewer/parity-corpus/`).
+# `$STATUMEN_PARITY_CORPUS_CACHE` (default `~/.cache/slideviewer/parity-corpus/`).
 
 [[slide]]
 name             = "aperio_svs_brightfield_he_typical"
@@ -10,9 +10,9 @@ format           = "aperio"
 codecs           = ["jpeg"]
 must_decode      = ["base", "level1", "level2", "label", "macro"]
 expected_failures = [
-  "ashlar-vs-reference:base",
-  "ashlar-vs-reference:level1",
-  "ashlar-vs-reference:level2",
+  "signinum-vs-reference:base",
+  "signinum-vs-reference:level1",
+  "signinum-vs-reference:level2",
 ]
 source           = "openslide-testdata"
 license          = "CC0-1.0"
@@ -126,7 +126,7 @@ sha256           = "f7306843363c08ab86539f52acbe492917c440df50231d06b9b2e1657ac9
 citation         = "OpenSlide testdata, DICOM WSI 3DHISTECH-1 sample."
 phi_reviewed     = true
 url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/DICOM/3DHISTECH-1.zip"
-notes            = "Public DICOM JPEG provenance row. Non-gating because this sample uses progressive JPEG, which is a ashlar JPEG follow-on."
+notes            = "Public DICOM JPEG provenance row. Non-gating because this sample uses progressive JPEG, which is a signinum JPEG follow-on."
 
 [[slide]]
 name             = "dicom_wsi_jp2k_tiled_full"

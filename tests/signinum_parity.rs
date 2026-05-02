@@ -1,16 +1,16 @@
-//! Ashlar CPU vs reference parity harness.
+//! Signinum CPU vs reference parity harness.
 
 mod support;
 
 use support::compare::{compare_rgba, tolerance_failure, Tolerance};
 use support::corpus::{load_public, resolve_entry_path, CorpusEntry};
 use support::oracles::{
-    is_reference_oracle_unsupported, read_probe, top_left_probe, AshlarOracle, Oracle,
-    ReferenceOracle,
+    is_reference_oracle_unsupported, read_probe, top_left_probe, Oracle, ReferenceOracle,
+    SigninumOracle,
 };
 
 #[test]
-fn ashlar_cpu_vs_reference_within_tolerance() {
+fn signinum_cpu_vs_reference_within_tolerance() {
     let strict_corpus = strict_corpus_required();
     let manifest = match load_public() {
         Ok(manifest) => manifest,
@@ -46,10 +46,10 @@ fn ashlar_cpu_vs_reference_within_tolerance() {
             continue;
         }
 
-        let sc = match AshlarOracle.open(&path) {
+        let sc = match SigninumOracle.open(&path) {
             Ok(slide) => slide,
             Err(err) => {
-                failures.push(format!("{}: open ashlar: {err}", entry.alias));
+                failures.push(format!("{}: open signinum: {err}", entry.alias));
                 continue;
             }
         };
@@ -76,12 +76,12 @@ fn ashlar_cpu_vs_reference_within_tolerance() {
                 Ok(buf) => buf,
                 Err(err) => {
                     eprintln!(
-                        "[sc-parity] {} level={level}: read ashlar failed: {err}; skipping",
+                        "[sc-parity] {} level={level}: read signinum failed: {err}; skipping",
                         entry.alias
                     );
                     if required {
                         failures.push(format!(
-                            "{} level={level}: required ashlar read failed: {err}",
+                            "{} level={level}: required signinum read failed: {err}",
                             entry.alias
                         ));
                     }
@@ -115,9 +115,9 @@ fn ashlar_cpu_vs_reference_within_tolerance() {
             if required {
                 record_comparison_failure(
                     entry,
-                    "ashlar-vs-reference",
+                    "signinum-vs-reference",
                     level,
-                    &format!("{} level={level}: ashlar vs reference", entry.alias),
+                    &format!("{} level={level}: signinum vs reference", entry.alias),
                     &cmp,
                     &mut failures,
                 );
@@ -128,7 +128,7 @@ fn ashlar_cpu_vs_reference_within_tolerance() {
 
     if missing_slides == 0 && checked == 0 {
         failures
-            .push("ashlar parity decoded zero independently reference-backed tiles".to_string());
+            .push("signinum parity decoded zero independently reference-backed tiles".to_string());
     }
     eprintln!(
         "[sc-parity] checked={checked} unsupported_reference={unsupported_reference} missing_slides={missing_slides} failures={}",
@@ -138,7 +138,7 @@ fn ashlar_cpu_vs_reference_within_tolerance() {
 }
 
 fn strict_corpus_required() -> bool {
-    std::env::var_os("ZIGGURAT_PARITY_REQUIRE_CORPUS").is_some()
+    std::env::var_os("STATUMEN_PARITY_REQUIRE_CORPUS").is_some()
 }
 
 fn record_comparison_failure(
@@ -169,7 +169,7 @@ fn tolerance_for_entry(entry: &CorpusEntry) -> Tolerance {
 
 #[cfg(feature = "parity-metal")]
 #[test]
-fn ashlar_metal_vs_cpu_within_tolerance() {
+fn signinum_metal_vs_cpu_within_tolerance() {
     eprintln!(
         "[sc-parity-metal] Phase 0 stub: no production Metal split yet; harness wired for Phase 5"
     );

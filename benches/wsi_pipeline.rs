@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use ziggurat::{FormatRegistry, PlaneSelection, Slide, TileLayout, TileRequest};
+use statumen::{FormatRegistry, PlaneSelection, Slide, TileLayout, TileRequest};
 
 #[path = "../tests/support/mod.rs"]
 mod support;

@@ -1,4 +1,4 @@
-//! `wsi_bench` — runs the audit workload set against a single slide via ziggurat.
+//! `wsi_bench` — runs the audit workload set against a single slide via statumen.
 //!
 //! Usage:
 //!   `wsi_bench SLIDE_PATH`
@@ -12,8 +12,8 @@ use bench_common::{
     host_string, repeat_index, run_workload, selected_workload, should_run_workload,
     tile_top_left_at_pixel, BenchRun, WorkloadPlan, WorkloadResult,
 };
+use statumen::{PlaneSelection, RegionRequest, Slide, TileViewRequest};
 use std::path::PathBuf;
-use ziggurat::{PlaneSelection, RegionRequest, Slide, TileViewRequest};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -62,7 +62,7 @@ fn main() {
 
         if selected_workload.as_deref() == Some("cold_open") || cold_open_failed {
             let run = BenchRun::new(
-                "ziggurat",
+                "statumen",
                 slide_path_json,
                 host,
                 selected_workload,
@@ -81,7 +81,7 @@ fn main() {
                 .clone()
                 .unwrap_or_else(|| "single_tile_l0".to_string());
             let run = BenchRun::new(
-                "ziggurat",
+                "statumen",
                 slide_path_json,
                 host,
                 selected_workload,
@@ -102,7 +102,7 @@ fn main() {
     if should_run_workload(selected_workload.as_deref(), "single_tile_l0") {
         // Read the center tile of level 0 enough times that p99 has signal.
         let top_left = tile_top_left_at_pixel(plan.center_l0, plan.tile_px);
-        workloads.push(run_workload::<_, ziggurat::WsiError>(
+        workloads.push(run_workload::<_, statumen::WsiError>(
             "single_tile_l0",
             200,
             || {
@@ -115,7 +115,7 @@ fn main() {
     if should_run_workload(selected_workload.as_deref(), "pan_trace_l0") {
         let pan_l0_coords = plan.pan_trace_l0();
         let mut idx = 0;
-        workloads.push(run_workload::<_, ziggurat::WsiError>(
+        workloads.push(run_workload::<_, statumen::WsiError>(
             "pan_trace_l0",
             pan_l0_coords.len(),
             || {
@@ -130,7 +130,7 @@ fn main() {
     if should_run_workload(selected_workload.as_deref(), "pan_trace_l2") {
         let pan_l2_coords = plan.pan_trace_l2();
         let mut idx = 0;
-        workloads.push(run_workload::<_, ziggurat::WsiError>(
+        workloads.push(run_workload::<_, statumen::WsiError>(
             "pan_trace_l2",
             pan_l2_coords.len(),
             || {
@@ -145,7 +145,7 @@ fn main() {
     if should_run_workload(selected_workload.as_deref(), "pan_trace_l2_dense") {
         let dense_l2_coords = plan.pan_trace_l2_dense();
         let mut idx = 0;
-        workloads.push(run_workload::<_, ziggurat::WsiError>(
+        workloads.push(run_workload::<_, statumen::WsiError>(
             "pan_trace_l2_dense",
             dense_l2_coords.len(),
             || {
@@ -158,7 +158,7 @@ fn main() {
     }
 
     if should_run_workload(selected_workload.as_deref(), "region_2k") {
-        workloads.push(run_workload::<_, ziggurat::WsiError>(
+        workloads.push(run_workload::<_, statumen::WsiError>(
             "region_2k",
             30,
             || {
@@ -179,7 +179,7 @@ fn main() {
 
     if should_run_workload(selected_workload.as_deref(), "viewport_region_l2") {
         let viewport = plan.centered_viewport_l2(1024);
-        workloads.push(run_workload::<_, ziggurat::WsiError>(
+        workloads.push(run_workload::<_, statumen::WsiError>(
             "viewport_region_l2",
             30,
             || {
@@ -200,13 +200,13 @@ fn main() {
 
     if should_run_workload(selected_workload.as_deref(), "thumbnail") {
         let thumbnail = if handle.dataset().associated_images.contains_key("thumbnail") {
-            run_workload::<_, ziggurat::WsiError>("thumbnail", 30, || {
+            run_workload::<_, statumen::WsiError>("thumbnail", 30, || {
                 handle.read_associated("thumbnail")
             })
         } else {
             let deepest = plan.level_count - 1;
             let dims = level_dims[deepest as usize];
-            run_workload::<_, ziggurat::WsiError>("thumbnail", 30, || {
+            run_workload::<_, statumen::WsiError>("thumbnail", 30, || {
                 let req = RegionRequest::legacy_xywh(
                     0,
                     0,
@@ -224,7 +224,7 @@ fn main() {
     }
 
     let run = BenchRun::new(
-        "ziggurat",
+        "statumen",
         slide_path_json,
         host,
         selected_workload,

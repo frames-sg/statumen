@@ -74,7 +74,7 @@ pub fn load_public() -> Result<CorpusManifest, String> {
 }
 
 pub fn load_private() -> Result<Option<CorpusManifest>, String> {
-    let path = if let Some(p) = std::env::var_os("ZIGGURAT_PARITY_PRIVATE_MANIFEST") {
+    let path = if let Some(p) = std::env::var_os("STATUMEN_PARITY_PRIVATE_MANIFEST") {
         PathBuf::from(p)
     } else {
         private_manifest_path()
@@ -88,7 +88,7 @@ pub fn load_private() -> Result<Option<CorpusManifest>, String> {
 }
 
 pub fn corpus_cache_dir() -> PathBuf {
-    if let Some(p) = std::env::var_os("ZIGGURAT_PARITY_CORPUS_CACHE") {
+    if let Some(p) = std::env::var_os("STATUMEN_PARITY_CORPUS_CACHE") {
         return PathBuf::from(p);
     }
     let home = std::env::var_os("HOME")
@@ -282,14 +282,14 @@ mod tests {
 
     #[test]
     fn cache_dir_respects_env() {
-        let prev = std::env::var_os("ZIGGURAT_PARITY_CORPUS_CACHE");
-        std::env::set_var("ZIGGURAT_PARITY_CORPUS_CACHE", "/tmp/sv-corpus-test");
+        let prev = std::env::var_os("STATUMEN_PARITY_CORPUS_CACHE");
+        std::env::set_var("STATUMEN_PARITY_CORPUS_CACHE", "/tmp/sv-corpus-test");
         let p = corpus_cache_dir();
         assert_eq!(p, PathBuf::from("/tmp/sv-corpus-test"));
         if let Some(v) = prev {
-            std::env::set_var("ZIGGURAT_PARITY_CORPUS_CACHE", v);
+            std::env::set_var("STATUMEN_PARITY_CORPUS_CACHE", v);
         } else {
-            std::env::remove_var("ZIGGURAT_PARITY_CORPUS_CACHE");
+            std::env::remove_var("STATUMEN_PARITY_CORPUS_CACHE");
         }
     }
 
@@ -329,13 +329,13 @@ mod tests {
         let mut manifest = parse_manifest(SAMPLE).expect("parse");
         let entry = manifest.slides.first_mut().expect("slide");
         entry.expected_failures = vec![
-            "ashlar-vs-reference:base".into(),
+            "signinum-vs-reference:base".into(),
             "reference-vs-openslide:level2".into(),
         ];
 
-        assert!(entry.expected_failure("ashlar-vs-reference", 0));
+        assert!(entry.expected_failure("signinum-vs-reference", 0));
         assert!(entry.expected_failure("reference-vs-openslide", 2));
-        assert!(!entry.expected_failure("ashlar-vs-reference", 1));
-        assert!(!entry.expected_failure("ashlar-vs-openslide", 0));
+        assert!(!entry.expected_failure("signinum-vs-reference", 1));
+        assert!(!entry.expected_failure("signinum-vs-openslide", 0));
     }
 }
