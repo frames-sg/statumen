@@ -27,27 +27,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: ziggurat
+          path: statumen
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt,clippy
       - run: cargo xtask fmt
-        working-directory: ziggurat
+        working-directory: statumen
       - run: cargo xtask clippy
-        working-directory: ziggurat
+        working-directory: statumen
       - run: cargo xtask test
-        working-directory: ziggurat
+        working-directory: statumen
 
   docs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          path: ziggurat
+          path: statumen
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask doc
-        working-directory: ziggurat
+        working-directory: statumen
 
   typos:
     runs-on: ubuntu-latest
@@ -64,20 +64,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: ziggurat
+          path: statumen
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask release-test
-        working-directory: ziggurat
+        working-directory: statumen
 
   package:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          path: ziggurat
+          path: statumen
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask package
-        working-directory: ziggurat
+        working-directory: statumen
 
   coverage:
     runs-on: ubuntu-latest
@@ -85,14 +85,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          path: ziggurat
+          path: statumen
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo xtask coverage
-        working-directory: ziggurat
+        working-directory: statumen
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ziggurat-lcov
-          path: ziggurat/lcov.info
+          name: statumen-lcov
+          path: statumen/lcov.info
           if-no-files-found: ignore

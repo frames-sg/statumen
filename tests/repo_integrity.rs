@@ -63,8 +63,9 @@ fn environment_knobs_use_statumen_prefix() {
         let source = fs::read_to_string(crate_root().join(relative)).unwrap_or_else(|err| {
             panic!("read {relative}: {err}");
         });
+        let retired_prefix = ["ZIG", "GURAT_"].concat();
         assert!(
-            !source.contains("ZIGGURAT_"),
+            !source.contains(&retired_prefix),
             "{relative} must use STATUMEN_ environment variable names"
         );
     }

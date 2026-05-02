@@ -46,11 +46,11 @@ base64 = "0.22"
 flate2 = "1"
 tempfile = "3"
 zstd = "0.13"
-signinum-jpeg = { package = "ashlar-jpeg", version = "=0.1.0" }
-signinum-core = { package = "ashlar-core", version = "=0.1.0" }
-signinum-tilecodec = { package = "ashlar-tilecodec", version = "=0.1.0" }
-signinum-jpeg-metal = { package = "ashlar-jpeg-metal", version = "=0.1.0", optional = true }
-signinum-j2k-metal = { package = "ashlar-j2k-metal", version = "=0.1.0" }
+signinum-jpeg = "=1.0.0"
+signinum-core = "=1.0.0"
+signinum-tilecodec = "=1.0.0"
+signinum-jpeg-metal = { version = "=0.2.0", optional = true }
+signinum-j2k-metal = "=0.2.0"
 metal = { version = "0.31", optional = true }
 dicom-core = "0.9"
 dicom-object = "0.9"
@@ -65,7 +65,7 @@ jpeg-encoder = "0.6"
 tempfile = "3"
 toml = "0.8"
 libloading = "0.8"
-signinum-j2k-native = { package = "ashlar-j2k-native", version = "=0.1.0" }
+signinum-j2k-native = "=0.2.0"
 
 [build-dependencies]
 pkg-config = "0.3"

@@ -51,84 +51,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "ashlar-core"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4f0f7eff600feb9903662e9e69cce8a7a255a8c518e77c4eaf7083732781c16"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "ashlar-j2k"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fadb0556e5e2ae465a626aec2f3a27fb843176257d28d99e2d332f3a137d795"
-dependencies = [
- "ashlar-core",
- "ashlar-j2k-native",
- "thiserror",
-]
-
-[[package]]
-name = "ashlar-j2k-metal"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63dc39f6d78c3bef3aed89336064edad45598757ee8e970433aba4f15048f249"
-dependencies = [
- "ashlar-core",
- "ashlar-j2k",
- "ashlar-j2k-native",
- "metal",
- "thiserror",
-]
-
-[[package]]
-name = "ashlar-j2k-native"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69db9ca0b3be68316275f3031baef34b8b974f9131535922eca098f3166d1fa9"
-dependencies = [
- "fearless_simd",
-]
-
-[[package]]
-name = "ashlar-jpeg"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "033bf3e7358c3b3614c36d0b557389dbcdf122ae8e3b33f5d2728b8ce926eac9"
-dependencies = [
- "ashlar-core",
- "memchr",
- "thiserror",
-]
-
-[[package]]
-name = "ashlar-jpeg-metal"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4913a43155846952fc43a7636498ccc8f1c181b11da79f50bd46332714048906"
-dependencies = [
- "ashlar-core",
- "ashlar-jpeg",
- "metal",
- "thiserror",
-]
-
-[[package]]
-name = "ashlar-tilecodec"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fc5c5e657afe0503718ab65b10ac044f894e2c02d2fe6e339ae16da1cb2d521"
-dependencies = [
- "ashlar-core",
- "flate2",
- "thiserror",
- "weezl",
- "zstd",
-]
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -917,6 +839,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "libz-sys"
 version = "1.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,6 +1229,85 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 
 [[package]]
+name = "signinum-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88ec8744a8ae2867cf268d40962202c83a5063e15619e18c540e621cfee3d611"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
+name = "signinum-j2k"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b0d1c8583ff5ca7ca010f196d137516286cee8ed36d6180479026da7b0fa11d"
+dependencies = [
+ "signinum-core",
+ "signinum-j2k-native",
+ "thiserror",
+]
+
+[[package]]
+name = "signinum-j2k-metal"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab60c5cc52722eacfe97ca031bd91ee37b5a306b41923a11b1b35c8f91d30474"
+dependencies = [
+ "metal",
+ "signinum-core",
+ "signinum-j2k",
+ "signinum-j2k-native",
+ "thiserror",
+]
+
+[[package]]
+name = "signinum-j2k-native"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "583a28b4a8f3fdf912d21330d3175b09dde605f022fd5fc66f222a09a57e8157"
+dependencies = [
+ "fearless_simd",
+ "libm",
+]
+
+[[package]]
+name = "signinum-jpeg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5433ed5c94d737540d291226a0f399fdc4b22e8d4183a0ae072ee9931a76f79d"
+dependencies = [
+ "memchr",
+ "signinum-core",
+ "thiserror",
+]
+
+[[package]]
+name = "signinum-jpeg-metal"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edeb655316ee31b57c04d4669a05746315882c980a0cc484cf96a2830c471c4b"
+dependencies = [
+ "metal",
+ "signinum-core",
+ "signinum-jpeg",
+ "thiserror",
+]
+
+[[package]]
+name = "signinum-tilecodec"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "755d1e981c7356ce6c44998a39e4716681c75ce40836ebc1f9ec0110e01f8159"
+dependencies = [
+ "flate2",
+ "signinum-core",
+ "thiserror",
+ "weezl",
+ "zstd",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1343,12 +1350,6 @@ dependencies = [
 name = "statumen"
 version = "0.1.0"
 dependencies = [
- "ashlar-core",
- "ashlar-j2k-metal",
- "ashlar-j2k-native",
- "ashlar-jpeg",
- "ashlar-jpeg-metal",
- "ashlar-tilecodec",
  "base64",
  "byteorder",
  "criterion",
@@ -1370,6 +1371,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "signinum-core",
+ "signinum-j2k-metal",
+ "signinum-j2k-native",
+ "signinum-jpeg",
+ "signinum-jpeg-metal",
+ "signinum-tilecodec",
  "tempfile",
  "thiserror",
  "toml",

@@ -21,7 +21,7 @@ env:
   DRY_RUN_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run-only }}
 
 jobs:
-  publish-ziggurat:
+  publish-statumen:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
