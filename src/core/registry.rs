@@ -1189,6 +1189,14 @@ impl Slide {
         result
     }
 
+    pub fn read_tiles(
+        &self,
+        reqs: &[TileRequest],
+        output: TileOutputPreference,
+    ) -> Result<Vec<TilePixels>, WsiError> {
+        self.source.read_tiles(reqs, output)
+    }
+
     /// Read a pixel region, compositing from cached or freshly-decoded tiles.
     ///
     /// Validates all indices (scene, series, level, plane axes) before reading.

@@ -307,6 +307,12 @@ type SyntheticDeepestKey = (usize, usize, u32, u32, u32);
 type SyntheticDeepestValue = (u32, u32, u32);
 const NDPI_DISPLAY_WIDE_STRIP_WIDTH: u32 = 1024;
 
+struct NdpiJpegTilePayload {
+    jpeg: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 #[cfg(feature = "metal")]
 fn jpeg_device_decode_enabled() -> bool {
     std::env::var(JPEG_DEVICE_DECODE_ENV).is_ok_and(|value| {
@@ -1602,7 +1608,7 @@ impl TiffPixelReader {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn decode_ndpi_strip(
+    fn ndpi_jpeg_tile_payload(
         &self,
         req: &TileRequest,
         ifd_id: IfdId,
@@ -1617,7 +1623,7 @@ impl TiffPixelReader {
         virtual_tile_height: u32,
         level_width: u32,
         level_height: u32,
-    ) -> Result<Arc<CpuTile>, WsiError> {
+    ) -> Result<NdpiJpegTilePayload, WsiError> {
         if strip_key.native_row >= tiles_down {
             return Err(WsiError::TileRead {
                 col: req.col,
@@ -1726,19 +1732,123 @@ impl TiffPixelReader {
         tile_jpeg.extend_from_slice(entropy);
         tile_jpeg.extend_from_slice(&[0xFF, 0xD9]);
 
+        Ok(NdpiJpegTilePayload {
+            jpeg: tile_jpeg,
+            width: strip_width,
+            height: strip_height,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_ndpi_strip(
+        &self,
+        req: &TileRequest,
+        ifd_id: IfdId,
+        jpeg_header: &[u8],
+        mcu_starts_tag: u16,
+        tiles_across: u32,
+        tiles_down: u32,
+        strip_offset: u64,
+        strip_byte_count: u64,
+        strip_key: NdpiStripKey,
+        virtual_tile_width: u32,
+        virtual_tile_height: u32,
+        level_width: u32,
+        level_height: u32,
+    ) -> Result<Arc<CpuTile>, WsiError> {
+        let payload = self.ndpi_jpeg_tile_payload(
+            req,
+            ifd_id,
+            jpeg_header,
+            mcu_starts_tag,
+            tiles_across,
+            tiles_down,
+            strip_offset,
+            strip_byte_count,
+            strip_key,
+            virtual_tile_width,
+            virtual_tile_height,
+            level_width,
+            level_height,
+        )?;
         let decoded = decode_jpeg_rgb_with_size_override(
-            &tile_jpeg,
+            &payload.jpeg,
             None,
-            strip_width,
-            strip_height,
+            payload.width,
+            payload.height,
             None,
             None,
-            self.tiff_jpeg_decode_options_for_data(ifd_id, false, &tile_jpeg, None)
+            self.tiff_jpeg_decode_options_for_data(ifd_id, false, &payload.jpeg, None)
                 .color_transform,
         )?;
         let decoded = cpu_tile_from_rgb_pixels(decoded.width, decoded.height, decoded.pixels)?;
 
         Ok(Arc::new(decoded))
+    }
+
+    #[cfg(feature = "metal")]
+    #[allow(clippy::too_many_arguments)]
+    fn ndpi_jpeg_decode_job<'a>(
+        &'a self,
+        req: &TileRequest,
+        ifd_id: IfdId,
+        jpeg_header: &[u8],
+        mcu_starts_tag: u16,
+        tiles_across: u32,
+        tiles_down: u32,
+        strip_offset: u64,
+        strip_byte_count: u64,
+    ) -> Result<JpegDecodeJob<'a>, WsiError> {
+        let level =
+            &self.layout.dataset.scenes[req.scene].series[req.series].levels[req.level as usize];
+        let (level_w, level_h) = level.dimensions;
+        let (vtw, vth) = match &level.tile_layout {
+            TileLayout::WholeLevel {
+                virtual_tile_width,
+                virtual_tile_height,
+                ..
+            } => (*virtual_tile_width, *virtual_tile_height),
+            _ => {
+                return Err(WsiError::TileRead {
+                    col: req.col,
+                    row: req.row,
+                    level: req.level,
+                    reason: "NdpiJpeg device decode expects WholeLevel tile layout".into(),
+                });
+            }
+        };
+        let (col, row) = validate_tile_coords(req.col, req.row, req.level)?;
+        let payload = self.ndpi_jpeg_tile_payload(
+            req,
+            ifd_id,
+            jpeg_header,
+            mcu_starts_tag,
+            tiles_across,
+            tiles_down,
+            strip_offset,
+            strip_byte_count,
+            NdpiStripKey {
+                ifd_id,
+                col,
+                native_row: row,
+            },
+            vtw,
+            vth,
+            level_w as u32,
+            level_h as u32,
+        )?;
+        let color_transform = self
+            .tiff_jpeg_decode_options_for_data(ifd_id, false, &payload.jpeg, None)
+            .color_transform;
+        Ok(JpegDecodeJob {
+            data: Cow::Owned(payload.jpeg),
+            tables: None,
+            expected_width: payload.width,
+            expected_height: payload.height,
+            color_transform,
+            force_dimensions: true,
+            requested_size: None,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2619,6 +2729,19 @@ impl TiffPixelReader {
         Ok(batch_compression)
     }
 
+    #[cfg(feature = "metal")]
+    fn ndpi_jpeg_batchable(&self, reqs: &[TileRequest]) -> Result<bool, WsiError> {
+        if reqs.is_empty() {
+            return Ok(false);
+        }
+        for req in reqs {
+            if !matches!(self.tile_source_for(req)?, TileSource::NdpiJpeg { .. }) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn decode_tiled_ifd_mixed_batch(
         &self,
         reqs: &[TileRequest],
@@ -2800,6 +2923,60 @@ impl TiffPixelReader {
         metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
     ) -> Result<Vec<TilePixels>, WsiError> {
         let jobs = self.collect_tiled_ifd_jpeg_jobs(reqs)?;
+        decode_batch_jpeg_pixels(&jobs, backend, require_device, metal_sessions)
+            .into_iter()
+            .zip(reqs.iter())
+            .map(|(result, req)| {
+                result.map_err(|err| WsiError::TileRead {
+                    col: req.col,
+                    row: req.row,
+                    level: req.level,
+                    reason: err.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "metal")]
+    fn decode_ndpi_jpeg_pixels(
+        &self,
+        reqs: &[TileRequest],
+        backend: BackendRequest,
+        require_device: bool,
+        metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
+    ) -> Result<Vec<TilePixels>, WsiError> {
+        let mut jobs = Vec::with_capacity(reqs.len());
+        for req in reqs {
+            let source = self.tile_source_for(req)?;
+            let TileSource::NdpiJpeg {
+                ifd_id,
+                jpeg_header,
+                mcu_starts_tag,
+                tiles_across,
+                tiles_down,
+                strip_offset,
+                strip_byte_count,
+                ..
+            } = source
+            else {
+                return Err(WsiError::TileRead {
+                    col: req.col,
+                    row: req.row,
+                    level: req.level,
+                    reason: "NDPI JPEG device batch received a non-NDPI tile source".into(),
+                });
+            };
+            jobs.push(self.ndpi_jpeg_decode_job(
+                req,
+                *ifd_id,
+                jpeg_header,
+                *mcu_starts_tag,
+                *tiles_across,
+                *tiles_down,
+                *strip_offset,
+                *strip_byte_count,
+            )?);
+        }
         decode_batch_jpeg_pixels(&jobs, backend, require_device, metal_sessions)
             .into_iter()
             .zip(reqs.iter())
@@ -4242,6 +4419,34 @@ impl SlideReader for TiffPixelReader {
 
         #[cfg(feature = "metal")]
         if prefer_device && !reqs.is_empty() {
+            if self.ndpi_jpeg_batchable(reqs)? {
+                if jpeg_device_decode_enabled() {
+                    match self.decode_ndpi_jpeg_pixels(
+                        reqs,
+                        backend,
+                        require_device,
+                        metal_sessions,
+                    ) {
+                        Ok(tiles) => return Ok(tiles),
+                        Err(err) if require_device => return Err(err),
+                        Err(err) => {
+                            tracing::debug!(
+                                error = %err,
+                                fallback_to_cpu = true,
+                                fallback_reason = "ndpi_jpeg_device_decode_failed",
+                                "NDPI JPEG device tile path failed; retrying through CPU output"
+                            );
+                        }
+                    }
+                } else if require_device {
+                    return Err(WsiError::Unsupported {
+                        reason: format!(
+                            "NDPI JPEG device decode is disabled; set {JPEG_DEVICE_DECODE_ENV}=1 to opt in"
+                        ),
+                    });
+                }
+            }
+
             let device_result = match self.tiled_ifd_batch_compression(reqs)? {
                 Some(Compression::Jpeg) if jpeg_device_decode_enabled() => {
                     Some(self.decode_tiled_ifd_jpeg_pixels(
@@ -5109,6 +5314,59 @@ mod tests {
                 native_row: 1,
             })
             .is_some());
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    #[ignore = "requires Metal device decode"]
+    fn ndpi_restart_tile_decodes_to_metal_device_tile() {
+        let Ok(jpeg_session) = signinum_jpeg_metal::MetalBackendSession::system_default() else {
+            return;
+        };
+        let Ok(j2k_session) = signinum_j2k_metal::MetalBackendSession::system_default() else {
+            return;
+        };
+        std::env::set_var(JPEG_DEVICE_DECODE_ENV, "1");
+        let (file, jpeg_header, strip_byte_count) = build_ndpi_scan_data_tiff_from_blobs(
+            128,
+            16,
+            &[[240, 20, 20], [20, 220, 20], [20, 20, 230], [220, 220, 30]],
+            false,
+        );
+        let container = Arc::new(TiffContainer::open(file.path()).unwrap());
+        let ifd_id = *container.top_ifds().first().unwrap();
+        let layout = build_test_ndpi_layout_from_header(TestNdpiJpegLayout {
+            ifd_id,
+            dimensions: (128, 16),
+            virtual_tile: (64, 8),
+            tile_grid: (2, 2),
+            jpeg_header,
+            strip_byte_count,
+        });
+        let reader = TiffPixelReader::new(container, layout);
+
+        let tiles = reader
+            .read_tiles(
+                &[TileRequest {
+                    scene: 0,
+                    series: 0,
+                    level: 0,
+                    plane: PlaneSelection::default(),
+                    col: 1,
+                    row: 1,
+                }],
+                TileOutputPreference::prefer_device_auto_with_metal(
+                    crate::output::metal::MetalBackendSessions::new(jpeg_session, j2k_session),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(tiles.len(), 1);
+        let TilePixels::Device(DeviceTile::Metal(tile)) = &tiles[0] else {
+            panic!("expected NDPI tile to decode to Metal");
+        };
+        assert_eq!((tile.width, tile.height), (64, 8));
+        assert_eq!(tile.format, SigninumPixelFormat::Rgb8);
     }
 
     #[test]
