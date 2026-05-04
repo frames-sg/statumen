@@ -179,6 +179,231 @@ fn jpeg_sof_color_hint(payload: &[u8]) -> JpegBitstreamColorHint {
     JpegBitstreamColorHint::Unknown
 }
 
+#[derive(Debug, Clone, Copy)]
+struct JpegFrameInfo {
+    width: u32,
+    height: u32,
+    bits_allocated: u16,
+    samples_per_pixel: u16,
+    photometric_interpretation: EncodedTilePhotometricInterpretation,
+}
+
+fn standalone_jpeg_frame(
+    tile_data: &[u8],
+    jpeg_tables: Option<&[u8]>,
+) -> Result<(Vec<u8>, JpegFrameInfo), WsiError> {
+    if !jpeg_has_soi(tile_data) {
+        return Err(WsiError::Unsupported {
+            reason: "JPEG passthrough requires tile payloads to start with SOI".into(),
+        });
+    }
+    if !tile_data.ends_with(&[0xFF, 0xD9]) {
+        return Err(WsiError::Unsupported {
+            reason: "JPEG passthrough requires tile payloads to end with EOI".into(),
+        });
+    }
+
+    let has_dqt = jpeg_has_segment_marker(tile_data, 0xDB)?;
+    let has_dht = jpeg_has_segment_marker(tile_data, 0xC4)?;
+    let frame = if has_dqt && has_dht {
+        tile_data.to_vec()
+    } else {
+        rebuild_jpeg_frame_with_tables(tile_data, jpeg_tables, !has_dqt, !has_dht)?
+    };
+    let info = parse_baseline_jpeg_frame_info(&frame)?;
+    Ok((frame, info))
+}
+
+fn jpeg_has_soi(data: &[u8]) -> bool {
+    data.starts_with(&[0xFF, 0xD8])
+}
+
+fn jpeg_has_segment_marker(data: &[u8], needle: u8) -> Result<bool, WsiError> {
+    let mut offset = 0usize;
+    while let Some(segment) = next_jpeg_segment(data, offset)? {
+        if segment.marker == needle {
+            return Ok(true);
+        }
+        if segment.marker == 0xDA || segment.marker == 0xD9 {
+            return Ok(false);
+        }
+        offset = segment.end;
+    }
+    Ok(false)
+}
+
+fn rebuild_jpeg_frame_with_tables(
+    tile_data: &[u8],
+    jpeg_tables: Option<&[u8]>,
+    need_dqt: bool,
+    need_dht: bool,
+) -> Result<Vec<u8>, WsiError> {
+    let tables = jpeg_tables.ok_or_else(|| WsiError::Unsupported {
+        reason: "JPEG passthrough tile is missing table segments and no JPEGTables are available"
+            .into(),
+    })?;
+    let table_segments = jpeg_table_segments(tables, need_dqt, need_dht)?;
+    if table_segments.is_empty() {
+        return Err(WsiError::Unsupported {
+            reason: "JPEG passthrough could not rebuild required DQT/DHT table segments".into(),
+        });
+    }
+    let mut frame = Vec::with_capacity(tile_data.len() + table_segments.len());
+    frame.extend_from_slice(&tile_data[..2]);
+    frame.extend_from_slice(&table_segments);
+    frame.extend_from_slice(&tile_data[2..]);
+    Ok(frame)
+}
+
+fn jpeg_table_segments(data: &[u8], need_dqt: bool, need_dht: bool) -> Result<Vec<u8>, WsiError> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    while let Some(segment) = next_jpeg_segment(data, offset)? {
+        if segment.marker == 0xDA || segment.marker == 0xD9 {
+            break;
+        }
+        let include = (need_dqt && segment.marker == 0xDB) || (need_dht && segment.marker == 0xC4);
+        if include {
+            out.extend_from_slice(&data[segment.start..segment.end]);
+        }
+        offset = segment.end;
+    }
+    Ok(out)
+}
+
+fn parse_baseline_jpeg_frame_info(data: &[u8]) -> Result<JpegFrameInfo, WsiError> {
+    let mut offset = 0usize;
+    while let Some(segment) = next_jpeg_segment(data, offset)? {
+        if segment.marker == 0xDA {
+            break;
+        }
+        if segment.marker == 0xC0 {
+            return parse_sof0_frame_info(segment.payload);
+        }
+        if is_jpeg_sof_marker(segment.marker) {
+            return Err(WsiError::Unsupported {
+                reason: "JPEG passthrough only supports Baseline JPEG SOF0 frames".into(),
+            });
+        }
+        offset = segment.end;
+    }
+    Err(WsiError::Unsupported {
+        reason: "JPEG passthrough could not find a Baseline JPEG SOF0 marker".into(),
+    })
+}
+
+fn parse_sof0_frame_info(payload: &[u8]) -> Result<JpegFrameInfo, WsiError> {
+    if payload.len() < 6 {
+        return Err(WsiError::Unsupported {
+            reason: "JPEG SOF0 segment is truncated".into(),
+        });
+    }
+    let precision = payload[0];
+    if precision != 8 {
+        return Err(WsiError::Unsupported {
+            reason: format!("JPEG passthrough requires 8-bit Baseline JPEG, got {precision}-bit"),
+        });
+    }
+    let height = u16::from_be_bytes([payload[1], payload[2]]) as u32;
+    let width = u16::from_be_bytes([payload[3], payload[4]]) as u32;
+    let components = payload[5] as usize;
+    if width == 0 || height == 0 {
+        return Err(WsiError::Unsupported {
+            reason: "JPEG passthrough requires nonzero SOF0 dimensions".into(),
+        });
+    }
+    if payload.len() < 6 + components * 3 {
+        return Err(WsiError::Unsupported {
+            reason: "JPEG SOF0 component table is truncated".into(),
+        });
+    }
+    let photometric_interpretation = match components {
+        1 => EncodedTilePhotometricInterpretation::Monochrome2,
+        3 => match jpeg_sof_color_hint(payload) {
+            JpegBitstreamColorHint::Rgb => EncodedTilePhotometricInterpretation::Rgb,
+            _ => EncodedTilePhotometricInterpretation::YbrFull422,
+        },
+        _ => {
+            return Err(WsiError::Unsupported {
+                reason: format!("JPEG passthrough supports 1 or 3 components, got {components}"),
+            });
+        }
+    };
+    Ok(JpegFrameInfo {
+        width,
+        height,
+        bits_allocated: 8,
+        samples_per_pixel: components as u16,
+        photometric_interpretation,
+    })
+}
+
+struct JpegSegment<'a> {
+    marker: u8,
+    start: usize,
+    end: usize,
+    payload: &'a [u8],
+}
+
+fn next_jpeg_segment(data: &[u8], mut offset: usize) -> Result<Option<JpegSegment<'_>>, WsiError> {
+    while offset + 1 < data.len() {
+        if data[offset] != 0xFF {
+            offset += 1;
+            continue;
+        }
+        let mut marker_offset = offset + 1;
+        while marker_offset < data.len() && data[marker_offset] == 0xFF {
+            marker_offset += 1;
+        }
+        if marker_offset >= data.len() {
+            return Ok(None);
+        }
+        let marker = data[marker_offset];
+        if marker == 0x00 {
+            offset = marker_offset + 1;
+            continue;
+        }
+        let start = marker_offset - 1;
+        let after_marker = marker_offset + 1;
+        if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+            return Ok(Some(JpegSegment {
+                marker,
+                start,
+                end: after_marker,
+                payload: &[],
+            }));
+        }
+        if after_marker + 2 > data.len() {
+            return Err(WsiError::Unsupported {
+                reason: "JPEG marker segment is truncated".into(),
+            });
+        }
+        let len = u16::from_be_bytes([data[after_marker], data[after_marker + 1]]) as usize;
+        if len < 2 {
+            return Err(WsiError::Unsupported {
+                reason: "JPEG marker segment has invalid length".into(),
+            });
+        }
+        let end = after_marker
+            .checked_add(len)
+            .ok_or_else(|| WsiError::Unsupported {
+                reason: "JPEG marker segment length overflow".into(),
+            })?;
+        if end > data.len() {
+            return Err(WsiError::Unsupported {
+                reason: "JPEG marker segment exceeds payload length".into(),
+            });
+        }
+        return Ok(Some(JpegSegment {
+            marker,
+            start,
+            end,
+            payload: &data[after_marker + 2..end],
+        }));
+    }
+    Ok(None)
+}
+
 fn signinum_downscale_for_factor(factor: u32) -> Option<SigninumDownscale> {
     match factor {
         1 => Some(SigninumDownscale::None),
@@ -2692,6 +2917,49 @@ impl TiffPixelReader {
         })
     }
 
+    fn read_tiled_ifd_raw_jpeg_tile(
+        &self,
+        req: &TileRequest,
+        ifd_id: IfdId,
+        jpeg_tables: Option<&[u8]>,
+    ) -> Result<RawCompressedTile, WsiError> {
+        let (tile_idx, _, _) = self.tiled_ifd_tile_index_and_dimensions(req, ifd_id)?;
+        let (offsets, byte_counts) = self.tiled_ifd_offsets_and_byte_counts(ifd_id)?;
+        if tile_idx >= offsets.len() || tile_idx >= byte_counts.len() {
+            return Err(WsiError::TileRead {
+                col: req.col,
+                row: req.row,
+                level: req.level,
+                reason: format!(
+                    "tile index {} out of range (offsets={}, byte_counts={})",
+                    tile_idx,
+                    offsets.len(),
+                    byte_counts.len()
+                ),
+            });
+        }
+        let byte_count = byte_counts[tile_idx];
+        if byte_count == 0 {
+            return Err(WsiError::Unsupported {
+                reason: "JPEG passthrough does not support empty TIFF tiles".into(),
+            });
+        }
+        let tile_data = self
+            .container
+            .pread(offsets[tile_idx], byte_count)
+            .map_err(|e| e.into_wsi_error(self.container.path()))?;
+        let (data, info) = standalone_jpeg_frame(&tile_data, jpeg_tables)?;
+        Ok(RawCompressedTile {
+            compression: Compression::Jpeg,
+            width: info.width,
+            height: info.height,
+            bits_allocated: info.bits_allocated,
+            samples_per_pixel: info.samples_per_pixel,
+            photometric_interpretation: info.photometric_interpretation,
+            data,
+        })
+    }
+
     fn empty_rgb_tile(width: u32, height: u32) -> CpuTile {
         let pixel_count = (width * height * 3) as usize;
         CpuTile {
@@ -4275,6 +4543,37 @@ impl SlideReader for TiffPixelReader {
             .synthetic_prime_once
             .get_or_init(|| self.prime_deepest_synthetic_levels_best_effort());
         &self.layout.dataset
+    }
+
+    fn read_raw_compressed_tile(&self, req: &TileRequest) -> Result<RawCompressedTile, WsiError> {
+        match self.tile_source_for(req)? {
+            TileSource::TiledIfd {
+                ifd_id,
+                jpeg_tables,
+                compression: Compression::Jpeg,
+            } => self.read_tiled_ifd_raw_jpeg_tile(req, *ifd_id, jpeg_tables.as_deref()),
+            TileSource::TiledIfd { compression, .. } => Err(WsiError::Unsupported {
+                reason: format!(
+                    "JPEG passthrough requires TIFF JPEG compression, got {:?}",
+                    compression
+                ),
+            }),
+            TileSource::NdpiJpeg { .. } => Err(WsiError::Unsupported {
+                reason: "NDPI JPEG passthrough is not available because restart-marker tile geometry must be validated before compressed-byte export".into(),
+            }),
+            TileSource::NdpiFullDecode { .. } => Err(WsiError::Unsupported {
+                reason: "NDPI JPEG passthrough is not available for whole-level full-decode JPEG sources".into(),
+            }),
+            TileSource::SyntheticDownsample { .. } => Err(WsiError::Unsupported {
+                reason: "JPEG passthrough is not available for synthetic downsample levels".into(),
+            }),
+            TileSource::StitchedLevel { .. } => Err(WsiError::Unsupported {
+                reason: "JPEG passthrough is not available for stitched levels".into(),
+            }),
+            TileSource::Stripped { .. } | TileSource::ExternalJpeg { .. } => Err(WsiError::Unsupported {
+                reason: "JPEG passthrough is only available for tiled image levels".into(),
+            }),
+        }
     }
 
     fn use_display_tile_cache(&self, req: &TileViewRequest) -> bool {
@@ -6282,6 +6581,195 @@ mod tests {
         TiffPixelReader::new(container, layout)
     }
 
+    fn build_tiled_jpeg_reader_with_tables(
+        width: u32,
+        height: u32,
+        tile_width: u32,
+        tile_height: u32,
+        tiles: &[Vec<u8>],
+        jpeg_tables: Vec<u8>,
+    ) -> TiffPixelReader {
+        let file = build_tiled_jpeg_tiff_with_tables(
+            width,
+            height,
+            tile_width,
+            tile_height,
+            tiles,
+            &jpeg_tables,
+        );
+        let container = Arc::new(TiffContainer::open(file.path()).unwrap());
+        let ifd_id = *container.top_ifds().first().unwrap();
+        let level = Level {
+            dimensions: (u64::from(width), u64::from(height)),
+            downsample: 1.0,
+            tile_layout: TileLayout::Regular {
+                tile_width,
+                tile_height,
+                tiles_across: u64::from(width.div_ceil(tile_width)),
+                tiles_down: u64::from(height.div_ceil(tile_height)),
+            },
+        };
+        let layout = DatasetLayout {
+            dataset: Dataset {
+                id: DatasetId(32),
+                scenes: vec![Scene {
+                    id: "s0".into(),
+                    name: None,
+                    series: vec![Series {
+                        id: "ser0".into(),
+                        axes: AxesShape::default(),
+                        levels: vec![level],
+                        sample_type: SampleType::Uint8,
+                        channels: vec![],
+                    }],
+                }],
+                associated_images: HashMap::new(),
+                properties: Properties::new(),
+                icc_profiles: HashMap::new(),
+            },
+            tile_sources: HashMap::from([(
+                TileSourceKey {
+                    scene: 0,
+                    series: 0,
+                    level: 0,
+                    z: 0,
+                    c: 0,
+                    t: 0,
+                },
+                TileSource::TiledIfd {
+                    ifd_id,
+                    jpeg_tables: Some(jpeg_tables),
+                    compression: Compression::Jpeg,
+                },
+            )]),
+            associated_sources: HashMap::new(),
+        };
+        TiffPixelReader::new(container, layout)
+    }
+
+    fn build_tiled_jpeg_tiff_with_tables(
+        width: u32,
+        height: u32,
+        tile_width: u32,
+        tile_height: u32,
+        tiles: &[Vec<u8>],
+        jpeg_tables: &[u8],
+    ) -> NamedTempFile {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&le_u16(42));
+        let first_ifd_pos = buf.len();
+        buf.extend_from_slice(&le_u32(0));
+
+        let mut tile_offsets = Vec::with_capacity(tiles.len());
+        let mut tile_byte_counts = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            tile_offsets.push(buf.len() as u32);
+            tile_byte_counts.push(tile.len() as u32);
+            buf.extend_from_slice(tile);
+        }
+
+        let tile_offsets_array_offset = if tile_offsets.len() > 1 {
+            let offset = buf.len() as u32;
+            for value in &tile_offsets {
+                buf.extend_from_slice(&le_u32(*value));
+            }
+            Some(offset)
+        } else {
+            None
+        };
+
+        let tile_byte_counts_array_offset = if tile_byte_counts.len() > 1 {
+            let offset = buf.len() as u32;
+            for value in &tile_byte_counts {
+                buf.extend_from_slice(&le_u32(*value));
+            }
+            Some(offset)
+        } else {
+            None
+        };
+
+        let jpeg_tables_offset = buf.len() as u32;
+        buf.extend_from_slice(jpeg_tables);
+
+        let ifd_offset = buf.len() as u32;
+        buf[first_ifd_pos..first_ifd_pos + 4].copy_from_slice(&le_u32(ifd_offset));
+
+        let mut tags = vec![
+            (256u16, 4u16, 1u32, le_u32(width)),
+            (257u16, 4u16, 1u32, le_u32(height)),
+            (258u16, 3u16, 1u32, short_in_u32(8)),
+            (259u16, 3u16, 1u32, short_in_u32(7)),
+            (262u16, 3u16, 1u32, short_in_u32(6)),
+            (277u16, 3u16, 1u32, short_in_u32(3)),
+            (322u16, 4u16, 1u32, le_u32(tile_width)),
+            (323u16, 4u16, 1u32, le_u32(tile_height)),
+            (
+                324u16,
+                4u16,
+                tile_offsets.len() as u32,
+                tile_offsets_array_offset
+                    .map(le_u32)
+                    .unwrap_or_else(|| le_u32(tile_offsets[0])),
+            ),
+            (
+                325u16,
+                4u16,
+                tile_byte_counts.len() as u32,
+                tile_byte_counts_array_offset
+                    .map(le_u32)
+                    .unwrap_or_else(|| le_u32(tile_byte_counts[0])),
+            ),
+            (
+                347u16,
+                7u16,
+                jpeg_tables.len() as u32,
+                le_u32(jpeg_tables_offset),
+            ),
+        ];
+        tags.sort_by_key(|tag| tag.0);
+
+        buf.extend_from_slice(&le_u16(tags.len() as u16));
+        for (tag, typ, count, value) in &tags {
+            buf.extend_from_slice(&le_u16(*tag));
+            buf.extend_from_slice(&le_u16(*typ));
+            buf.extend_from_slice(&le_u32(*count));
+            buf.extend_from_slice(value);
+        }
+        buf.extend_from_slice(&le_u32(0));
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&buf).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    fn split_test_jpeg_tables(jpeg: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+        let mut abbreviated = Vec::from(&jpeg[..2]);
+        let mut tables = Vec::from(&jpeg[..2]);
+        let mut offset = 2usize;
+        while offset + 4 <= jpeg.len() {
+            assert_eq!(jpeg[offset], 0xFF);
+            let marker = jpeg[offset + 1];
+            if marker == 0xDA {
+                abbreviated.extend_from_slice(&jpeg[offset..]);
+                tables.extend_from_slice(&[0xFF, 0xD9]);
+                return (abbreviated, tables);
+            }
+            let len = u16::from_be_bytes([jpeg[offset + 2], jpeg[offset + 3]]) as usize;
+            let end = offset + 2 + len;
+            assert!(end <= jpeg.len());
+            if marker == 0xDB || marker == 0xC4 {
+                tables.extend_from_slice(&jpeg[offset..end]);
+            } else {
+                abbreviated.extend_from_slice(&jpeg[offset..end]);
+            }
+            offset = end;
+        }
+        panic!("test JPEG did not contain SOS marker");
+    }
+
     fn build_ndpi_full_jpeg_tiff(
         width: u32,
         height: u32,
@@ -6496,6 +6984,86 @@ mod tests {
         assert_eq!(pixel(3, 0), [20, 20, 20]);
         assert_eq!(pixel(0, 3), [30, 30, 30]);
         assert_eq!(pixel(3, 3), [40, 40, 40]);
+    }
+
+    #[test]
+    fn raw_compressed_tile_returns_standalone_tiled_jpeg_byte_identical() {
+        let jpeg = encode_solid_rgb_jpeg(8, 8, [200, 10, 30]);
+        let reader = build_tiled_jpeg_reader(8, 8, 8, 8, std::slice::from_ref(&jpeg));
+
+        let raw = reader
+            .read_raw_compressed_tile(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 0,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .unwrap();
+
+        assert_eq!(raw.compression, Compression::Jpeg);
+        assert_eq!((raw.width, raw.height), (8, 8));
+        assert_eq!(raw.bits_allocated, 8);
+        assert_eq!(raw.samples_per_pixel, 3);
+        assert_eq!(raw.data, jpeg);
+    }
+
+    #[test]
+    fn raw_compressed_tile_rebuilds_tiled_jpeg_with_jpeg_tables_without_reencoding_entropy() {
+        let jpeg = encode_solid_rgb_jpeg(8, 8, [40, 180, 90]);
+        let (abbreviated_tile, jpeg_tables) = split_test_jpeg_tables(&jpeg);
+        let reader = build_tiled_jpeg_reader_with_tables(
+            8,
+            8,
+            8,
+            8,
+            std::slice::from_ref(&abbreviated_tile),
+            jpeg_tables,
+        );
+
+        let raw = reader
+            .read_raw_compressed_tile(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 0,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .unwrap();
+
+        assert_eq!(raw.compression, Compression::Jpeg);
+        assert_eq!((raw.width, raw.height), (8, 8));
+        assert!(raw.data.len() > abbreviated_tile.len());
+        assert!(raw.data.windows(2).any(|bytes| bytes == [0xFF, 0xDB]));
+        assert!(raw.data.windows(2).any(|bytes| bytes == [0xFF, 0xC4]));
+        assert!(raw.data.ends_with(&[0xFF, 0xD9]));
+        assert!(raw
+            .data
+            .windows(abbreviated_tile.len().saturating_sub(2))
+            .any(|window| window == &abbreviated_tile[2..]));
+    }
+
+    #[test]
+    fn raw_compressed_tile_rejects_ndpi_restart_tiles_for_passthrough() {
+        let (reader, _) = build_test_ndpi_reader_for_strip_cache(128, 16, 1);
+
+        let err = reader
+            .read_raw_compressed_tile(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 1,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("NDPI JPEG passthrough"),
+            "got: {err}"
+        );
     }
 
     #[test]

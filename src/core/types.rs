@@ -289,6 +289,27 @@ pub enum Compression {
     Other(u16),
 }
 
+/// Photometric interpretation for an encoded tile payload.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EncodedTilePhotometricInterpretation {
+    Monochrome2,
+    Rgb,
+    YbrFull422,
+}
+
+/// Raw compressed tile bytes that can be copied into another container without
+/// decoding pixels.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RawCompressedTile {
+    pub compression: Compression,
+    pub width: u32,
+    pub height: u32,
+    pub bits_allocated: u16,
+    pub samples_per_pixel: u16,
+    pub photometric_interpretation: EncodedTilePhotometricInterpretation,
+    pub data: Vec<u8>,
+}
+
 // ── Sample types ───────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]

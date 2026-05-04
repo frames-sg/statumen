@@ -22,8 +22,8 @@ pub use core::registry::{
 };
 pub use core::types::{
     AssociatedImage, AxesShape, ChannelInfo, ColorSpace, Compression, CpuTile, CpuTileData,
-    CpuTileLayout, Dataset, DatasetId, DeviceTile, DisplayWindow, Level, LevelIdx,
-    OutputBackendRequest, PlaneIdx, PlaneSelection, RegionRequest, SampleType, Scene, SceneId,
-    Series, SeriesId, TileEntry, TileHit, TileLayout, TileOutputPreference, TilePixels,
-    TileRequest, TileViewRequest,
+    CpuTileLayout, Dataset, DatasetId, DeviceTile, DisplayWindow,
+    EncodedTilePhotometricInterpretation, Level, LevelIdx, OutputBackendRequest, PlaneIdx,
+    PlaneSelection, RawCompressedTile, RegionRequest, SampleType, Scene, SceneId, Series, SeriesId,
+    TileEntry, TileHit, TileLayout, TileOutputPreference, TilePixels, TileRequest, TileViewRequest,
 };

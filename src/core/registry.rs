@@ -166,6 +166,14 @@ pub trait SlideReader: Send + Sync {
         }
     }
     fn read_tile_cpu(&self, req: &TileRequest) -> Result<CpuTile, WsiError>;
+    fn read_raw_compressed_tile(&self, req: &TileRequest) -> Result<RawCompressedTile, WsiError> {
+        Err(WsiError::Unsupported {
+            reason: format!(
+                "raw compressed tile access is not available for tile ({}, {}) at level {}",
+                req.col, req.row, req.level
+            ),
+        })
+    }
     fn read_tiles_cpu(&self, reqs: &[TileRequest]) -> Result<Vec<CpuTile>, WsiError> {
         self.read_tiles(reqs, TileOutputPreference::cpu())?
             .into_iter()
@@ -1195,6 +1203,13 @@ impl Slide {
         output: TileOutputPreference,
     ) -> Result<Vec<TilePixels>, WsiError> {
         self.source.read_tiles(reqs, output)
+    }
+
+    pub fn read_raw_compressed_tile(
+        &self,
+        req: &TileRequest,
+    ) -> Result<RawCompressedTile, WsiError> {
+        self.source.read_raw_compressed_tile(req)
     }
 
     /// Read a pixel region, compositing from cached or freshly-decoded tiles.
