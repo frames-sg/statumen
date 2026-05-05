@@ -12,6 +12,7 @@ use support::oracles::{
 };
 
 #[test]
+#[ignore = "requires public parity corpus; run after scripts/parity-corpus-fetch.sh"]
 fn preflight() {
     let strict_corpus = strict_corpus_required();
     let manifest = match load_public() {
@@ -67,31 +68,29 @@ fn preflight() {
         };
 
         #[cfg(feature = "parity-openslide")]
-        if let Some(ref openslide) = openslide {
-            match openslide.open(&path) {
-                Ok(os_slide) => {
-                    if os_slide.level_count != baseline.level_count {
+        match openslide.open(&path) {
+            Ok(os_slide) => {
+                if os_slide.level_count != baseline.level_count {
+                    failures.push(format!(
+                        "{}: OpenSlide level count mismatch openslide={} statumen={}",
+                        entry.alias, os_slide.level_count, baseline.level_count
+                    ));
+                }
+                for (level, (ours, theirs)) in baseline
+                    .level_dimensions
+                    .iter()
+                    .zip(os_slide.level_dimensions.iter())
+                    .enumerate()
+                {
+                    if ours != theirs {
                         failures.push(format!(
-                            "{}: OpenSlide level count mismatch openslide={} statumen={}",
-                            entry.alias, os_slide.level_count, baseline.level_count
+                            "{}: OpenSlide dimension mismatch at level {level}: statumen={ours:?} openslide={theirs:?}",
+                            entry.alias
                         ));
                     }
-                    for (level, (ours, theirs)) in baseline
-                        .level_dimensions
-                        .iter()
-                        .zip(os_slide.level_dimensions.iter())
-                        .enumerate()
-                    {
-                        if ours != theirs {
-                            failures.push(format!(
-                                "{}: OpenSlide dimension mismatch at level {level}: statumen={ours:?} openslide={theirs:?}",
-                                entry.alias
-                            ));
-                        }
-                    }
                 }
-                Err(err) => eprintln!("[preflight] {} OpenSlide open failed: {err}", entry.alias),
             }
+            Err(err) => eprintln!("[preflight] {} OpenSlide open failed: {err}", entry.alias),
         }
 
         for level in 0..baseline.level_count.min(3) {
@@ -194,69 +193,61 @@ fn preflight() {
             checked += 1;
 
             #[cfg(feature = "parity-openslide")]
-            if let Some(ref openslide) = openslide {
-                match openslide
-                    .open(&path)
-                    .and_then(|opened| read_probe(&opened, probe))
-                {
-                    Ok(os_buf) => {
-                        if let Some(ref baseline_buf) = baseline_buf {
-                            let report = compare_rgba(
-                                &baseline_buf.pixels_rgba,
-                                &os_buf.pixels_rgba,
-                                Tolerance::TOLERANT,
+            match openslide
+                .open(&path)
+                .and_then(|opened| read_probe(&opened, probe))
+            {
+                Ok(os_buf) => {
+                    if let Some(ref baseline_buf) = baseline_buf {
+                        let report = compare_rgba(
+                            &baseline_buf.pixels_rgba,
+                            &os_buf.pixels_rgba,
+                            Tolerance::TOLERANT,
+                        );
+                        eprintln!(
+                            "[preflight] {} level={level} reference-vs-openslide max_abs={} mean_abs={:.4} psnr={:.2}dB",
+                            entry.alias, report.max_abs, report.mean_abs, report.psnr_db
+                        );
+                        if required {
+                            record_comparison_failure(
+                                entry,
+                                "reference-vs-openslide",
+                                level,
+                                &format!("{} level={level}: reference vs OpenSlide", entry.alias),
+                                &report,
+                                &mut failures,
                             );
-                            eprintln!(
-                                "[preflight] {} level={level} reference-vs-openslide max_abs={} mean_abs={:.4} psnr={:.2}dB",
-                                entry.alias, report.max_abs, report.mean_abs, report.psnr_db
-                            );
-                            if required {
-                                record_comparison_failure(
-                                    entry,
-                                    "reference-vs-openslide",
-                                    level,
-                                    &format!(
-                                        "{} level={level}: reference vs OpenSlide",
-                                        entry.alias
-                                    ),
-                                    &report,
-                                    &mut failures,
-                                );
-                            }
-                        }
-                        if let Some(ref sc_buf) = signinum_buf {
-                            let report = compare_rgba(
-                                &sc_buf.pixels_rgba,
-                                &os_buf.pixels_rgba,
-                                Tolerance::TOLERANT,
-                            );
-                            eprintln!(
-                                "[preflight] {} level={level} signinum-vs-openslide max_abs={} mean_abs={:.4} psnr={:.2}dB",
-                                entry.alias, report.max_abs, report.mean_abs, report.psnr_db
-                            );
-                            if required {
-                                record_comparison_failure(
-                                    entry,
-                                    "signinum-vs-openslide",
-                                    level,
-                                    &format!(
-                                        "{} level={level}: signinum vs OpenSlide",
-                                        entry.alias
-                                    ),
-                                    &report,
-                                    &mut failures,
-                                );
-                            }
                         }
                     }
-                    Err(err) => {
-                        eprintln!("[preflight] {} OpenSlide read failed: {err}", entry.alias);
+                    if let Some(ref sc_buf) = signinum_buf {
+                        let report = compare_rgba(
+                            &sc_buf.pixels_rgba,
+                            &os_buf.pixels_rgba,
+                            Tolerance::TOLERANT,
+                        );
+                        eprintln!(
+                            "[preflight] {} level={level} signinum-vs-openslide max_abs={} mean_abs={:.4} psnr={:.2}dB",
+                            entry.alias, report.max_abs, report.mean_abs, report.psnr_db
+                        );
                         if required {
-                            failures.push(format!(
-                                "{} level={level}: required OpenSlide read failed: {err}",
-                                entry.alias
-                            ));
+                            record_comparison_failure(
+                                entry,
+                                "signinum-vs-openslide",
+                                level,
+                                &format!("{} level={level}: signinum vs OpenSlide", entry.alias),
+                                &report,
+                                &mut failures,
+                            );
                         }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[preflight] {} OpenSlide read failed: {err}", entry.alias);
+                    if required {
+                        failures.push(format!(
+                            "{} level={level}: required OpenSlide read failed: {err}",
+                            entry.alias
+                        ));
                     }
                 }
             }
@@ -278,7 +269,7 @@ fn preflight() {
 }
 
 fn strict_corpus_required() -> bool {
-    std::env::var_os("STATUMEN_PARITY_REQUIRE_CORPUS").is_some()
+    true
 }
 
 fn record_comparison_failure(
@@ -308,14 +299,8 @@ fn tolerance_for_entry(entry: &CorpusEntry) -> Tolerance {
 }
 
 #[cfg(feature = "parity-openslide")]
-fn openslide_oracle() -> Option<support::oracles::OpenSlideOracle> {
-    match support::openslide_shim::try_load() {
-        Some(lib) => Some(support::oracles::OpenSlideOracle { lib }),
-        None => {
-            eprintln!(
-                "[preflight] libopenslide not found; set OPENSLIDE_LIB_PATH or install OpenSlide; skipping OpenSlide oracle"
-            );
-            None
-        }
-    }
+fn openslide_oracle() -> support::oracles::OpenSlideOracle {
+    let lib = support::openslide_shim::try_load()
+        .expect("libopenslide is required when parity-openslide is enabled");
+    support::oracles::OpenSlideOracle { lib }
 }

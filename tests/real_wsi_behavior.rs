@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use statumen::{
-    CpuTile, FormatRegistry, PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest,
+    Compression, CpuTile, EncodedTilePhotometricInterpretation, FormatRegistry, PlaneSelection,
+    RegionRequest, Slide, TileLayout, TileRequest,
 };
 
 mod support;
@@ -133,7 +134,7 @@ fn region_hits(handle: &Slide, req: &RegionRequest) -> HashSet<(i64, i64)> {
 }
 
 #[test]
-#[ignore = "requires real OpenSlide testdata; set STATUMEN_REAL_WSI_ROOT or use the local default"]
+#[ignore = "requires public parity corpus; run after scripts/parity-corpus-fetch.sh"]
 fn aperio_jpeg_distinct_tile_batch_matches_sequential_tile_reads() {
     let handle = Slide::open(aperio_jpeg_slide()).expect("open Aperio JPEG slide");
     let level = regular_level_with_min_tiles(&handle, 8, 8);
@@ -157,7 +158,7 @@ fn aperio_jpeg_distinct_tile_batch_matches_sequential_tile_reads() {
 }
 
 #[test]
-#[ignore = "requires real OpenSlide testdata; set STATUMEN_REAL_WSI_ROOT or use the local default"]
+#[ignore = "requires public parity corpus; run after scripts/parity-corpus-fetch.sh"]
 fn aperio_jpeg_viewport_pan_populates_and_reuses_distinct_tile_cache_entries() {
     let handle = open_with_large_cache(&aperio_jpeg_slide());
     let level = regular_level_with_min_tiles(&handle, 10, 8);
@@ -214,7 +215,7 @@ fn aperio_jpeg_viewport_pan_populates_and_reuses_distinct_tile_cache_entries() {
 }
 
 #[test]
-#[ignore = "requires real OpenSlide testdata; set STATUMEN_REAL_WSI_ROOT or use the local default"]
+#[ignore = "requires public parity corpus; run after scripts/parity-corpus-fetch.sh"]
 fn aperio_jp2k_distinct_tile_batch_matches_sequential_tile_reads() {
     let handle = Slide::open(aperio_jp2k_slide()).expect("open Aperio JP2K slide");
     let level = regular_level_with_min_tiles(&handle, 4, 4);
@@ -235,4 +236,33 @@ fn aperio_jp2k_distinct_tile_batch_matches_sequential_tile_reads() {
     for (batched, sequential) in batched.iter().zip(sequential.iter()) {
         assert_same_buffers(batched, sequential);
     }
+}
+
+#[test]
+#[ignore = "requires public parity corpus; run after scripts/parity-corpus-fetch.sh"]
+fn aperio_jp2k_exposes_raw_compressed_codestream_tile() {
+    let handle = Slide::open(aperio_jp2k_slide()).expect("open Aperio JP2K slide");
+    let level = regular_level_with_min_tiles(&handle, 1, 1);
+
+    let raw = handle
+        .read_raw_compressed_tile(&tile_request(level.index, 0, 0))
+        .expect("read raw compressed JP2K tile");
+
+    assert!(matches!(
+        raw.compression,
+        Compression::Jp2kRgb | Compression::Jp2kYcbcr
+    ));
+    assert_eq!(
+        (raw.width, raw.height),
+        (level.tile_width, level.tile_height)
+    );
+    assert_eq!(raw.bits_allocated, 8);
+    assert_eq!(raw.samples_per_pixel, 3);
+    assert!(matches!(
+        raw.photometric_interpretation,
+        EncodedTilePhotometricInterpretation::Rgb
+            | EncodedTilePhotometricInterpretation::YbrFull422
+    ));
+    assert!(raw.data.starts_with(&[0xFF, 0x4F]));
+    assert!(raw.data.windows(2).any(|marker| marker == [0xFF, 0x51]));
 }

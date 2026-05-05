@@ -18,6 +18,8 @@ use signinum_jpeg::{
     Decoder as SigninumJpegDecoder, Downscale as SigninumDownscale,
     PixelFormat as SigninumPixelFormat,
 };
+#[cfg(feature = "metal")]
+use signinum_jpeg_metal::SurfaceResidency as SigninumJpegSurfaceResidency;
 
 /// Maximum total bytes allowed for a single JPEG decode allocation.
 /// Set to 512 MB to cover large NDPI full-decode levels while preventing
@@ -290,6 +292,16 @@ fn decode_one_jpeg_pixels(
         .map_err(|err| WsiError::Jpeg(format!("signinum JPEG device decode failed: {err}")))?;
 
     if surface.backend_kind() == SigninumBackendKind::Metal {
+        if surface.residency() == SigninumJpegSurfaceResidency::CpuStagedMetalUpload {
+            if require_device {
+                return Err(WsiError::Unsupported {
+                    reason:
+                        "JPEG device decode produced CPU-staged Metal upload instead of resident Metal decode"
+                            .into(),
+                });
+            }
+            return decode_one_jpeg_job(job).map(TilePixels::Cpu);
+        }
         if let Some(tile) = crate::output::metal::MetalDeviceTile::from_jpeg(surface) {
             return Ok(TilePixels::Device(DeviceTile::Metal(tile)));
         }

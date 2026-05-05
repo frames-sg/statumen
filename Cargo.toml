@@ -1,14 +1,27 @@
 [package]
 name = "statumen"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 description = "Statumen whole-slide image reader"
 repository = "https://github.com/jcwal1516/statumen"
+homepage = "https://github.com/jcwal1516/statumen"
+documentation = "https://docs.rs/statumen"
+authors = ["Statumen contributors"]
 keywords = ["whole-slide", "microscopy", "tiff", "pathology"]
 categories = ["multimedia::images", "science"]
+# MSRV policy: track the latest stable Rust release. Bumping `rust-version`
+# is a minor-version bump for this crate.
 rust-version = "1.94"
 readme = "README.md"
+exclude = [
+    "benches/**",
+    "scripts/**",
+    "docs/**",
+    ".github/**",
+    "typos.toml",
+    "architecture.md",
+]
 # Disable cargo's auto-discovery of binaries from src/bin/*.rs so that the
 # shared `bench_common.rs` (which has no `main`) is not treated as a binary
 # target. The `wsi_bench` and `openslide_bench` binaries are listed
@@ -34,7 +47,7 @@ cuda = []
 [dependencies]
 image = { version = "0.25", default-features = false, features = ["bmp", "png", "pnm"] }
 quick-xml = "0.36"
-lru = "0.12"
+lru = "0.18"
 thiserror = "2"
 sha2 = "0.10"
 byteorder = "1"
@@ -46,12 +59,12 @@ base64 = "0.22"
 flate2 = "1"
 tempfile = "3"
 zstd = "0.13"
-signinum-jpeg = "=1.0.0"
-signinum-core = "=1.0.0"
-signinum-tilecodec = "=1.0.0"
-signinum-j2k = "=1.1.0"
-signinum-jpeg-metal = { version = "=0.2.0", optional = true }
-signinum-j2k-metal = { version = "=0.3.0", optional = true }
+signinum-jpeg = "1"
+signinum-core = "1"
+signinum-tilecodec = "1"
+signinum-j2k = "1.1"
+signinum-jpeg-metal = { version = "0.2", optional = true }
+signinum-j2k-metal = { version = "0.3", optional = true }
 metal = { version = "0.31", optional = true }
 dicom-core = "0.9"
 dicom-object = "0.9"
@@ -68,7 +81,7 @@ jpeg-encoder = "0.6"
 tempfile = "3"
 toml = "0.8"
 libloading = "0.8"
-signinum-j2k-native = "=0.3.0"
+signinum-j2k-native = "0.3"
 
 [build-dependencies]
 pkg-config = "0.3"
@@ -119,10 +132,10 @@ members = [".", "xtask"]
 resolver = "2"
 
 [patch.crates-io]
-signinum-core = { path = "../signinum/crates/signinum-core" }
-signinum-jpeg = { path = "../signinum/crates/signinum-jpeg" }
-signinum-jpeg-metal = { path = "../signinum/crates/signinum-jpeg-metal" }
-signinum-j2k = { path = "../signinum/crates/signinum-j2k" }
-signinum-j2k-metal = { path = "../signinum/crates/signinum-j2k-metal" }
-signinum-j2k-native = { path = "../signinum/crates/signinum-j2k-native" }
-signinum-tilecodec = { path = "../signinum/crates/signinum-tilecodec" }
+signinum-core = { git = "https://github.com/jcwal1516/signinum.git", rev = "5be6a3caec2f6c9f653dbb0e0cc18deba1c9bc36" }
+signinum-jpeg = { git = "https://github.com/jcwal1516/signinum.git", rev = "5be6a3caec2f6c9f653dbb0e0cc18deba1c9bc36" }
+signinum-jpeg-metal = { git = "https://github.com/jcwal1516/signinum.git", rev = "5be6a3caec2f6c9f653dbb0e0cc18deba1c9bc36" }
+signinum-j2k = { git = "https://github.com/jcwal1516/signinum.git", rev = "5be6a3caec2f6c9f653dbb0e0cc18deba1c9bc36" }
+signinum-j2k-metal = { git = "https://github.com/jcwal1516/signinum.git", rev = "5be6a3caec2f6c9f653dbb0e0cc18deba1c9bc36" }
+signinum-j2k-native = { git = "https://github.com/jcwal1516/signinum.git", rev = "5be6a3caec2f6c9f653dbb0e0cc18deba1c9bc36" }
+signinum-tilecodec = { git = "https://github.com/jcwal1516/signinum.git", rev = "5be6a3caec2f6c9f653dbb0e0cc18deba1c9bc36" }

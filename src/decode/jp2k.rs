@@ -15,6 +15,8 @@ use signinum_core::DeviceSurface as SigninumDeviceSurface;
 use signinum_core::{BackendRequest as SigninumBackendRequest, PixelFormat as SigninumPixelFormat};
 use signinum_j2k::J2kDecoder as SigninumJp2kDecoder;
 #[cfg(feature = "metal")]
+use signinum_j2k_metal::SurfaceResidency as SigninumJp2kSurfaceResidency;
+#[cfg(feature = "metal")]
 use signinum_j2k_metal::{J2kDecoder as SigninumMetalJp2kDecoder, MetalTileBatch};
 #[cfg(feature = "metal")]
 use std::sync::Arc;
@@ -191,6 +193,7 @@ fn decode_one_jp2k_pixels(
         job.expected_height,
         colorspace,
         require_device,
+        Some(metal_sessions),
     )
 }
 
@@ -282,7 +285,9 @@ fn decode_jp2k_tile_batch_to_pixels(
         };
     };
     if jp2k_device_batch_enabled() {
-        if let Ok(tiles) = decode_jp2k_tile_batch_to_device_pixels(reqs, require_device) {
+        if let Ok(tiles) =
+            decode_jp2k_tile_batch_to_device_pixels(reqs, require_device, metal_sessions)
+        {
             return Ok(tiles);
         }
     }
@@ -319,6 +324,7 @@ fn decode_jp2k_tile_batch_to_pixels(
                     },
                 ),
                 require_device,
+                Some(metal_sessions),
             )
         })
         .collect()
@@ -331,10 +337,10 @@ fn jp2k_device_batch_enabled() -> bool {
 
 #[cfg(feature = "metal")]
 fn parse_jp2k_device_batch_flag(value: Option<&str>) -> bool {
-    value.is_some_and(|value| {
-        matches!(
+    value.is_none_or(|value| {
+        !matches!(
             value.to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
+            "0" | "false" | "off" | "no"
         )
     })
 }
@@ -343,6 +349,7 @@ fn parse_jp2k_device_batch_flag(value: Option<&str>) -> bool {
 fn decode_jp2k_tile_batch_to_device_pixels(
     reqs: &[Jp2kDecodeJob<'_>],
     require_device: bool,
+    metal_sessions: &crate::output::metal::MetalBackendSessions,
 ) -> Result<Vec<TilePixels>, WsiError> {
     let headers = reqs
         .iter()
@@ -350,6 +357,23 @@ fn decode_jp2k_tile_batch_to_device_pixels(
             validate_jp2k_decode_request(req.data.as_ref(), req.expected_width, req.expected_height)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let output_colorspaces = reqs
+        .iter()
+        .zip(headers.iter())
+        .map(|(req, header)| {
+            effective_output_colorspace(
+                header,
+                if req.rgb_color_space {
+                    Jp2kColorSpace::Rgb
+                } else {
+                    Jp2kColorSpace::YCbCr
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let conversion_sessions = output_colorspaces
+        .contains(&Jp2kColorSpace::YCbCr)
+        .then_some(metal_sessions);
     let mut batch = MetalTileBatch::with_capacity(reqs.len());
     for req in reqs {
         batch
@@ -365,24 +389,66 @@ fn decode_jp2k_tile_batch_to_device_pixels(
     let surfaces = batch.decode_all().map_err(|err| {
         WsiError::Jp2k(format!("signinum JP2K device batch decode failed: {err}"))
     })?;
-    surfaces
+    let mut pixels = Vec::with_capacity(surfaces.len());
+    let mut ycbcr_slots = Vec::new();
+    let mut ycbcr_tiles = Vec::new();
+    for (surface, ((req, _header), colorspace)) in surfaces.into_iter().zip(
+        reqs.iter()
+            .zip(headers.iter())
+            .zip(output_colorspaces.iter()),
+    ) {
+        if *colorspace == Jp2kColorSpace::YCbCr
+            && surface.backend_kind() == signinum_core::BackendKind::Metal
+        {
+            if surface.residency() == SigninumJp2kSurfaceResidency::CpuStagedMetalUpload {
+                return Err(WsiError::Unsupported {
+                    reason:
+                        "JP2K device decode produced CPU-staged Metal upload instead of resident Metal decode"
+                            .into(),
+                });
+            }
+            if let Some(tile) = crate::output::metal::MetalDeviceTile::from_j2k(surface) {
+                ycbcr_slots.push(pixels.len());
+                ycbcr_tiles.push(tile);
+                pixels.push(None);
+                continue;
+            }
+            if require_device {
+                return Err(WsiError::Unsupported {
+                    reason: "device backend not available for j2k".into(),
+                });
+            }
+            return Err(WsiError::Jp2k(
+                "signinum JP2K returned Metal backend without public buffer".into(),
+            ));
+        }
+
+        pixels.push(Some(tile_pixels_from_jp2k_surface(
+            surface,
+            req.expected_width,
+            req.expected_height,
+            *colorspace,
+            require_device,
+            conversion_sessions,
+        )?));
+    }
+    if !ycbcr_tiles.is_empty() {
+        let converted = metal_sessions.ycbcr8_tiles_to_rgb8(&ycbcr_tiles)?;
+        if converted.len() != ycbcr_slots.len() {
+            return Err(WsiError::Jp2k(
+                "Metal JP2K YCbCr batch conversion output count mismatch".into(),
+            ));
+        }
+        for (slot, tile) in ycbcr_slots.into_iter().zip(converted) {
+            pixels[slot] = Some(TilePixels::Device(DeviceTile::Metal(tile)));
+        }
+    }
+    pixels
         .into_iter()
-        .zip(reqs.iter().zip(headers.iter()))
-        .map(|(surface, (req, header))| {
-            tile_pixels_from_jp2k_surface(
-                surface,
-                req.expected_width,
-                req.expected_height,
-                effective_output_colorspace(
-                    header,
-                    if req.rgb_color_space {
-                        Jp2kColorSpace::Rgb
-                    } else {
-                        Jp2kColorSpace::YCbCr
-                    },
-                ),
-                require_device,
-            )
+        .map(|pixel| {
+            pixel.ok_or_else(|| {
+                WsiError::Jp2k("Metal JP2K YCbCr batch conversion missing output".into())
+            })
         })
         .collect()
 }
@@ -394,9 +460,30 @@ fn tile_pixels_from_jp2k_surface(
     expected_height: u32,
     colorspace: Jp2kColorSpace,
     require_device: bool,
+    metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
 ) -> Result<TilePixels, WsiError> {
     if surface.backend_kind() == signinum_core::BackendKind::Metal {
+        if surface.residency() == SigninumJp2kSurfaceResidency::CpuStagedMetalUpload {
+            return Err(WsiError::Unsupported {
+                reason:
+                    "JP2K device decode produced CPU-staged Metal upload instead of resident Metal decode"
+                        .into(),
+            });
+        }
         if let Some(tile) = crate::output::metal::MetalDeviceTile::from_j2k(surface) {
+            if colorspace == Jp2kColorSpace::YCbCr {
+                let Some(metal_sessions) = metal_sessions else {
+                    return Err(WsiError::Unsupported {
+                        reason:
+                            "JP2K Metal YCbCr output requires a Metal session for RGB conversion"
+                                .into(),
+                    });
+                };
+                let converter = metal_sessions.ycbcr_to_rgb8_converter()?;
+                return tile
+                    .ycbcr8_to_rgb8(&converter)
+                    .map(|tile| TilePixels::Device(DeviceTile::Metal(tile)));
+            }
             return Ok(TilePixels::Device(DeviceTile::Metal(tile)));
         }
         if require_device {
@@ -518,6 +605,15 @@ mod tests {
 
     const MAX_CHANNEL_DELTA: u8 = 50;
     const MAX_AVG_CHANNEL_DELTA_X100: u64 = 1600;
+
+    #[cfg(feature = "metal")]
+    fn test_metal_sessions() -> Option<crate::output::metal::MetalBackendSessions> {
+        let device = metal::Device::system_default()?;
+        Some(crate::output::metal::MetalBackendSessions::new(
+            signinum_jpeg_metal::MetalBackendSession::new(device.clone()),
+            signinum_j2k_metal::MetalBackendSession::new(device),
+        ))
+    }
 
     fn assert_rgba_matches_rgb_fixture(decoded: &RgbaImage, expected_rgb: &image::RgbImage) {
         assert_eq!(decoded.width(), expected_rgb.width());
@@ -685,10 +781,10 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn fixture_rgb_device_batch_returns_metal_tiles() {
-        if metal::Device::system_default().is_none() {
+        let Some(sessions) = test_metal_sessions() else {
             eprintln!("skipping JP2K device batch test: no Metal device");
             return;
-        }
+        };
         let codestream = include_bytes!("../../tests/fixtures/jp2k/rgb_nomct.j2k");
         let header = parse_codestream_header(codestream).unwrap();
         let requests = [
@@ -708,7 +804,7 @@ mod tests {
             },
         ];
 
-        let decoded = decode_jp2k_tile_batch_to_device_pixels(&requests, false).unwrap();
+        let decoded = decode_jp2k_tile_batch_to_device_pixels(&requests, false, &sessions).unwrap();
 
         assert_eq!(decoded.len(), 2);
         for tile in decoded {
@@ -725,10 +821,119 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
-    fn jp2k_device_batch_flag_is_opt_in() {
-        assert!(!parse_jp2k_device_batch_flag(None));
+    fn fixture_ycbcr_device_decode_returns_rgb_metal_tile() {
+        let Some(sessions) = test_metal_sessions() else {
+            eprintln!("skipping JP2K YCbCr device decode test: no Metal device");
+            return;
+        };
+        let codestream = include_bytes!("../../tests/fixtures/jp2k/ycbcr_444.j2k");
+        let header = parse_codestream_header(codestream).unwrap();
+        let expected = load_fixture_rgb(include_bytes!("../../tests/fixtures/jp2k/ycbcr_444.ppm"));
+        let request = Jp2kDecodeJob {
+            data: Cow::Borrowed(codestream),
+            expected_width: header.image_width,
+            expected_height: header.image_height,
+            rgb_color_space: false,
+            backend: SigninumBackendRequest::Auto,
+        };
+
+        let decoded = decode_one_jp2k_pixels(&request, true, Some(&sessions)).unwrap();
+        let TilePixels::Device(DeviceTile::Metal(tile)) = decoded else {
+            panic!("expected converted Metal device tile");
+        };
+        assert_eq!(tile.format, SigninumPixelFormat::Rgb8);
+        let crate::output::metal::MetalDeviceStorage::Buffer {
+            buffer,
+            byte_offset,
+        } = &tile.storage;
+        let encoded = signinum_j2k_metal::encode_lossless_from_padded_metal_buffer_with_report(
+            signinum_j2k_metal::MetalLosslessEncodeTile {
+                buffer,
+                byte_offset: *byte_offset,
+                width: tile.width,
+                height: tile.height,
+                pitch_bytes: tile.pitch_bytes,
+                output_width: tile.width,
+                output_height: tile.height,
+                format: tile.format,
+            },
+            &signinum_j2k::J2kLosslessEncodeOptions {
+                backend: signinum_j2k::EncodeBackendPreference::RequireDevice,
+                validation: signinum_j2k::J2kEncodeValidation::External,
+                ..signinum_j2k::J2kLosslessEncodeOptions::default()
+            },
+            sessions.j2k(),
+        )
+        .unwrap();
+        let mut actual = vec![0; tile.width as usize * tile.height as usize * 3];
+        signinum_j2k::J2kDecoder::new(&encoded.encoded.codestream)
+            .unwrap()
+            .decode_into(
+                &mut actual,
+                tile.width as usize * SigninumPixelFormat::Rgb8.bytes_per_pixel(),
+                SigninumPixelFormat::Rgb8,
+            )
+            .unwrap();
+        let sample = CpuTile {
+            width: tile.width,
+            height: tile.height,
+            channels: 3,
+            color_space: crate::core::types::ColorSpace::Rgb,
+            layout: crate::core::types::CpuTileLayout::Interleaved,
+            data: crate::core::types::CpuTileData::u8(actual),
+        };
+        assert_sample_buffer_matches_rgb_fixture(&sample, &expected);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn fixture_ycbcr_device_batch_returns_rgb_metal_tiles() {
+        let Some(sessions) = test_metal_sessions() else {
+            eprintln!("skipping JP2K YCbCr device batch test: no Metal device");
+            return;
+        };
+        let codestream = include_bytes!("../../tests/fixtures/jp2k/ycbcr_444.j2k");
+        let header = parse_codestream_header(codestream).unwrap();
+        let requests = [
+            Jp2kDecodeJob {
+                data: Cow::Borrowed(codestream),
+                expected_width: header.image_width,
+                expected_height: header.image_height,
+                rgb_color_space: false,
+                backend: SigninumBackendRequest::Auto,
+            },
+            Jp2kDecodeJob {
+                data: Cow::Borrowed(codestream),
+                expected_width: header.image_width,
+                expected_height: header.image_height,
+                rgb_color_space: false,
+                backend: SigninumBackendRequest::Auto,
+            },
+        ];
+
+        let decoded = decode_jp2k_tile_batch_to_device_pixels(&requests, true, &sessions).unwrap();
+
+        assert_eq!(decoded.len(), 2);
+        for tile in decoded {
+            let TilePixels::Device(DeviceTile::Metal(tile)) = tile else {
+                panic!("expected Metal device tile");
+            };
+            assert_eq!(
+                (tile.width, tile.height),
+                (header.image_width, header.image_height)
+            );
+            assert_eq!(tile.format, SigninumPixelFormat::Rgb8);
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn jp2k_device_batch_flag_defaults_to_enabled_with_disable_escape_hatch() {
+        assert!(parse_jp2k_device_batch_flag(None));
         assert!(!parse_jp2k_device_batch_flag(Some("0")));
         assert!(!parse_jp2k_device_batch_flag(Some("false")));
+        assert!(!parse_jp2k_device_batch_flag(Some("OFF")));
+        assert!(!parse_jp2k_device_batch_flag(Some("no")));
         assert!(parse_jp2k_device_batch_flag(Some("1")));
         assert!(parse_jp2k_device_batch_flag(Some("true")));
         assert!(parse_jp2k_device_batch_flag(Some("ON")));

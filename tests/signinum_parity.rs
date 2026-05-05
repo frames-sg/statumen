@@ -10,6 +10,7 @@ use support::oracles::{
 };
 
 #[test]
+#[ignore = "requires public parity corpus; run after scripts/parity-corpus-fetch.sh"]
 fn signinum_cpu_vs_reference_within_tolerance() {
     let strict_corpus = strict_corpus_required();
     let manifest = match load_public() {
@@ -138,7 +139,7 @@ fn signinum_cpu_vs_reference_within_tolerance() {
 }
 
 fn strict_corpus_required() -> bool {
-    std::env::var_os("STATUMEN_PARITY_REQUIRE_CORPUS").is_some()
+    true
 }
 
 fn record_comparison_failure(

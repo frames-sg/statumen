@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![forbid(unsafe_code)]
 
 pub(crate) mod core;
@@ -23,7 +25,8 @@ pub use core::registry::{
 pub use core::types::{
     AssociatedImage, AxesShape, ChannelInfo, ColorSpace, Compression, CpuTile, CpuTileData,
     CpuTileLayout, Dataset, DatasetId, DeviceTile, DisplayWindow,
-    EncodedTilePhotometricInterpretation, Level, LevelIdx, OutputBackendRequest, PlaneIdx,
-    PlaneSelection, RawCompressedTile, RegionRequest, SampleType, Scene, SceneId, Series, SeriesId,
-    TileEntry, TileHit, TileLayout, TileOutputPreference, TilePixels, TileRequest, TileViewRequest,
+    EncodedTilePhotometricInterpretation, Level, LevelIdx, LevelSourceKind, OutputBackendRequest,
+    PlaneIdx, PlaneSelection, RawCompressedTile, RegionRequest, SampleType, Scene, SceneId, Series,
+    SeriesId, TileEntry, TileHit, TileLayout, TileOutputPreference, TilePixels, TileRequest,
+    TileViewRequest,
 };

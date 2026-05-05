@@ -568,9 +568,13 @@ pub(crate) fn validate_narrow_subset(info: &Jp2kCodestreamInfo) -> Result<(), Ws
             "unsupported JP2K chroma subsampling; expected 4:4:4, 4:2:2, or 4:2:0".into(),
         ));
     }
-    if info.coding_style.transform != Jp2kWaveletTransform::Irreversible9x7 {
+    if !matches!(
+        info.coding_style.transform,
+        Jp2kWaveletTransform::Irreversible9x7 | Jp2kWaveletTransform::Reversible5x3
+    ) {
         return Err(WsiError::Jp2k(
-            "unsupported JP2K wavelet transform; expected irreversible 9/7".into(),
+            "unsupported JP2K wavelet transform; expected irreversible 9/7 or reversible 5/3"
+                .into(),
         ));
     }
     if info.coding_style.code_block_width() > 64 || info.coding_style.code_block_height() > 64 {
@@ -586,15 +590,16 @@ pub(crate) fn validate_narrow_subset(info: &Jp2kCodestreamInfo) -> Result<(), Ws
             "unsupported JP2K code-block exponent sum".into(),
         ));
     }
-    if info.coding_style.code_block_style != 0 {
+    if !matches!(info.coding_style.code_block_style, 0 | 0x40) {
         return Err(WsiError::Jp2k(
-            "unsupported JP2K code-block style; expected default style".into(),
+            "unsupported JP2K code-block style; expected default or HT block coding".into(),
         ));
     }
     if info.coding_style.layers == 0 {
         return Err(WsiError::Jp2k("invalid JP2K layer count".into()));
     }
     match info.quantization.style {
+        Jp2kQuantizationStyle::NoQuantization => {}
         Jp2kQuantizationStyle::ScalarDerived => {
             if info.quantization.steps.len() != 1 {
                 return Err(WsiError::Jp2k(
@@ -661,7 +666,22 @@ mod tests {
     }
 
     fn build_cod(transform: u8, mct: bool) -> Vec<u8> {
-        let payload = [0, 0, 0, 1, u8::from(mct), 5, 4, 4, 0, transform];
+        build_cod_with_code_block_style(transform, mct, 0)
+    }
+
+    fn build_cod_with_code_block_style(transform: u8, mct: bool, code_block_style: u8) -> Vec<u8> {
+        let payload = [
+            0,
+            0,
+            0,
+            1,
+            u8::from(mct),
+            5,
+            4,
+            4,
+            code_block_style,
+            transform,
+        ];
         segment(MARKER_COD, &payload)
     }
 
@@ -781,17 +801,29 @@ mod tests {
     }
 
     #[test]
-    fn reject_reversible_transform_subset() {
+    fn validate_supported_subset_accepts_reversible_lossless_transform() {
         let mut stream = Vec::new();
         stream.extend_from_slice(&MARKER_SOC.to_be_bytes());
         stream.extend_from_slice(&build_siz(64, 64, 64, 64, 1, 1, 8));
         stream.extend_from_slice(&build_cod(1, false));
-        stream.extend_from_slice(&build_qcd(2));
+        stream.extend_from_slice(&build_qcd(0));
         stream.extend_from_slice(&build_sot(14, 0, 1));
         stream.extend_from_slice(&MARKER_SOD.to_be_bytes());
         let info = parse_codestream_header(&stream).unwrap();
-        let err = validate_narrow_subset(&info).unwrap_err().to_string();
-        assert!(err.contains("irreversible 9/7"));
+        validate_narrow_subset(&info).unwrap();
+    }
+
+    #[test]
+    fn validate_supported_subset_accepts_htj2k_lossless_profile() {
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&MARKER_SOC.to_be_bytes());
+        stream.extend_from_slice(&build_siz(64, 64, 64, 64, 1, 1, 8));
+        stream.extend_from_slice(&build_cod_with_code_block_style(1, true, 0x40));
+        stream.extend_from_slice(&build_qcd(0));
+        stream.extend_from_slice(&build_sot(14, 0, 1));
+        stream.extend_from_slice(&MARKER_SOD.to_be_bytes());
+        let info = parse_codestream_header(&stream).unwrap();
+        validate_narrow_subset(&info).unwrap();
     }
 
     #[test]

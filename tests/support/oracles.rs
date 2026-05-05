@@ -245,7 +245,7 @@ fn open_via_statumen(
     })
 }
 
-fn sample_buffer_to_rgba(buf: CpuTile) -> Result<TileBuffer, String> {
+pub(crate) fn sample_buffer_to_rgba(buf: CpuTile) -> Result<TileBuffer, String> {
     let width = buf.width;
     let height = buf.height;
     let rgba = buf
@@ -259,13 +259,13 @@ fn sample_buffer_to_rgba(buf: CpuTile) -> Result<TileBuffer, String> {
 }
 
 #[derive(Debug)]
-enum ReferenceTileError {
+pub(crate) enum ReferenceTileError {
     Unsupported(String),
     Fatal(String),
 }
 
 impl ReferenceTileError {
-    fn unsupported(message: impl Into<String>) -> Self {
+    pub(crate) fn unsupported(message: impl Into<String>) -> Self {
         Self::Unsupported(message.into())
     }
 
@@ -274,7 +274,7 @@ impl ReferenceTileError {
     }
 }
 
-fn require_reference_tile(
+pub(crate) fn require_reference_tile(
     result: Result<TileBuffer, ReferenceTileError>,
     context: impl AsRef<str>,
 ) -> Result<TileBuffer, String> {
@@ -859,83 +859,5 @@ impl Oracle for OpenSlideOracle {
             reader,
             region_reader,
         })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[allow(unused_imports)]
-    use super::*;
-    #[allow(unused_imports)]
-    use statumen::{ColorSpace, CpuTileData, CpuTileLayout};
-
-    #[test]
-    fn signinum_oracle_name() {
-        assert_eq!(SigninumOracle.name(), "signinum");
-    }
-
-    #[test]
-    fn reference_oracle_name() {
-        assert_eq!(ReferenceOracle.name(), "reference");
-    }
-
-    #[test]
-    fn reference_oracle_unsupported_decode_is_an_error() {
-        let err = require_reference_tile(
-            Err(ReferenceTileError::unsupported(
-                "fixture format is not TIFF JPEG",
-            )),
-            "fixture level=0 tile=(0,0)",
-        )
-        .expect_err("unsupported reference decode must not fall back to production");
-
-        assert!(err.contains("reference oracle unsupported"));
-        assert!(err.contains("fixture format is not TIFF JPEG"));
-        assert!(is_reference_oracle_unsupported(&err));
-    }
-
-    #[test]
-    fn sample_buffer_to_rgba_respects_planar_rgb_layout() {
-        let tile = CpuTile {
-            width: 2,
-            height: 1,
-            channels: 3,
-            color_space: ColorSpace::Rgb,
-            layout: CpuTileLayout::Planar,
-            data: CpuTileData::u8(vec![10, 40, 20, 50, 30, 60]),
-        };
-
-        let out = sample_buffer_to_rgba(tile).expect("convert");
-
-        assert_eq!(out.pixels_rgba, vec![10, 20, 30, 255, 40, 50, 60, 255]);
-    }
-
-    #[test]
-    fn top_left_probe_falls_back_to_region_for_irregular_layout() {
-        let slide = OpenedSlide {
-            path: PathBuf::from("fixture.bif"),
-            oracle_name: "fixture",
-            level_count: 1,
-            level_dimensions: vec![(123, 45)],
-            tile_sizes: vec![None],
-            reader: Box::new(|_, _, _, _, _| Err("tile reader should not be used".into())),
-            region_reader: Box::new(|level, x, y, width, height| {
-                assert_eq!(level, 0);
-                assert_eq!((x, y), (0, 0));
-                assert_eq!((width, height), (123, 45));
-                Ok(TileBuffer {
-                    pixels_rgba: vec![0; width as usize * height as usize * 4],
-                    width,
-                    height,
-                })
-            }),
-        };
-
-        let probe = top_left_probe(&slide, 0).expect("probe");
-
-        assert_eq!(probe.kind, ProbeKind::Region);
-        assert_eq!((probe.width, probe.height), (123, 45));
-        let tile = read_probe(&slide, probe).expect("read probe");
-        assert_eq!((tile.width, tile.height), (123, 45));
     }
 }

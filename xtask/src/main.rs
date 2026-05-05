@@ -18,6 +18,7 @@ fn run() -> Result<(), String> {
         "fmt" => fmt(),
         "clippy" => clippy(),
         "test" => test(),
+        "parity-corpus-test" => parity_corpus_test(),
         "doc" | "docs" => doc(),
         "typos" => typos(),
         "release-test" => release_test(),
@@ -49,7 +50,50 @@ fn clippy() -> Result<(), String> {
 }
 
 fn test() -> Result<(), String> {
-    run_cargo(&["test", "--lib", "--tests"])
+    run_cargo(&["test", "--lib", "--tests"])?;
+    run_cargo(&["test", "--lib", "--tests", "--features", "parity-openslide"])?;
+    if cfg!(target_os = "macos") {
+        run_cargo(&[
+            "test",
+            "--lib",
+            "--tests",
+            "--features",
+            "metal",
+            "--no-run",
+        ])?;
+    }
+    Ok(())
+}
+
+fn parity_corpus_test() -> Result<(), String> {
+    run_cargo(&[
+        "test",
+        "--test",
+        "openslide_parity",
+        "preflight",
+        "--",
+        "--exact",
+        "--ignored",
+    ])?;
+    run_cargo(&[
+        "test",
+        "--test",
+        "signinum_parity",
+        "signinum_cpu_vs_reference_within_tolerance",
+        "--",
+        "--exact",
+        "--ignored",
+    ])?;
+    run_cargo(&[
+        "test",
+        "--test",
+        "dicom_parity",
+        "dicom_public_corpus_decodes_with_statumen",
+        "--",
+        "--exact",
+        "--ignored",
+    ])?;
+    run_cargo(&["test", "--test", "real_wsi_behavior", "--", "--ignored"])
 }
 
 fn doc() -> Result<(), String> {
@@ -140,6 +184,7 @@ fn print_help() {
            fmt          check rustfmt\n\
            clippy       run clippy with warnings denied\n\
            test         run library and integration tests\n\
+           parity-corpus-test run strict corpus-backed ignored integration tests\n\
            doc          build docs with warnings denied\n\
            typos        run typos\n\
            release-test run release-mode library and integration tests\n\

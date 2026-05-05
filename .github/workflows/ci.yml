@@ -49,6 +49,24 @@ jobs:
       - run: cargo xtask doc
         working-directory: statumen
 
+  parity-corpus:
+    runs-on: ubuntu-latest
+    env:
+      STATUMEN_PARITY_ALIASES: svs-001,svs-jp2k-001,dicom-jp2k-001
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: statumen
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/slideviewer/parity-corpus
+          key: statumen-parity-corpus-${{ hashFiles('statumen/tests/fixtures/parity_corpus.public.toml') }}
+      - run: scripts/parity-corpus-fetch.sh svs-001 svs-jp2k-001 dicom-jp2k-001
+        working-directory: statumen
+      - run: cargo xtask parity-corpus-test
+        working-directory: statumen
+
   typos:
     runs-on: ubuntu-latest
     steps:
@@ -78,6 +96,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo xtask package
         working-directory: statumen
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: statumen
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: ""
+          command-arguments: advisories bans licenses sources
+          manifest-path: statumen/Cargo.toml
 
   coverage:
     runs-on: ubuntu-latest

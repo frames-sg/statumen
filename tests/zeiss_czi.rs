@@ -20,11 +20,9 @@ fn zeiss_czi_fixture() -> Option<PathBuf> {
 }
 
 #[test]
+#[ignore = "requires STATUMEN_ZEISS_CZI_PATH or local Zeiss CZI testdata"]
 fn builtin_registry_opens_zeiss_czi_and_reads_display_tile() {
-    let Some(path) = zeiss_czi_fixture() else {
-        eprintln!("[zeiss-czi] skipping: set STATUMEN_ZEISS_CZI_PATH to a Zeiss CZI fixture");
-        return;
-    };
+    let path = zeiss_czi_fixture().expect("set STATUMEN_ZEISS_CZI_PATH to a Zeiss CZI fixture");
 
     let slide = Slide::open(&path).expect("open Zeiss CZI through builtin registry");
     let dataset = slide.dataset();

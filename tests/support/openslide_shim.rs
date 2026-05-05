@@ -222,25 +222,3 @@ impl Drop for OpenSlide {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[allow(unused_imports)]
-    use super::*;
-
-    #[test]
-    fn missing_env_path_does_not_panic() {
-        let prev = std::env::var_os("OPENSLIDE_LIB_PATH");
-        std::env::set_var(
-            "OPENSLIDE_LIB_PATH",
-            "/definitely/does/not/exist/libopenslide.dylib",
-        );
-        let result = try_load();
-        if let Some(prev) = prev {
-            std::env::set_var("OPENSLIDE_LIB_PATH", prev);
-        } else {
-            std::env::remove_var("OPENSLIDE_LIB_PATH");
-        }
-        let _ = result;
-    }
-}

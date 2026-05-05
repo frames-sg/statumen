@@ -117,24 +117,58 @@ fn public_wsi_api_does_not_reexport_signinum_backend_request() {
 #[test]
 fn default_manifest_uses_cpu_jp2k_facade_and_optional_metal_adapter() {
     let manifest = fs::read_to_string(crate_root().join("Cargo.toml")).expect("read manifest");
+    let manifest = manifest
+        .parse::<toml::Value>()
+        .expect("Cargo.toml must parse as TOML");
 
+    let dependencies = manifest
+        .get("dependencies")
+        .and_then(toml::Value::as_table)
+        .expect("Cargo.toml must define [dependencies]");
     assert!(
-        manifest.contains("signinum-j2k = \"=1.1.0\""),
+        dependencies.contains_key("signinum-j2k"),
         "statumen default JP2K decode must depend on signinum-j2k facade"
     );
+
+    let j2k_metal = dependencies
+        .get("signinum-j2k-metal")
+        .and_then(toml::Value::as_table)
+        .expect("signinum-j2k-metal dependency must use table syntax");
     assert!(
-        manifest.contains("signinum-j2k-metal = { version = \"=0.3.0\", optional = true }"),
+        j2k_metal.get("optional").and_then(toml::Value::as_bool) == Some(true),
         "signinum-j2k-metal must be optional"
     );
+
+    let features = manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .expect("Cargo.toml must define [features]");
+    let metal_feature = features
+        .get("metal")
+        .and_then(toml::Value::as_array)
+        .expect("metal feature must be an array");
     assert!(
-        manifest.contains(
-            "metal = [\"dep:metal\", \"dep:signinum-jpeg-metal\", \"dep:signinum-j2k-metal\"]"
-        ),
+        metal_feature
+            .iter()
+            .any(|value| value.as_str() == Some("dep:signinum-j2k-metal")),
         "metal feature must be the only feature that enables signinum-j2k-metal"
     );
-    assert!(
-        !manifest.contains("signinum-j2k-metal = \"=0.3.0\""),
-        "statumen default dependency graph must not include signinum-j2k-metal"
+
+    let enabling_features = features
+        .iter()
+        .filter_map(|(name, value)| {
+            value.as_array().and_then(|items| {
+                items
+                    .iter()
+                    .any(|item| item.as_str() == Some("dep:signinum-j2k-metal"))
+                    .then_some(name.as_str())
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        enabling_features,
+        vec!["metal"],
+        "only the metal feature may enable signinum-j2k-metal"
     );
 }
 

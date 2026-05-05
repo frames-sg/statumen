@@ -49,12 +49,21 @@ const SUPPORTED_TRANSFER_SYNTAXES: &[&str] = &[
     uids::JPEG_BASELINE8_BIT,
     uids::JPEG2000_LOSSLESS,
     uids::JPEG2000,
+    HTJ2K_LOSSLESS_TRANSFER_SYNTAX,
+    HTJ2K_LOSSLESS_RPCL_TRANSFER_SYNTAX,
     uids::RLE_LOSSLESS,
 ];
 const JPEG_TRANSFER_SYNTAX: &str = uids::JPEG_BASELINE8_BIT;
 const RLE_TRANSFER_SYNTAX: &str = uids::RLE_LOSSLESS;
 const EXPLICIT_VR_BIG_ENDIAN_TRANSFER_SYNTAX: &str = "1.2.840.10008.1.2.2";
-const JP2K_TRANSFER_SYNTAXES: &[&str] = &[uids::JPEG2000_LOSSLESS, uids::JPEG2000];
+const HTJ2K_LOSSLESS_TRANSFER_SYNTAX: &str = "1.2.840.10008.1.2.4.201";
+const HTJ2K_LOSSLESS_RPCL_TRANSFER_SYNTAX: &str = "1.2.840.10008.1.2.4.202";
+const JP2K_TRANSFER_SYNTAXES: &[&str] = &[
+    uids::JPEG2000_LOSSLESS,
+    uids::JPEG2000,
+    HTJ2K_LOSSLESS_TRANSFER_SYNTAX,
+    HTJ2K_LOSSLESS_RPCL_TRANSFER_SYNTAX,
+];
 
 fn is_encapsulated_transfer_syntax(uid: &str) -> bool {
     uid == JPEG_TRANSFER_SYNTAX
@@ -188,6 +197,18 @@ impl SlideReader for DicomReader {
         self.read_tile_with_backend(req, BackendRequest::Auto)
     }
 
+    fn read_raw_compressed_tile(&self, req: &TileRequest) -> Result<RawCompressedTile, WsiError> {
+        let image = self
+            .slide
+            .levels
+            .get(req.level as usize)
+            .ok_or(WsiError::LevelOutOfRange {
+                level: req.level,
+                count: self.slide.levels.len() as u32,
+            })?;
+        image.read_raw_compressed_tile(req.col, req.row, req.level)
+    }
+
     fn read_associated(&self, name: &str) -> Result<CpuTile, WsiError> {
         let image = self
             .slide
@@ -304,16 +325,23 @@ impl DicomSlide {
         let mut properties = Properties::new();
         properties.insert("openslide.vendor", "dicom");
         properties.insert("openslide.quickhash-1", quickhash);
-        let (shared_pixel_spacing, shared_objective_lens_power) =
-            if level0.pixel_spacing.is_none() || level0.objective_lens_power.is_none() {
-                if canonicalize_or_fallback(&level0.path) == start_key {
+        let (shared_pixel_spacing, shared_objective_lens_power) = if level0.pixel_spacing.is_none()
+            || level0.objective_lens_power.is_none()
+        {
+            if canonicalize_or_fallback(&level0.path) == start_key {
+                if start_meta_level0_properties.0.is_some()
+                    && start_meta_level0_properties.1.is_some()
+                {
                     start_meta_level0_properties
                 } else {
-                    parse_level0_properties(&level0.path).unwrap_or((None, None))
+                    parse_level0_properties(&level0.path).unwrap_or(start_meta_level0_properties)
                 }
             } else {
-                (None, None)
-            };
+                parse_level0_properties(&level0.path).unwrap_or((None, None))
+            }
+        } else {
+            (None, None)
+        };
         let level0_pixel_spacing = level0.pixel_spacing.or(shared_pixel_spacing);
         if let Some((mpp_x, mpp_y)) = level0_pixel_spacing {
             properties.insert("openslide.mpp-x", format!("{mpp_x}"));
@@ -465,6 +493,39 @@ impl DicomLevel {
 
         let (width, height) = self.actual_tile_dimensions(col_u32, row_u32);
         Ok(black_sample_buffer(width, height))
+    }
+
+    fn read_raw_compressed_tile(
+        &self,
+        col: i64,
+        row: i64,
+        level: u32,
+    ) -> Result<RawCompressedTile, WsiError> {
+        if col < 0 || row < 0 || col >= self.tiles_across as i64 || row >= self.tiles_down as i64 {
+            return Err(WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!(
+                    "tile ({col},{row}) out of range ({}x{})",
+                    self.tiles_across, self.tiles_down
+                ),
+            });
+        }
+
+        let col_u32 = col as u32;
+        let row_u32 = row as u32;
+        for image in &self.parts {
+            if image.frame_index(col_u32, row_u32).is_some() {
+                return image.read_raw_compressed_tile(col, row, level);
+            }
+        }
+
+        Err(WsiError::Unsupported {
+            reason: format!(
+                "raw compressed tile access is not available for sparse missing DICOM tile ({col}, {row}) at level {level}"
+            ),
+        })
     }
 
     fn actual_tile_dimensions(&self, col: u32, row: u32) -> (u32, u32) {
@@ -627,6 +688,56 @@ impl DicomImage {
         Ok(crop_sample_buffer_rgb(buffer, actual_width, actual_height))
     }
 
+    fn read_raw_compressed_tile(
+        &self,
+        col: i64,
+        row: i64,
+        level: u32,
+    ) -> Result<RawCompressedTile, WsiError> {
+        if col < 0 || row < 0 || col >= self.tiles_across as i64 || row >= self.tiles_down as i64 {
+            return Err(WsiError::TileRead {
+                col,
+                row,
+                level,
+                reason: format!(
+                    "tile ({col},{row}) out of range ({}x{})",
+                    self.tiles_across, self.tiles_down
+                ),
+            });
+        }
+
+        let col_u32 = col as u32;
+        let row_u32 = row as u32;
+        let Some(frame_index) = self.frame_index(col_u32, row_u32) else {
+            return Err(WsiError::Unsupported {
+                reason: format!(
+                    "raw compressed tile access is not available for sparse missing DICOM tile ({col}, {row}) at level {level}"
+                ),
+            });
+        };
+        let compression = raw_compression_for_transfer_syntax(
+            &self.transfer_syntax_uid,
+            &self.photometric_interpretation,
+        )?;
+        let photometric_interpretation = raw_photometric_interpretation(
+            self.samples_per_pixel,
+            &self.photometric_interpretation,
+        )?;
+        let bytes = self.extract_encapsulated_frame(frame_index, level, col, row, true)?;
+        let mut data = bytes.as_ref().clone();
+        trim_encapsulated_frame_padding(&mut data);
+
+        Ok(RawCompressedTile {
+            compression,
+            width: self.tile_width,
+            height: self.tile_height,
+            bits_allocated: 8,
+            samples_per_pixel: self.samples_per_pixel,
+            photometric_interpretation,
+            data,
+        })
+    }
+
     fn read_associated(&self, name: &str) -> Result<CpuTile, WsiError> {
         let buffer = self
             .decode_frame_sample_buffer(0, 0, 0, 0, BackendRequest::Auto)
@@ -780,7 +891,10 @@ impl DicomImage {
                 data: Cow::Borrowed(bytes.as_slice()),
                 expected_width: self.tile_width,
                 expected_height: self.tile_height,
-                rgb_color_space: self.photometric_interpretation != "YBR_ICT",
+                rgb_color_space: !matches!(
+                    self.photometric_interpretation.as_str(),
+                    "YBR_ICT" | "YBR_RCT"
+                ),
                 backend,
             }])
             .into_iter()
@@ -988,6 +1102,12 @@ fn scan_encapsulated_frames(
 ) -> Result<DicomEncapsulatedFrames, WsiError> {
     let transfer_syntax = TransferSyntaxRegistry
         .get(transfer_syntax_uid)
+        .or_else(|| {
+            JP2K_TRANSFER_SYNTAXES
+                .contains(&transfer_syntax_uid)
+                .then(|| TransferSyntaxRegistry.get(uids::EXPLICIT_VR_LITTLE_ENDIAN))
+                .flatten()
+        })
         .ok_or_else(|| {
             invalid_slide(
                 path,
@@ -1447,7 +1567,10 @@ fn validate_supported_pixel_format(meta: &ParsedDicomMetadata) -> Result<(), Wsi
         meta.photometric_interpretation == "YBR_FULL_422"
             || meta.photometric_interpretation == "RGB"
     } else if JP2K_TRANSFER_SYNTAXES.contains(&meta.transfer_syntax_uid.as_str()) {
-        meta.photometric_interpretation == "YBR_ICT" || meta.photometric_interpretation == "RGB"
+        matches!(
+            meta.photometric_interpretation.as_str(),
+            "YBR_ICT" | "YBR_RCT" | "RGB"
+        )
     } else {
         meta.photometric_interpretation == "RGB"
     };
@@ -1931,6 +2054,58 @@ fn crop_sample_buffer_rgb(buffer: CpuTile, width: u32, height: u32) -> CpuTile {
     rgb_image_to_sample_buffer(image)
 }
 
+fn raw_compression_for_transfer_syntax(
+    transfer_syntax_uid: &str,
+    photometric_interpretation: &str,
+) -> Result<Compression, WsiError> {
+    if transfer_syntax_uid == JPEG_TRANSFER_SYNTAX {
+        return Ok(Compression::Jpeg);
+    }
+    if JP2K_TRANSFER_SYNTAXES.contains(&transfer_syntax_uid) {
+        return Ok(
+            if matches!(photometric_interpretation, "YBR_ICT" | "YBR_RCT") {
+                Compression::Jp2kYcbcr
+            } else {
+                Compression::Jp2kRgb
+            },
+        );
+    }
+    Err(WsiError::Unsupported {
+        reason: format!(
+            "raw compressed DICOM tile access requires JPEG Baseline or J2K/HTJ2K transfer syntax, got {transfer_syntax_uid}"
+        ),
+    })
+}
+
+fn raw_photometric_interpretation(
+    samples_per_pixel: u16,
+    photometric_interpretation: &str,
+) -> Result<EncodedTilePhotometricInterpretation, WsiError> {
+    match (samples_per_pixel, photometric_interpretation) {
+        (1, "MONOCHROME1" | "MONOCHROME2") => {
+            Ok(EncodedTilePhotometricInterpretation::Monochrome2)
+        }
+        (3, "RGB") => Ok(EncodedTilePhotometricInterpretation::Rgb),
+        (3, "YBR_FULL_422" | "YBR_ICT" | "YBR_RCT") => {
+            Ok(EncodedTilePhotometricInterpretation::YbrFull422)
+        }
+        (_, other) => Err(WsiError::Unsupported {
+            reason: format!(
+                "raw compressed DICOM tile access does not support photometric interpretation {other}"
+            ),
+        }),
+    }
+}
+
+fn trim_encapsulated_frame_padding(data: &mut Vec<u8>) {
+    if data.len() >= 3
+        && data.last() == Some(&0)
+        && data[data.len() - 3..data.len() - 1] == [0xFF, 0xD9]
+    {
+        data.pop();
+    }
+}
+
 trait IntoRgbImage {
     fn into_rgb_image(self) -> image::RgbImage;
 }
@@ -1974,6 +2149,7 @@ mod tests {
     use super::*;
     use crate::core::registry::Slide;
     use dicom_core::value::fragments::Fragments;
+    use dicom_core::value::DataSetSequence;
     use dicom_core::value::{PixelFragmentSequence, Value};
     use dicom_core::{DataElement, PrimitiveValue, VR};
     use dicom_object::{FileMetaTableBuilder, InMemDicomObject};
@@ -2008,6 +2184,7 @@ mod tests {
         photometric_interpretation: &'static str,
         planar_configuration: Option<u16>,
         pixel_spacing: Option<&'static str>,
+        shared_pixel_spacing: Option<&'static str>,
         pixel_data: TestPixelData,
     }
 
@@ -2019,6 +2196,7 @@ mod tests {
                 photometric_interpretation: "RGB",
                 planar_configuration: Some(0),
                 pixel_spacing: Some("0.00025\\0.00025"),
+                shared_pixel_spacing: None,
                 pixel_data: TestPixelData::Native(pixel_data),
             }
         }
@@ -2111,6 +2289,21 @@ mod tests {
         if let Some(pixel_spacing) = options.pixel_spacing {
             object.put(DataElement::new(tags::PIXEL_SPACING, VR::DS, pixel_spacing));
         }
+        if let Some(pixel_spacing) = options.shared_pixel_spacing {
+            let mut pixel_measures = InMemDicomObject::new_empty();
+            pixel_measures.put(DataElement::new(tags::PIXEL_SPACING, VR::DS, pixel_spacing));
+            let mut shared = InMemDicomObject::new_empty();
+            shared.put(DataElement::<InMemDicomObject>::new(
+                tags::PIXEL_MEASURES_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::from(vec![pixel_measures]),
+            ));
+            object.put(DataElement::<InMemDicomObject>::new(
+                tags::SHARED_FUNCTIONAL_GROUPS_SEQUENCE,
+                VR::SQ,
+                DataSetSequence::from(vec![shared]),
+            ));
+        }
         match options.pixel_data {
             TestPixelData::Native(pixel_data) => {
                 object.put(DataElement::new(
@@ -2159,6 +2352,20 @@ mod tests {
             TilePixels::Cpu(tile) => tile,
             TilePixels::Device(_) => panic!("DICOM tests request CPU output"),
         }
+    }
+
+    fn read_first_raw_compressed_tile(path: &Path) -> RawCompressedTile {
+        Slide::open(path)
+            .expect("open DICOM slide")
+            .read_raw_compressed_tile(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 0,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .expect("read first raw compressed tile")
     }
 
     fn test_dicom_image(sop_instance_uid: &str, grid: DicomGrid) -> Arc<DicomImage> {
@@ -2361,6 +2568,27 @@ mod tests {
     }
 
     #[test]
+    fn shared_functional_group_pixel_spacing_is_mpp_for_start_instance() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared-spacing.dcm");
+        let mut options =
+            TestDicomOptions::native(vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]);
+        options.pixel_spacing = None;
+        options.shared_pixel_spacing = Some("0.0005\\0.00025");
+        write_test_dicom(&path, options);
+
+        let slide = Slide::open(&path).expect("open DICOM slide");
+        assert_eq!(
+            slide.dataset().properties.get("openslide.mpp-x"),
+            Some("0.25")
+        );
+        assert_eq!(
+            slide.dataset().properties.get("openslide.mpp-y"),
+            Some("0.5")
+        );
+    }
+
+    #[test]
     fn decodes_rle_lossless_rgb_frame() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rle.dcm");
@@ -2372,6 +2600,7 @@ mod tests {
                 photometric_interpretation: "RGB",
                 planar_configuration: Some(1),
                 pixel_spacing: Some("0.00025\\0.00025"),
+                shared_pixel_spacing: None,
                 pixel_data: TestPixelData::Encapsulated(rle_rgb_frame(
                     &[255, 0, 0, 255],
                     &[0, 255, 0, 255],
@@ -2384,5 +2613,67 @@ mod tests {
             rgb_bytes(&read_first_tile(&path)),
             vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 0]
         );
+    }
+
+    #[test]
+    fn reads_htj2k_rpcl_raw_compressed_frame_without_dicom_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("htj2k-rpcl.dcm");
+        let codestream = vec![0xFF, 0x4F, 0x00, 0xFF, 0xD9];
+        write_test_dicom(
+            &path,
+            TestDicomOptions {
+                transfer_syntax: HTJ2K_LOSSLESS_RPCL_TRANSFER_SYNTAX,
+                samples_per_pixel: 3,
+                photometric_interpretation: "RGB",
+                planar_configuration: Some(0),
+                pixel_spacing: Some("0.00025\\0.00025"),
+                shared_pixel_spacing: None,
+                pixel_data: TestPixelData::Encapsulated(codestream.clone()),
+            },
+        );
+
+        let raw = read_first_raw_compressed_tile(&path);
+        assert_eq!(raw.compression, Compression::Jp2kRgb);
+        assert_eq!(raw.width, 2);
+        assert_eq!(raw.height, 2);
+        assert_eq!(raw.bits_allocated, 8);
+        assert_eq!(raw.samples_per_pixel, 3);
+        assert_eq!(
+            raw.photometric_interpretation,
+            EncodedTilePhotometricInterpretation::Rgb
+        );
+        assert_eq!(raw.data, codestream);
+    }
+
+    #[test]
+    fn reads_jpeg2000_ybr_rct_raw_compressed_frame_as_ycbcr() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("jpeg2000-ybr-rct.dcm");
+        let codestream = vec![0xFF, 0x4F, 0x00, 0xFF, 0xD9];
+        write_test_dicom(
+            &path,
+            TestDicomOptions {
+                transfer_syntax: uids::JPEG2000_LOSSLESS,
+                samples_per_pixel: 3,
+                photometric_interpretation: "YBR_RCT",
+                planar_configuration: Some(0),
+                pixel_spacing: Some("0.00025\\0.00025"),
+                shared_pixel_spacing: None,
+                pixel_data: TestPixelData::Encapsulated(codestream.clone()),
+            },
+        );
+
+        let raw = read_first_raw_compressed_tile(&path);
+        assert_eq!(raw.compression, Compression::Jp2kYcbcr);
+        assert_eq!(raw.width, 2);
+        assert_eq!(raw.height, 2);
+        assert_eq!(raw.bits_allocated, 8);
+        assert_eq!(raw.samples_per_pixel, 3);
+        assert_eq!(
+            raw.photometric_interpretation,
+            EncodedTilePhotometricInterpretation::YbrFull422
+        );
+        assert_eq!(raw.data, codestream);
     }
 }

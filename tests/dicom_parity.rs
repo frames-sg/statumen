@@ -6,6 +6,7 @@ use support::corpus::{load_public, resolve_entry_path};
 use support::oracles::{read_probe, top_left_probe, Oracle, SigninumOracle};
 
 #[test]
+#[ignore = "requires public parity corpus; run after scripts/parity-corpus-fetch.sh"]
 fn dicom_public_corpus_decodes_with_statumen() {
     let strict_corpus = strict_corpus_required();
     let manifest = match load_public() {
@@ -84,14 +85,13 @@ fn dicom_public_corpus_decodes_with_statumen() {
 
 #[cfg(feature = "parity-openslide")]
 #[test]
+#[ignore = "requires public parity corpus and libopenslide"]
 fn dicom_public_corpus_matches_openslide_within_tolerance() {
     use support::compare::{compare_rgba, tolerance_failure, Tolerance};
     use support::oracles::OpenSlideOracle;
 
-    let Some(lib) = support::openslide_shim::try_load() else {
-        eprintln!("[dicom-parity] libopenslide unavailable; skipping OpenSlide comparison");
-        return;
-    };
+    let lib = support::openslide_shim::try_load()
+        .expect("libopenslide is required for DICOM OpenSlide parity");
     let openslide = OpenSlideOracle { lib };
     let manifest = load_public().expect("load public manifest");
     let mut checked = 0u32;
@@ -179,5 +179,5 @@ fn dicom_public_corpus_matches_openslide_within_tolerance() {
 }
 
 fn strict_corpus_required() -> bool {
-    std::env::var_os("STATUMEN_PARITY_REQUIRE_CORPUS").is_some()
+    true
 }

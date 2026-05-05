@@ -60,11 +60,9 @@ fn assert_decodes_u16_region(
 }
 
 #[test]
+#[ignore = "requires STATUMEN_ZVI_ROOT or local Zeiss ZVI testdata"]
 fn builtin_registry_opens_zeiss_zvi_variants_and_reads_u16_regions() {
-    let Some(paths) = fixture_paths() else {
-        eprintln!("[zeiss-zvi] skipping: set STATUMEN_ZVI_ROOT to the Zeiss ZVI fixture directory");
-        return;
-    };
+    let paths = fixture_paths().expect("set STATUMEN_ZVI_ROOT to the Zeiss ZVI fixture directory");
 
     for path in paths {
         let slide = Slide::open(&path).expect("open Zeiss ZVI through builtin registry");
