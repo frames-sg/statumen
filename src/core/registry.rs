@@ -129,6 +129,32 @@ impl<'a> SlideReadContext<'a> {
 /// ```
 pub trait SlideReader: Send + Sync {
     fn dataset(&self) -> &Dataset;
+    fn level_source_kind(
+        &self,
+        scene: usize,
+        series: usize,
+        level: u32,
+    ) -> Result<LevelSourceKind, WsiError> {
+        let dataset = self.dataset();
+        let scene_ref = dataset.scenes.get(scene).ok_or(WsiError::SceneOutOfRange {
+            index: scene,
+            count: dataset.scenes.len(),
+        })?;
+        let series_ref = scene_ref
+            .series
+            .get(series)
+            .ok_or(WsiError::SeriesOutOfRange {
+                index: series,
+                count: scene_ref.series.len(),
+            })?;
+        if level as usize >= series_ref.levels.len() {
+            return Err(WsiError::LevelOutOfRange {
+                level,
+                count: series_ref.levels.len() as u32,
+            });
+        }
+        Ok(LevelSourceKind::Physical)
+    }
     fn read_tiles(
         &self,
         reqs: &[TileRequest],
@@ -1114,6 +1140,15 @@ impl Slide {
 
     pub fn dataset(&self) -> &Dataset {
         self.source.dataset()
+    }
+
+    pub fn level_source_kind(
+        &self,
+        scene: usize,
+        series: usize,
+        level: u32,
+    ) -> Result<LevelSourceKind, WsiError> {
+        self.source.level_source_kind(scene, series, level)
     }
 
     pub fn cached_tile_present(&self, req: &TileRequest) -> bool {

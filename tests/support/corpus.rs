@@ -70,7 +70,12 @@ pub fn load_public() -> Result<CorpusManifest, String> {
     let path = public_manifest_path();
     let text =
         std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    parse_manifest(&text)
+    let mut manifest = parse_manifest(&text)?;
+    apply_alias_filter(
+        &mut manifest,
+        std::env::var("STATUMEN_PARITY_ALIASES").ok().as_deref(),
+    );
+    Ok(manifest)
 }
 
 pub fn load_private() -> Result<Option<CorpusManifest>, String> {
@@ -211,7 +216,7 @@ fn url_file_name(url: &str) -> Option<&str> {
     url.rsplit('/').next().filter(|name| !name.is_empty())
 }
 
-fn format_default_extension(format: &str) -> Option<&'static str> {
+pub(crate) fn format_default_extension(format: &str) -> Option<&'static str> {
     match format {
         "aperio" => Some("svs"),
         "leica" => Some("scn"),
@@ -240,102 +245,18 @@ pub fn private_manifest_path() -> PathBuf {
         .join("parity_corpus.private.toml")
 }
 
-#[cfg(test)]
-mod tests {
-    #[allow(unused_imports)]
-    use super::*;
-
-    const SAMPLE: &str = r#"
-        [[slide]]
-        name             = "aperio_svs_brightfield_he_typical"
-        alias            = "svs-001"
-        path             = ""
-        format           = "aperio"
-        codecs           = ["jpeg"]
-        must_decode      = ["base", "level1", "level2", "label", "macro"]
-        source           = "openslide-testdata"
-        license          = "CC0-1.0"
-        redistributable  = true
-        sha256           = "deadbeef"
-        citation         = "Goode A. et al. OpenSlide..."
-        phi_reviewed     = true
-        url              = "https://openslide.cs.cmu.edu/download/openslide-testdata/Aperio/CMU-1.svs"
-    "#;
-
-    #[test]
-    fn parses_minimal_manifest() {
-        let m = parse_manifest(SAMPLE).expect("parse");
-        assert_eq!(m.slides.len(), 1);
-        let s = &m.slides[0];
-        assert_eq!(s.alias, "svs-001");
-        assert_eq!(s.format, "aperio");
-        assert!(s.redistributable);
-        assert_eq!(s.codecs, vec!["jpeg"]);
-        assert_eq!(s.must_decode.len(), 5);
+pub(crate) fn apply_alias_filter(manifest: &mut CorpusManifest, raw_aliases: Option<&str>) {
+    let Some(raw_aliases) = raw_aliases else {
+        return;
+    };
+    let aliases = raw_aliases
+        .split(|ch: char| ch == ',' || ch == ';' || ch.is_whitespace())
+        .filter(|alias| !alias.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if aliases.is_empty() {
+        return;
     }
-
-    #[test]
-    fn unknown_format_extension_returns_none() {
-        assert!(format_default_extension("nonsense").is_none());
-        assert_eq!(format_default_extension("aperio"), Some("svs"));
-    }
-
-    #[test]
-    fn cache_dir_respects_env() {
-        let prev = std::env::var_os("STATUMEN_PARITY_CORPUS_CACHE");
-        std::env::set_var("STATUMEN_PARITY_CORPUS_CACHE", "/tmp/sv-corpus-test");
-        let p = corpus_cache_dir();
-        assert_eq!(p, PathBuf::from("/tmp/sv-corpus-test"));
-        if let Some(v) = prev {
-            std::env::set_var("STATUMEN_PARITY_CORPUS_CACHE", v);
-        } else {
-            std::env::remove_var("STATUMEN_PARITY_CORPUS_CACHE");
-        }
-    }
-
-    #[test]
-    fn public_manifest_parses() {
-        let p = public_manifest_path();
-        let text = std::fs::read_to_string(&p).expect("read public manifest");
-        let m = parse_manifest(&text).expect("parse public manifest");
-        assert!(!m.slides.is_empty(), "public manifest has no slides");
-        for s in &m.slides {
-            assert!(
-                s.redistributable,
-                "public entry {} not redistributable",
-                s.alias
-            );
-            assert!(!s.alias.is_empty());
-            assert!(!s.format.is_empty());
-            assert!(!s.codecs.is_empty());
-        }
-    }
-
-    #[test]
-    fn must_decode_level_matches_base_and_numbered_levels() {
-        let mut manifest = parse_manifest(SAMPLE).expect("parse");
-        let entry = manifest.slides.first_mut().expect("slide");
-        entry.must_decode = vec!["base".into(), "level1".into(), "level12".into()];
-
-        assert!(entry.must_decode_level(0));
-        assert!(entry.must_decode_level(1));
-        assert!(entry.must_decode_level(12));
-        assert!(!entry.must_decode_level(2));
-        assert!(!entry.must_decode_level(10));
-    }
-
-    #[test]
-    fn expected_failure_matches_pair_and_level_aliases() {
-        let mut manifest = parse_manifest(SAMPLE).expect("parse");
-        let entry = manifest.slides.first_mut().expect("slide");
-        entry.expected_failures = vec![
-            "signinum-vs-reference:base".into(),
-            "reference-vs-openslide:level2".into(),
-        ];
-
-        assert!(entry.expected_failure("signinum-vs-reference", 0));
-        assert!(entry.expected_failure("reference-vs-openslide", 2));
-        assert!(!entry.expected_failure("signinum-vs-reference", 1));
-        assert!(!entry.expected_failure("signinum-vs-openslide", 0));
-    }
+    manifest
+        .slides
+        .retain(|entry| aliases.contains(entry.alias.as_str()));
 }

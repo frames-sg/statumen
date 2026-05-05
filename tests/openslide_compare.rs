@@ -25,10 +25,10 @@ struct RegionCase {
 }
 
 #[test]
+#[ignore = "requires STATUMEN_OPENSLIDE_COMPARE_PATHS and libopenslide"]
 fn compare_against_openslide_for_env_paths() {
-    let Some(raw_paths) = env::var_os("STATUMEN_OPENSLIDE_COMPARE_PATHS") else {
-        return;
-    };
+    let raw_paths = env::var_os("STATUMEN_OPENSLIDE_COMPARE_PATHS")
+        .expect("STATUMEN_OPENSLIDE_COMPARE_PATHS is required for OpenSlide comparison");
 
     let paths: Vec<PathBuf> = env::split_paths(&raw_paths)
         .map(resolve_compare_path)
@@ -44,21 +44,13 @@ fn compare_against_openslide_for_env_paths() {
 }
 
 #[test]
+#[ignore = "requires STATUMEN_APERIO_JPEG_RGB_PATH and libopenslide"]
 fn aperio_jpeg_rgb_pyramid_levels_match_openslide() {
-    let Some(path) = aperio_jpeg_rgb_regression_path() else {
-        return;
-    };
+    let path = aperio_jpeg_rgb_regression_path()
+        .expect("STATUMEN_APERIO_JPEG_RGB_PATH is required for the Aperio RGB regression");
     let handle = Slide::open(&path).expect("open Aperio RGB regression slide with statumen");
-    let openslide = match OpenSlide::open(&path) {
-        Ok(openslide) => openslide,
-        Err(err) => {
-            eprintln!(
-                "[openslide-compare] skipping Aperio RGB regression for {}: {err}",
-                path.display()
-            );
-            return;
-        }
-    };
+    let openslide = OpenSlide::open(&path)
+        .unwrap_or_else(|err| panic!("open Aperio RGB regression with OpenSlide: {err}"));
     let level_count = handle.dataset().scenes[0].series[0].levels.len();
     let max_level = level_count.saturating_sub(1).min(3);
 

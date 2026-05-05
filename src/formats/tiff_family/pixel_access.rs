@@ -489,6 +489,68 @@ fn disable_jpeg_restart_interval(header: &mut [u8]) {
     }
 }
 
+fn patch_jpeg_sof0_dimensions(data: &mut [u8], width: u32, height: u32) -> Result<(), WsiError> {
+    if width == 0 || height == 0 || width > u16::MAX as u32 || height > u16::MAX as u32 {
+        return Err(WsiError::Unsupported {
+            reason: format!(
+                "NDPI JPEG passthrough requires u16 SOF dimensions, got {width}x{height}"
+            ),
+        });
+    }
+
+    let mut offset = 0usize;
+    while let Some(segment) = next_jpeg_segment(data, offset)? {
+        if segment.marker == 0xC0 {
+            if segment.payload.len() < 5 {
+                return Err(WsiError::Unsupported {
+                    reason: "NDPI JPEG passthrough SOF0 segment is truncated".into(),
+                });
+            }
+            let payload_start = segment.start + 4;
+            data[payload_start + 1..payload_start + 3]
+                .copy_from_slice(&(height as u16).to_be_bytes());
+            data[payload_start + 3..payload_start + 5]
+                .copy_from_slice(&(width as u16).to_be_bytes());
+            return Ok(());
+        }
+        if is_jpeg_sof_marker(segment.marker) {
+            return Err(WsiError::Unsupported {
+                reason: "NDPI JPEG passthrough only supports Baseline JPEG SOF0 frames".into(),
+            });
+        }
+        if segment.marker == 0xDA {
+            break;
+        }
+        offset = segment.end;
+    }
+
+    Err(WsiError::Unsupported {
+        reason: "NDPI JPEG passthrough could not find a Baseline JPEG SOF0 marker".into(),
+    })
+}
+
+fn ndpi_restart_segments_align_to_rows(
+    level_width: u64,
+    virtual_tile_width: u32,
+    restart_interval: u16,
+) -> bool {
+    if level_width == 0 || virtual_tile_width == 0 || restart_interval == 0 {
+        return false;
+    }
+    let restart_interval = u64::from(restart_interval);
+    let virtual_tile_width = u64::from(virtual_tile_width);
+    if !virtual_tile_width.is_multiple_of(restart_interval) {
+        return false;
+    }
+    let mcu_width = virtual_tile_width / restart_interval;
+    if mcu_width == 0 {
+        return false;
+    }
+    level_width
+        .div_ceil(mcu_width)
+        .is_multiple_of(restart_interval)
+}
+
 /// Validate that tile coordinates are non-negative and fit in u32.
 fn validate_tile_coords(col: i64, row: i64, level: u32) -> Result<(u32, u32), WsiError> {
     if col < 0 || row < 0 {
@@ -924,6 +986,93 @@ fn fit_synthetic_rgb_tile_to_dimensions(
         "synthetic NDPI level dimensions mismatch: got {}x{}, expected {}x{}",
         tile.width, tile.height, width, height
     )))
+}
+
+fn checked_rgb_u8_len(width: u32, height: u32) -> Result<usize, WsiError> {
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| {
+            WsiError::DisplayConversion(format!("RGB region dimensions overflow: {width}x{height}"))
+        })?;
+    pixels.checked_mul(3).ok_or_else(|| {
+        WsiError::DisplayConversion(format!(
+            "RGB region byte length overflows usize: {width}x{height}"
+        ))
+    })
+}
+
+fn zero_rgb_interleaved_u8_tile(width: u32, height: u32) -> Result<CpuTile, WsiError> {
+    Ok(CpuTile {
+        width,
+        height,
+        channels: 3,
+        color_space: ColorSpace::Rgb,
+        layout: CpuTileLayout::Interleaved,
+        data: CpuTileData::u8(vec![0u8; checked_rgb_u8_len(width, height)?]),
+    })
+}
+
+fn paste_rgb_interleaved_u8_tile(
+    source: &CpuTile,
+    width: u32,
+    height: u32,
+    dst_x: u32,
+    dst_y: u32,
+) -> Result<CpuTile, WsiError> {
+    if source.layout != CpuTileLayout::Interleaved
+        || source.channels != 3
+        || source.color_space != ColorSpace::Rgb
+    {
+        return Err(WsiError::DisplayConversion(
+            "synthetic NDPI ROI paste requires interleaved RGB input".into(),
+        ));
+    }
+    let src = source.data.as_u8().ok_or_else(|| {
+        WsiError::DisplayConversion("synthetic NDPI ROI paste requires U8 data".into())
+    })?;
+    if dst_x == 0 && dst_y == 0 && source.width == width && source.height == height {
+        return Ok(source.clone());
+    }
+    if u64::from(dst_x) + u64::from(source.width) > u64::from(width)
+        || u64::from(dst_y) + u64::from(source.height) > u64::from(height)
+    {
+        return Err(WsiError::DisplayConversion(format!(
+            "synthetic NDPI ROI paste {}x{} at ({dst_x},{dst_y}) exceeds output {width}x{height}",
+            source.width, source.height
+        )));
+    }
+
+    let mut out = vec![0u8; checked_rgb_u8_len(width, height)?];
+    let src_stride = source.width as usize * 3;
+    let dst_stride = width as usize * 3;
+    let dst_x = dst_x as usize;
+    let dst_y = dst_y as usize;
+    for row in 0..source.height as usize {
+        let src_off = row * src_stride;
+        let dst_off = (dst_y + row) * dst_stride + dst_x * 3;
+        out[dst_off..dst_off + src_stride].copy_from_slice(&src[src_off..src_off + src_stride]);
+    }
+
+    Ok(CpuTile {
+        width,
+        height,
+        channels: 3,
+        color_space: ColorSpace::Rgb,
+        layout: CpuTileLayout::Interleaved,
+        data: CpuTileData::u8(out),
+    })
+}
+
+fn ensure_interleaved_rgb_u8(tile: CpuTile) -> Result<CpuTile, WsiError> {
+    if tile.layout == CpuTileLayout::Interleaved
+        && tile.channels == 3
+        && tile.color_space == ColorSpace::Rgb
+        && tile.data.as_u8().is_some()
+    {
+        Ok(tile)
+    } else {
+        Ok(rgba_image_to_sample_buffer(tile.to_rgba()?))
+    }
 }
 
 #[derive(Debug)]
@@ -2359,7 +2508,14 @@ impl TiffPixelReader {
             || u64::from(w) != level.dimensions.0
             || u64::from(h) != level.dimensions.1
         {
-            return composite_region_from_source(self, cache, req);
+            return self.read_synthetic_subregion_fastpath(
+                cache,
+                req,
+                base_level,
+                factor,
+                level.dimensions.0,
+                level.dimensions.1,
+            );
         }
 
         let key = CacheKey {
@@ -2435,6 +2591,188 @@ impl TiffPixelReader {
             cache.put(key, image.clone());
         }
         Ok(image.as_ref().clone())
+    }
+
+    fn read_synthetic_subregion_fastpath(
+        &self,
+        cache: Option<&crate::core::cache::TileCache>,
+        req: &RegionRequest,
+        base_level: u32,
+        factor: u32,
+        target_width: u64,
+        target_height: u64,
+    ) -> Result<CpuTile, WsiError> {
+        let (x, y) = req.origin_px;
+        let (w, h) = req.size_px;
+        if w == 0 || h == 0 {
+            return zero_rgb_interleaved_u8_tile(w, h);
+        }
+
+        let x0 = i128::from(x);
+        let y0 = i128::from(y);
+        let x1 = x0 + i128::from(w);
+        let y1 = y0 + i128::from(h);
+        let target_w = i128::from(target_width);
+        let target_h = i128::from(target_height);
+        let clipped_x0 = x0.clamp(0, target_w);
+        let clipped_y0 = y0.clamp(0, target_h);
+        let clipped_x1 = x1.clamp(0, target_w);
+        let clipped_y1 = y1.clamp(0, target_h);
+
+        if clipped_x1 <= clipped_x0 || clipped_y1 <= clipped_y0 {
+            return zero_rgb_interleaved_u8_tile(w, h);
+        }
+
+        let valid_w = u32::try_from(clipped_x1 - clipped_x0).map_err(|_| {
+            WsiError::DisplayConversion(format!(
+                "synthetic NDPI ROI width exceeds region API bounds: {}",
+                clipped_x1 - clipped_x0
+            ))
+        })?;
+        let valid_h = u32::try_from(clipped_y1 - clipped_y0).map_err(|_| {
+            WsiError::DisplayConversion(format!(
+                "synthetic NDPI ROI height exceeds region API bounds: {}",
+                clipped_y1 - clipped_y0
+            ))
+        })?;
+        let dst_x = u32::try_from(clipped_x0 - x0).map_err(|_| {
+            WsiError::DisplayConversion("synthetic NDPI ROI destination x overflow".into())
+        })?;
+        let dst_y = u32::try_from(clipped_y0 - y0).map_err(|_| {
+            WsiError::DisplayConversion("synthetic NDPI ROI destination y overflow".into())
+        })?;
+
+        let base_tile_req = TileRequest {
+            scene: req.scene.0,
+            series: req.series.0,
+            level: base_level,
+            plane: req.plane.0,
+            col: 0,
+            row: 0,
+        };
+        if matches!(
+            self.tile_source_for(&base_tile_req)?,
+            TileSource::NdpiFullDecode { .. }
+        ) {
+            let tile_req = TileRequest {
+                scene: req.scene.0,
+                series: req.series.0,
+                level: req.level.0,
+                plane: req.plane.0,
+                col: 0,
+                row: 0,
+            };
+            if let Some(scaled) =
+                self.try_decode_synthetic_level_with_signinum(&tile_req, base_level, factor)?
+            {
+                let crop_x0 = u32::try_from(clipped_x0).map_err(|_| {
+                    WsiError::DisplayConversion(
+                        "synthetic NDPI ROI source x exceeds crop bounds".into(),
+                    )
+                })?;
+                let crop_y0 = u32::try_from(clipped_y0).map_err(|_| {
+                    WsiError::DisplayConversion(
+                        "synthetic NDPI ROI source y exceeds crop bounds".into(),
+                    )
+                })?;
+                let cropped =
+                    crop_rgb_interleaved_u8_buffer(&scaled, crop_x0, crop_y0, valid_w, valid_h)?;
+                return paste_rgb_interleaved_u8_tile(&cropped, w, h, dst_x, dst_y);
+            }
+        }
+
+        let series = self
+            .layout
+            .dataset
+            .scenes
+            .get(req.scene.0)
+            .and_then(|scene| scene.series.get(req.series.0))
+            .ok_or_else(|| WsiError::SeriesOutOfRange {
+                index: req.series.0,
+                count: self
+                    .layout
+                    .dataset
+                    .scenes
+                    .get(req.scene.0)
+                    .map_or(0, |scene| scene.series.len()),
+            })?;
+        let base =
+            series
+                .levels
+                .get(base_level as usize)
+                .ok_or_else(|| WsiError::LevelOutOfRange {
+                    level: base_level,
+                    count: series.levels.len() as u32,
+                })?;
+        let clipped_x0 = u128::try_from(clipped_x0).map_err(|_| {
+            WsiError::DisplayConversion("synthetic NDPI ROI source x is negative".into())
+        })?;
+        let clipped_y0 = u128::try_from(clipped_y0).map_err(|_| {
+            WsiError::DisplayConversion("synthetic NDPI ROI source y is negative".into())
+        })?;
+        let clipped_x1 = u128::try_from(clipped_x1).map_err(|_| {
+            WsiError::DisplayConversion("synthetic NDPI ROI source right is negative".into())
+        })?;
+        let clipped_y1 = u128::try_from(clipped_y1).map_err(|_| {
+            WsiError::DisplayConversion("synthetic NDPI ROI source bottom is negative".into())
+        })?;
+        let factor = u128::from(factor);
+        let base_x0 = clipped_x0.checked_mul(factor).ok_or_else(|| {
+            WsiError::DisplayConversion("synthetic NDPI base ROI x overflow".into())
+        })?;
+        let base_y0 = clipped_y0.checked_mul(factor).ok_or_else(|| {
+            WsiError::DisplayConversion("synthetic NDPI base ROI y overflow".into())
+        })?;
+        let base_x1 = clipped_x1
+            .checked_mul(factor)
+            .ok_or_else(|| {
+                WsiError::DisplayConversion("synthetic NDPI base ROI right overflow".into())
+            })?
+            .min(u128::from(base.dimensions.0));
+        let base_y1 = clipped_y1
+            .checked_mul(factor)
+            .ok_or_else(|| {
+                WsiError::DisplayConversion("synthetic NDPI base ROI bottom overflow".into())
+            })?
+            .min(u128::from(base.dimensions.1));
+        if base_x1 <= base_x0 || base_y1 <= base_y0 {
+            return zero_rgb_interleaved_u8_tile(w, h);
+        }
+
+        let base_req = RegionRequest::legacy_xywh(
+            req.scene.0,
+            req.series.0,
+            base_level,
+            req.plane.0,
+            i64::try_from(base_x0).map_err(|_| {
+                WsiError::DisplayConversion("synthetic NDPI base ROI x exceeds i64".into())
+            })?,
+            i64::try_from(base_y0).map_err(|_| {
+                WsiError::DisplayConversion("synthetic NDPI base ROI y exceeds i64".into())
+            })?,
+            u32::try_from(base_x1 - base_x0).map_err(|_| {
+                WsiError::DisplayConversion(
+                    "synthetic NDPI base ROI width exceeds region API bounds".into(),
+                )
+            })?,
+            u32::try_from(base_y1 - base_y0).map_err(|_| {
+                WsiError::DisplayConversion(
+                    "synthetic NDPI base ROI height exceeds region API bounds".into(),
+                )
+            })?,
+        );
+        let base_source = TiffPixelReaderNoSyntheticPrime { inner: self };
+        let base_region = ensure_interleaved_rgb_u8(composite_region_from_source(
+            &base_source,
+            cache,
+            &base_req,
+        )?)?;
+        let downsampled = fit_synthetic_rgb_tile_to_dimensions(
+            downsample_rgb_pow2_box(&base_region, factor as u32)?,
+            valid_w,
+            valid_h,
+        )?;
+        paste_rgb_interleaved_u8_tile(&downsampled, w, h, dst_x, dst_y)
     }
 
     fn get_or_decode_synthetic_level(
@@ -2949,6 +3287,209 @@ impl TiffPixelReader {
             .pread(offsets[tile_idx], byte_count)
             .map_err(|e| e.into_wsi_error(self.container.path()))?;
         let (data, info) = standalone_jpeg_frame(&tile_data, jpeg_tables)?;
+        Ok(RawCompressedTile {
+            compression: Compression::Jpeg,
+            width: info.width,
+            height: info.height,
+            bits_allocated: info.bits_allocated,
+            samples_per_pixel: info.samples_per_pixel,
+            photometric_interpretation: info.photometric_interpretation,
+            data,
+        })
+    }
+
+    fn read_tiled_ifd_raw_jp2k_tile(
+        &self,
+        req: &TileRequest,
+        ifd_id: IfdId,
+        compression: Compression,
+    ) -> Result<RawCompressedTile, WsiError> {
+        let (tile_idx, width, height) = self.tiled_ifd_tile_index_and_dimensions(req, ifd_id)?;
+        let (offsets, byte_counts) = self.tiled_ifd_offsets_and_byte_counts(ifd_id)?;
+        if tile_idx >= offsets.len() || tile_idx >= byte_counts.len() {
+            return Err(WsiError::TileRead {
+                col: req.col,
+                row: req.row,
+                level: req.level,
+                reason: format!(
+                    "tile index {} out of range (offsets={}, byte_counts={})",
+                    tile_idx,
+                    offsets.len(),
+                    byte_counts.len()
+                ),
+            });
+        }
+        let byte_count = byte_counts[tile_idx];
+        if byte_count == 0 {
+            return Err(WsiError::Unsupported {
+                reason: "J2K passthrough does not support empty TIFF tiles".into(),
+            });
+        }
+
+        let data = self
+            .container
+            .pread(offsets[tile_idx], byte_count)
+            .map_err(|e| e.into_wsi_error(self.container.path()))?;
+        let samples_per_pixel = self
+            .container
+            .get_u32(ifd_id, tags::SAMPLES_PER_PIXEL)
+            .unwrap_or(3);
+        if samples_per_pixel == 0 || samples_per_pixel > u32::from(u16::MAX) {
+            return Err(WsiError::Unsupported {
+                reason: format!(
+                    "J2K passthrough requires samples per pixel to fit in u16, got {samples_per_pixel}"
+                ),
+            });
+        }
+        let bits_allocated = self
+            .container
+            .get_u32(ifd_id, tags::BITS_PER_SAMPLE)
+            .unwrap_or(8);
+        if bits_allocated == 0 || bits_allocated > u32::from(u16::MAX) {
+            return Err(WsiError::Unsupported {
+                reason: format!(
+                    "J2K passthrough requires bits per sample to fit in u16, got {bits_allocated}"
+                ),
+            });
+        }
+        let photometric = self.container.get_u32(ifd_id, tags::PHOTOMETRIC).unwrap_or(
+            match (compression, samples_per_pixel) {
+                (_, 1) => 1,
+                (Compression::Jp2kYcbcr, _) => 6,
+                _ => 2,
+            },
+        );
+        let photometric_interpretation = match samples_per_pixel {
+            1 => EncodedTilePhotometricInterpretation::Monochrome2,
+            3 => match compression {
+                Compression::Jp2kRgb => EncodedTilePhotometricInterpretation::Rgb,
+                Compression::Jp2kYcbcr => EncodedTilePhotometricInterpretation::YbrFull422,
+                _ if photometric == 2 => EncodedTilePhotometricInterpretation::Rgb,
+                _ if photometric == 6 => EncodedTilePhotometricInterpretation::YbrFull422,
+                _ => {
+                    return Err(WsiError::Unsupported {
+                        reason: format!(
+                            "J2K passthrough does not support photometric interpretation {photometric}"
+                        ),
+                    });
+                }
+            },
+            other => {
+                return Err(WsiError::Unsupported {
+                    reason: format!("J2K passthrough supports 1 or 3 samples, got {other}"),
+                });
+            }
+        };
+
+        Ok(RawCompressedTile {
+            compression,
+            width,
+            height,
+            bits_allocated: bits_allocated as u16,
+            samples_per_pixel: samples_per_pixel as u16,
+            photometric_interpretation,
+            data,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_ndpi_raw_jpeg_tile(
+        &self,
+        req: &TileRequest,
+        ifd_id: IfdId,
+        jpeg_header: &[u8],
+        mcu_starts_tag: u16,
+        tiles_across: u32,
+        tiles_down: u32,
+        restart_interval: u16,
+        strip_offset: u64,
+        strip_byte_count: u64,
+    ) -> Result<RawCompressedTile, WsiError> {
+        let (col, row) = validate_tile_coords(req.col, req.row, req.level)?;
+        if col >= tiles_across || row >= tiles_down {
+            return Err(WsiError::TileRead {
+                col: req.col,
+                row: req.row,
+                level: req.level,
+                reason: format!(
+                    "NDPI raw JPEG tile ({},{}) out of range ({}x{})",
+                    req.col, req.row, tiles_across, tiles_down
+                ),
+            });
+        }
+
+        let level =
+            &self.layout.dataset.scenes[req.scene].series[req.series].levels[req.level as usize];
+        let (level_w, level_h) = level.dimensions;
+        let (virtual_tile_width, virtual_tile_height) = match level.tile_layout {
+            TileLayout::WholeLevel {
+                virtual_tile_width,
+                virtual_tile_height,
+                ..
+            } if virtual_tile_width > 0 && virtual_tile_height > 0 => {
+                (virtual_tile_width, virtual_tile_height)
+            }
+            TileLayout::WholeLevel { .. } => {
+                return Err(WsiError::TileRead {
+                    col: req.col,
+                    row: req.row,
+                    level: req.level,
+                    reason: "NDPI raw JPEG passthrough requires nonzero WholeLevel virtual tile dimensions"
+                        .into(),
+                });
+            }
+            _ => {
+                return Err(WsiError::TileRead {
+                    col: req.col,
+                    row: req.row,
+                    level: req.level,
+                    reason: "NDPI raw JPEG passthrough expects WholeLevel tile layout".into(),
+                });
+            }
+        };
+        if !ndpi_restart_segments_align_to_rows(level_w, virtual_tile_width, restart_interval) {
+            return Err(WsiError::Unsupported {
+                reason: format!(
+                    "NDPI raw JPEG passthrough requires restart segments to align to image rows (level width {level_w}, virtual tile width {virtual_tile_width}, restart interval {restart_interval})"
+                ),
+            });
+        }
+
+        let payload = self.ndpi_jpeg_tile_payload(
+            req,
+            ifd_id,
+            jpeg_header,
+            mcu_starts_tag,
+            tiles_across,
+            tiles_down,
+            strip_offset,
+            strip_byte_count,
+            NdpiStripKey {
+                ifd_id,
+                col,
+                native_row: row,
+            },
+            virtual_tile_width,
+            virtual_tile_height,
+            u32::try_from(level_w).map_err(|_| WsiError::Unsupported {
+                reason: "NDPI raw JPEG passthrough requires level width to fit in u32".into(),
+            })?,
+            u32::try_from(level_h).map_err(|_| WsiError::Unsupported {
+                reason: "NDPI raw JPEG passthrough requires level height to fit in u32".into(),
+            })?,
+        )?;
+        let mut data = payload.jpeg;
+        patch_jpeg_sof0_dimensions(&mut data, virtual_tile_width, virtual_tile_height)?;
+        let info = parse_baseline_jpeg_frame_info(&data)?;
+        if info.width != virtual_tile_width || info.height != virtual_tile_height {
+            return Err(WsiError::Unsupported {
+                reason: format!(
+                    "NDPI raw JPEG passthrough SOF dimensions {}x{} do not match virtual tile {}x{}",
+                    info.width, info.height, virtual_tile_width, virtual_tile_height
+                ),
+            });
+        }
+
         Ok(RawCompressedTile {
             compression: Compression::Jpeg,
             width: info.width,
@@ -4537,12 +5078,80 @@ impl TiffPixelReader {
     }
 }
 
+struct TiffPixelReaderNoSyntheticPrime<'a> {
+    inner: &'a TiffPixelReader,
+}
+
+impl SlideReader for TiffPixelReaderNoSyntheticPrime<'_> {
+    fn dataset(&self) -> &Dataset {
+        &self.inner.layout.dataset
+    }
+
+    fn read_tiles(
+        &self,
+        reqs: &[TileRequest],
+        output: TileOutputPreference,
+    ) -> Result<Vec<TilePixels>, WsiError> {
+        <TiffPixelReader as SlideReader>::read_tiles(self.inner, reqs, output)
+    }
+
+    fn read_tile_cpu(&self, req: &TileRequest) -> Result<CpuTile, WsiError> {
+        self.inner.read_tile_cpu(req)
+    }
+
+    fn read_associated(&self, name: &str) -> Result<CpuTile, WsiError> {
+        self.inner.read_associated(name)
+    }
+}
+
 impl SlideReader for TiffPixelReader {
     fn dataset(&self) -> &Dataset {
         let _ = self
             .synthetic_prime_once
             .get_or_init(|| self.prime_deepest_synthetic_levels_best_effort());
         &self.layout.dataset
+    }
+
+    fn level_source_kind(
+        &self,
+        scene: usize,
+        series: usize,
+        level: u32,
+    ) -> Result<LevelSourceKind, WsiError> {
+        let scene_ref = self
+            .layout
+            .dataset
+            .scenes
+            .get(scene)
+            .ok_or(WsiError::SceneOutOfRange {
+                index: scene,
+                count: self.layout.dataset.scenes.len(),
+            })?;
+        let series_ref = scene_ref
+            .series
+            .get(series)
+            .ok_or(WsiError::SeriesOutOfRange {
+                index: series,
+                count: scene_ref.series.len(),
+            })?;
+        if level as usize >= series_ref.levels.len() {
+            return Err(WsiError::LevelOutOfRange {
+                level,
+                count: series_ref.levels.len() as u32,
+            });
+        }
+
+        let synthetic = self.layout.tile_sources.iter().any(|(key, source)| {
+            key.scene == scene
+                && key.series == series
+                && key.level == level
+                && matches!(source, TileSource::SyntheticDownsample { .. })
+        });
+        if synthetic {
+            Ok(LevelSourceKind::SyntheticDownsample)
+        } else {
+            Ok(LevelSourceKind::Physical)
+        }
     }
 
     fn read_raw_compressed_tile(&self, req: &TileRequest) -> Result<RawCompressedTile, WsiError> {
@@ -4552,15 +5161,38 @@ impl SlideReader for TiffPixelReader {
                 jpeg_tables,
                 compression: Compression::Jpeg,
             } => self.read_tiled_ifd_raw_jpeg_tile(req, *ifd_id, jpeg_tables.as_deref()),
+            TileSource::TiledIfd {
+                ifd_id,
+                compression: compression @ (Compression::Jp2kRgb | Compression::Jp2kYcbcr),
+                ..
+            } => self.read_tiled_ifd_raw_jp2k_tile(req, *ifd_id, *compression),
             TileSource::TiledIfd { compression, .. } => Err(WsiError::Unsupported {
                 reason: format!(
-                    "JPEG passthrough requires TIFF JPEG compression, got {:?}",
+                    "compressed passthrough requires TIFF JPEG or J2K compression, got {:?}",
                     compression
                 ),
             }),
-            TileSource::NdpiJpeg { .. } => Err(WsiError::Unsupported {
-                reason: "NDPI JPEG passthrough is not available because restart-marker tile geometry must be validated before compressed-byte export".into(),
-            }),
+            TileSource::NdpiJpeg {
+                ifd_id,
+                jpeg_header,
+                mcu_starts_tag,
+                tiles_across,
+                tiles_down,
+                restart_interval,
+                strip_offset,
+                strip_byte_count,
+                ..
+            } => self.read_ndpi_raw_jpeg_tile(
+                req,
+                *ifd_id,
+                jpeg_header,
+                *mcu_starts_tag,
+                *tiles_across,
+                *tiles_down,
+                *restart_interval,
+                *strip_offset,
+                *strip_byte_count,
+            ),
             TileSource::NdpiFullDecode { .. } => Err(WsiError::Unsupported {
                 reason: "NDPI JPEG passthrough is not available for whole-level full-decode JPEG sources".into(),
             }),
@@ -4714,12 +5346,14 @@ impl SlideReader for TiffPixelReader {
         #[cfg(feature = "metal")]
         let prefer_device = output.prefers_device();
         #[cfg(feature = "metal")]
+        let compressed_device_decode_enabled = output.compressed_device_decode_enabled();
+        #[cfg(feature = "metal")]
         let metal_sessions = output.metal_sessions();
 
         #[cfg(feature = "metal")]
         if prefer_device && !reqs.is_empty() {
             if self.ndpi_jpeg_batchable(reqs)? {
-                if jpeg_device_decode_enabled() {
+                if compressed_device_decode_enabled || jpeg_device_decode_enabled() {
                     match self.decode_ndpi_jpeg_pixels(
                         reqs,
                         backend,
@@ -4740,14 +5374,16 @@ impl SlideReader for TiffPixelReader {
                 } else if require_device {
                     return Err(WsiError::Unsupported {
                         reason: format!(
-                            "NDPI JPEG device decode is disabled; set {JPEG_DEVICE_DECODE_ENV}=1 to opt in"
+                            "NDPI JPEG device decode is disabled; set {JPEG_DEVICE_DECODE_ENV}=1 or request compressed device decode to opt in"
                         ),
                     });
                 }
             }
 
             let device_result = match self.tiled_ifd_batch_compression(reqs)? {
-                Some(Compression::Jpeg) if jpeg_device_decode_enabled() => {
+                Some(Compression::Jpeg)
+                    if compressed_device_decode_enabled || jpeg_device_decode_enabled() =>
+                {
                     Some(self.decode_tiled_ifd_jpeg_pixels(
                         reqs,
                         backend,
@@ -4758,13 +5394,13 @@ impl SlideReader for TiffPixelReader {
                 Some(Compression::Jpeg) if require_device => {
                     return Err(WsiError::Unsupported {
                         reason: format!(
-                            "JPEG device decode is disabled; set {JPEG_DEVICE_DECODE_ENV}=1 to opt in"
+                            "JPEG device decode is disabled; set {JPEG_DEVICE_DECODE_ENV}=1 or request compressed device decode to opt in"
                         ),
                     });
                 }
                 Some(Compression::Jpeg) => None,
                 Some(compression @ (Compression::Jp2kRgb | Compression::Jp2kYcbcr))
-                    if jp2k_device_decode_enabled() =>
+                    if compressed_device_decode_enabled || jp2k_device_decode_enabled() =>
                 {
                     Some(self.decode_tiled_ifd_jp2k_pixels(
                         reqs,
@@ -4777,7 +5413,7 @@ impl SlideReader for TiffPixelReader {
                 Some(Compression::Jp2kRgb | Compression::Jp2kYcbcr) if require_device => {
                     return Err(WsiError::Unsupported {
                         reason: format!(
-                            "JP2K device decode is disabled; set {JP2K_DEVICE_DECODE_ENV}=1 to opt in"
+                            "JP2K device decode is disabled; set {JP2K_DEVICE_DECODE_ENV}=1 or request compressed device decode to opt in"
                         ),
                     });
                 }
@@ -5973,18 +6609,155 @@ mod tests {
         }
     }
 
+    fn synthetic_ndpi_base_pixel(x: u32, y: u32) -> [u8; 3] {
+        [
+            (10 + x.saturating_mul(7) + y.saturating_mul(3)).min(255) as u8,
+            (20 + x.saturating_mul(5) + y.saturating_mul(11)).min(255) as u8,
+            (30 + x.saturating_mul(13) + y.saturating_mul(2)).min(255) as u8,
+        ]
+    }
+
+    fn synthetic_ndpi_base_image(width: u32, height: u32) -> image::RgbImage {
+        image::RgbImage::from_fn(width, height, |x, y| {
+            image::Rgb(synthetic_ndpi_base_pixel(x, y))
+        })
+    }
+
+    fn crop_rgb_with_zero_fill(source: &CpuTile, x: i64, y: i64, w: u32, h: u32) -> CpuTile {
+        assert_eq!(source.channels, 3);
+        assert_eq!(source.color_space, ColorSpace::Rgb);
+        assert_eq!(source.layout, CpuTileLayout::Interleaved);
+        let src = source.data.as_u8().unwrap();
+        let mut out = vec![0u8; w as usize * h as usize * 3];
+        let clipped_x0 = x.max(0).min(i64::from(source.width));
+        let clipped_y0 = y.max(0).min(i64::from(source.height));
+        let clipped_x1 = x
+            .saturating_add(i64::from(w))
+            .max(0)
+            .min(i64::from(source.width));
+        let clipped_y1 = y
+            .saturating_add(i64::from(h))
+            .max(0)
+            .min(i64::from(source.height));
+        if clipped_x1 <= clipped_x0 || clipped_y1 <= clipped_y0 {
+            return CpuTile {
+                width: w,
+                height: h,
+                channels: 3,
+                color_space: ColorSpace::Rgb,
+                layout: CpuTileLayout::Interleaved,
+                data: CpuTileData::u8(out),
+            };
+        }
+
+        let copy_w = (clipped_x1 - clipped_x0) as usize;
+        let copy_h = (clipped_y1 - clipped_y0) as usize;
+        let dst_x = (clipped_x0 - x) as usize;
+        let dst_y = (clipped_y0 - y) as usize;
+        let src_stride = source.width as usize * 3;
+        let dst_stride = w as usize * 3;
+        for row in 0..copy_h {
+            let src_off = (clipped_y0 as usize + row) * src_stride + clipped_x0 as usize * 3;
+            let dst_off = (dst_y + row) * dst_stride + dst_x * 3;
+            out[dst_off..dst_off + copy_w * 3].copy_from_slice(&src[src_off..src_off + copy_w * 3]);
+        }
+
+        CpuTile {
+            width: w,
+            height: h,
+            channels: 3,
+            color_space: ColorSpace::Rgb,
+            layout: CpuTileLayout::Interleaved,
+            data: CpuTileData::u8(out),
+        }
+    }
+
+    fn expected_synthetic_ndpi_region(
+        reader: &TiffPixelReader,
+        factor: u32,
+        x: i64,
+        y: i64,
+        w: u32,
+        h: u32,
+    ) -> CpuTile {
+        let tile_req = TileRequest {
+            scene: 0,
+            series: 0,
+            level: 1,
+            plane: PlaneSelection::default(),
+            col: 0,
+            row: 0,
+        };
+        let full = if let Some(image) = reader
+            .try_decode_synthetic_level_with_signinum(&tile_req, 0, factor)
+            .unwrap()
+        {
+            image
+        } else {
+            let mut base = reader
+                .read_tile_cpu(&TileRequest {
+                    scene: 0,
+                    series: 0,
+                    level: 0,
+                    plane: PlaneSelection::default(),
+                    col: 0,
+                    row: 0,
+                })
+                .unwrap();
+            if base.layout != CpuTileLayout::Interleaved
+                || base.channels != 3
+                || base.color_space != ColorSpace::Rgb
+                || base.data.as_u8().is_none()
+            {
+                base = rgba_image_to_sample_buffer(base.to_rgba().unwrap());
+            }
+            let target = &reader.layout.dataset.scenes[0].series[0].levels[1];
+            fit_synthetic_rgb_tile_to_dimensions(
+                downsample_rgb_pow2_box(&base, factor).unwrap(),
+                target.dimensions.0 as u32,
+                target.dimensions.1 as u32,
+            )
+            .unwrap()
+        };
+        crop_rgb_with_zero_fill(&full, x, y, w, h)
+    }
+
+    fn assert_tile_eq(actual: &CpuTile, expected: &CpuTile) {
+        assert_eq!(
+            (actual.width, actual.height),
+            (expected.width, expected.height)
+        );
+        assert_eq!(actual.channels, expected.channels);
+        assert_eq!(actual.color_space, expected.color_space);
+        assert_eq!(actual.layout, expected.layout);
+        assert_eq!(actual.data.as_u8().unwrap(), expected.data.as_u8().unwrap());
+    }
+
+    fn read_synthetic_ndpi_region(
+        reader: &TiffPixelReader,
+        x: i64,
+        y: i64,
+        w: u32,
+        h: u32,
+    ) -> CpuTile {
+        let req = RegionRequest::legacy_xywh(0, 0, 1, PlaneSelection::default(), x, y, w, h);
+        let mut ctx = crate::core::registry::SlideReadContext::new(
+            None,
+            TileOutputPreference::cpu(),
+            256 * 1024 * 1024,
+        );
+        reader
+            .read_region_fastpath(&mut ctx, &req)
+            .expect("synthetic level should have a region fast path")
+            .expect("synthetic region fast path should produce pixels")
+    }
+
     fn build_synthetic_ndpi_reader(
         width: u32,
         height: u32,
         synthetic: &[(u64, u64, u32)],
     ) -> TiffPixelReader {
-        let image = image::RgbImage::from_fn(width, height, |x, y| {
-            image::Rgb([
-                (10 + x.saturating_mul(7) + y.saturating_mul(3)).min(255) as u8,
-                (20 + x.saturating_mul(5) + y.saturating_mul(11)).min(255) as u8,
-                (30 + x.saturating_mul(13) + y.saturating_mul(2)).min(255) as u8,
-            ])
-        });
+        let image = synthetic_ndpi_base_image(width, height);
         let mut jpeg = Vec::new();
         JpegEncoder::new(&mut jpeg, 95)
             .encode(
@@ -6075,6 +6848,94 @@ mod tests {
             associated_sources: HashMap::new(),
         };
         TiffPixelReader::new(container, layout)
+    }
+
+    #[test]
+    fn synthetic_ndpi_level_source_kind_marks_generated_downsamples() {
+        let reader = build_synthetic_ndpi_reader(8, 8, &[(4, 4, 2)]);
+
+        assert_eq!(
+            reader.level_source_kind(0, 0, 0).unwrap(),
+            LevelSourceKind::Physical
+        );
+        assert_eq!(
+            reader.level_source_kind(0, 0, 1).unwrap(),
+            LevelSourceKind::SyntheticDownsample
+        );
+    }
+
+    #[test]
+    fn synthetic_ndpi_subregion_fastpath_matches_center_roi_without_materializing_level() {
+        let reader = build_synthetic_ndpi_reader(8, 8, &[(4, 4, 2)]);
+        let tile = read_synthetic_ndpi_region(&reader, 1, 1, 2, 2);
+        let expected = expected_synthetic_ndpi_region(&reader, 2, 1, 1, 2, 2);
+
+        assert_tile_eq(&tile, &expected);
+        assert_eq!(
+            reader.synthetic_level_cache.lock().unwrap().current_bytes,
+            0,
+            "ROI reads must not materialize the whole synthetic level"
+        );
+        assert_eq!(
+            reader.synthetic_region_cache.lock().unwrap().current_bytes,
+            0,
+            "ROI reads must not populate full synthetic region cache entries"
+        );
+    }
+
+    #[test]
+    fn synthetic_ndpi_subregion_fastpath_zero_fills_negative_origin() {
+        let reader = build_synthetic_ndpi_reader(8, 8, &[(4, 4, 2)]);
+        let tile = read_synthetic_ndpi_region(&reader, -1, -1, 3, 3);
+        let expected = expected_synthetic_ndpi_region(&reader, 2, -1, -1, 3, 3);
+
+        assert_tile_eq(&tile, &expected);
+    }
+
+    #[test]
+    fn synthetic_ndpi_subregion_fastpath_keeps_odd_ceil_edge_pixels() {
+        let reader = build_synthetic_ndpi_reader(5, 5, &[(3, 3, 2)]);
+        let tile = read_synthetic_ndpi_region(&reader, 2, 2, 1, 1);
+        let expected = expected_synthetic_ndpi_region(&reader, 2, 2, 2, 1, 1);
+
+        assert_tile_eq(&tile, &expected);
+    }
+
+    #[test]
+    fn synthetic_ndpi_subregion_fastpath_respects_cropped_synthetic_dimensions() {
+        let reader = build_synthetic_ndpi_reader(5, 5, &[(2, 2, 2)]);
+        let tile = read_synthetic_ndpi_region(&reader, 1, 1, 1, 1);
+        let expected = expected_synthetic_ndpi_region(&reader, 2, 1, 1, 1, 1);
+
+        assert_tile_eq(&tile, &expected);
+    }
+
+    #[test]
+    fn synthetic_ndpi_subregion_fastpath_does_not_prime_deepest_synthetic_level() {
+        let reader = build_synthetic_ndpi_reader(8, 8, &[(3, 3, 2), (2, 2, 4)]);
+        let tile = read_synthetic_ndpi_region(&reader, 1, 1, 1, 1);
+        let expected = expected_synthetic_ndpi_region(&reader, 2, 1, 1, 1, 1);
+
+        assert_tile_eq(&tile, &expected);
+        assert_eq!(
+            reader.synthetic_level_cache.lock().unwrap().current_bytes,
+            0,
+            "ROI reads must not materialize the requested synthetic level"
+        );
+        assert_eq!(
+            reader.synthetic_region_cache.lock().unwrap().current_bytes,
+            0,
+            "ROI reads must not prime unrelated full synthetic levels"
+        );
+    }
+
+    #[test]
+    fn synthetic_ndpi_subregion_fastpath_matches_factor_four_repeated_box_edges() {
+        let reader = build_synthetic_ndpi_reader(9, 7, &[(3, 2, 4)]);
+        let tile = read_synthetic_ndpi_region(&reader, 1, 1, 2, 1);
+        let expected = expected_synthetic_ndpi_region(&reader, 4, 1, 1, 2, 1);
+
+        assert_tile_eq(&tile, &expected);
     }
 
     #[test]
@@ -6206,6 +7067,97 @@ mod tests {
             (259u16, 3u16, 1u32, short_in_u32(1)),
             (262u16, 3u16, 1u32, short_in_u32(1)),
             (277u16, 3u16, 1u32, short_in_u32(1)),
+            (322u16, 4u16, 1u32, le_u32(tile_width)),
+            (323u16, 4u16, 1u32, le_u32(tile_height)),
+            (
+                324u16,
+                4u16,
+                tile_offsets.len() as u32,
+                tile_offsets_array_offset
+                    .map(le_u32)
+                    .unwrap_or_else(|| le_u32(tile_offsets[0])),
+            ),
+            (
+                325u16,
+                4u16,
+                tile_byte_counts.len() as u32,
+                tile_byte_counts_array_offset
+                    .map(le_u32)
+                    .unwrap_or_else(|| le_u32(tile_byte_counts[0])),
+            ),
+        ];
+        tags.sort_by_key(|tag| tag.0);
+
+        buf.extend_from_slice(&le_u16(tags.len() as u16));
+        for (tag, typ, count, value) in &tags {
+            buf.extend_from_slice(&le_u16(*tag));
+            buf.extend_from_slice(&le_u16(*typ));
+            buf.extend_from_slice(&le_u32(*count));
+            buf.extend_from_slice(value);
+        }
+        buf.extend_from_slice(&le_u32(0));
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&buf).unwrap();
+        file.flush().unwrap();
+        file
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_tiled_encoded_tiff(
+        width: u32,
+        height: u32,
+        tile_width: u32,
+        tile_height: u32,
+        tiles: &[Vec<u8>],
+        compression_tag: u16,
+        samples_per_pixel: u16,
+        photometric: u16,
+    ) -> NamedTempFile {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"II");
+        buf.extend_from_slice(&le_u16(42));
+        let first_ifd_pos = buf.len();
+        buf.extend_from_slice(&le_u32(0));
+
+        let mut tile_offsets = Vec::with_capacity(tiles.len());
+        let mut tile_byte_counts = Vec::with_capacity(tiles.len());
+        for tile in tiles {
+            tile_offsets.push(buf.len() as u32);
+            tile_byte_counts.push(tile.len() as u32);
+            buf.extend_from_slice(tile);
+        }
+
+        let tile_offsets_array_offset = if tile_offsets.len() > 1 {
+            let offset = buf.len() as u32;
+            for value in &tile_offsets {
+                buf.extend_from_slice(&le_u32(*value));
+            }
+            Some(offset)
+        } else {
+            None
+        };
+
+        let tile_byte_counts_array_offset = if tile_byte_counts.len() > 1 {
+            let offset = buf.len() as u32;
+            for value in &tile_byte_counts {
+                buf.extend_from_slice(&le_u32(*value));
+            }
+            Some(offset)
+        } else {
+            None
+        };
+
+        let ifd_offset = buf.len() as u32;
+        buf[first_ifd_pos..first_ifd_pos + 4].copy_from_slice(&le_u32(ifd_offset));
+
+        let mut tags = vec![
+            (256u16, 4u16, 1u32, le_u32(width)),
+            (257u16, 4u16, 1u32, le_u32(height)),
+            (258u16, 3u16, 1u32, short_in_u32(8)),
+            (259u16, 3u16, 1u32, short_in_u32(compression_tag)),
+            (262u16, 3u16, 1u32, short_in_u32(photometric)),
+            (277u16, 3u16, 1u32, short_in_u32(samples_per_pixel)),
             (322u16, 4u16, 1u32, le_u32(tile_width)),
             (323u16, 4u16, 1u32, le_u32(tile_height)),
             (
@@ -6647,6 +7599,78 @@ mod tests {
         TiffPixelReader::new(container, layout)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn build_tiled_encoded_reader(
+        width: u32,
+        height: u32,
+        tile_width: u32,
+        tile_height: u32,
+        tiles: &[Vec<u8>],
+        compression: Compression,
+        compression_tag: u16,
+        samples_per_pixel: u16,
+        photometric: u16,
+    ) -> TiffPixelReader {
+        let file = build_tiled_encoded_tiff(
+            width,
+            height,
+            tile_width,
+            tile_height,
+            tiles,
+            compression_tag,
+            samples_per_pixel,
+            photometric,
+        );
+        let container = Arc::new(TiffContainer::open(file.path()).unwrap());
+        let ifd_id = *container.top_ifds().first().unwrap();
+        let level = Level {
+            dimensions: (u64::from(width), u64::from(height)),
+            downsample: 1.0,
+            tile_layout: TileLayout::Regular {
+                tile_width,
+                tile_height,
+                tiles_across: u64::from(width.div_ceil(tile_width)),
+                tiles_down: u64::from(height.div_ceil(tile_height)),
+            },
+        };
+        let layout = DatasetLayout {
+            dataset: Dataset {
+                id: DatasetId(33),
+                scenes: vec![Scene {
+                    id: "s0".into(),
+                    name: None,
+                    series: vec![Series {
+                        id: "ser0".into(),
+                        axes: AxesShape::default(),
+                        levels: vec![level],
+                        sample_type: SampleType::Uint8,
+                        channels: vec![],
+                    }],
+                }],
+                associated_images: HashMap::new(),
+                properties: Properties::new(),
+                icc_profiles: HashMap::new(),
+            },
+            tile_sources: HashMap::from([(
+                TileSourceKey {
+                    scene: 0,
+                    series: 0,
+                    level: 0,
+                    z: 0,
+                    c: 0,
+                    t: 0,
+                },
+                TileSource::TiledIfd {
+                    ifd_id,
+                    jpeg_tables: None,
+                    compression,
+                },
+            )]),
+            associated_sources: HashMap::new(),
+        };
+        TiffPixelReader::new(container, layout)
+    }
+
     fn build_tiled_jpeg_tiff_with_tables(
         width: u32,
         height: u32,
@@ -7046,8 +8070,87 @@ mod tests {
     }
 
     #[test]
-    fn raw_compressed_tile_rejects_ndpi_restart_tiles_for_passthrough() {
+    fn raw_compressed_tile_returns_tiled_jp2k_rgb_byte_identical() {
+        let codestream = include_bytes!("../../../tests/fixtures/jp2k/rgb_nomct.j2k").to_vec();
+        let expected =
+            load_fixture_rgb(include_bytes!("../../../tests/fixtures/jp2k/rgb_nomct.ppm"));
+        let reader = build_tiled_encoded_reader(
+            expected.width(),
+            expected.height(),
+            expected.width(),
+            expected.height(),
+            std::slice::from_ref(&codestream),
+            Compression::Jp2kRgb,
+            33004,
+            3,
+            2,
+        );
+
+        let raw = reader
+            .read_raw_compressed_tile(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 0,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .unwrap();
+
+        assert_eq!(raw.compression, Compression::Jp2kRgb);
+        assert_eq!(
+            (raw.width, raw.height),
+            (expected.width(), expected.height())
+        );
+        assert_eq!(raw.bits_allocated, 8);
+        assert_eq!(raw.samples_per_pixel, 3);
+        assert_eq!(
+            raw.photometric_interpretation,
+            EncodedTilePhotometricInterpretation::Rgb
+        );
+        assert_eq!(raw.data, codestream);
+    }
+
+    #[test]
+    fn raw_compressed_tile_returns_standalone_ndpi_restart_jpeg() {
         let (reader, _) = build_test_ndpi_reader_for_strip_cache(128, 16, 1);
+
+        let raw = reader
+            .read_raw_compressed_tile(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 1,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .unwrap();
+
+        assert_eq!(raw.compression, Compression::Jpeg);
+        assert_eq!((raw.width, raw.height), (128, 16));
+        assert_eq!(raw.bits_allocated, 8);
+        assert_eq!(raw.samples_per_pixel, 3);
+        assert!(raw.data.starts_with(&[0xFF, 0xD8]));
+        assert!(raw.data.ends_with(&[0xFF, 0xD9]));
+        assert!(raw.data.windows(2).any(|bytes| bytes == [0xFF, 0xC0]));
+        assert!(raw.data.windows(2).any(|bytes| bytes == [0xFF, 0xDA]));
+
+        let decoded = decode_jpeg_rgb_with_size_override(
+            &raw.data,
+            None,
+            raw.width,
+            raw.height,
+            None,
+            None,
+            SigninumColorTransform::Auto,
+        )
+        .expect("decode raw NDPI JPEG tile");
+        assert_eq!((decoded.width, decoded.height), (128, 16));
+    }
+
+    #[test]
+    fn raw_compressed_tile_rejects_ndpi_restart_segments_that_cross_rows() {
+        let (reader, _) = build_test_ndpi_reader_for_strip_cache(130, 16, 2);
 
         let err = reader
             .read_raw_compressed_tile(&TileRequest {
@@ -7061,8 +8164,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("NDPI JPEG passthrough"),
-            "got: {err}"
+            err.to_string().contains("align to image rows"),
+            "unexpected error: {err}"
         );
     }
 
