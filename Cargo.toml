@@ -130,12 +130,3 @@ path = "src/bin/svcache.rs"
 [workspace]
 members = [".", "xtask"]
 resolver = "2"
-
-[patch.crates-io]
-signinum-core = { git = "https://github.com/jcwal1516/signinum.git", rev = "bc31845f83f71f21675da6c1dc75efde317a9a17" }
-signinum-jpeg = { git = "https://github.com/jcwal1516/signinum.git", rev = "bc31845f83f71f21675da6c1dc75efde317a9a17" }
-signinum-jpeg-metal = { git = "https://github.com/jcwal1516/signinum.git", rev = "bc31845f83f71f21675da6c1dc75efde317a9a17" }
-signinum-j2k = { git = "https://github.com/jcwal1516/signinum.git", rev = "bc31845f83f71f21675da6c1dc75efde317a9a17" }
-signinum-j2k-metal = { git = "https://github.com/jcwal1516/signinum.git", rev = "bc31845f83f71f21675da6c1dc75efde317a9a17" }
-signinum-j2k-native = { git = "https://github.com/jcwal1516/signinum.git", rev = "bc31845f83f71f21675da6c1dc75efde317a9a17" }
-signinum-tilecodec = { git = "https://github.com/jcwal1516/signinum.git", rev = "bc31845f83f71f21675da6c1dc75efde317a9a17" }
