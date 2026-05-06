@@ -78,7 +78,10 @@ impl FormatProbe for TiffFamilyBackend {
         // This lets other backends in the registry try their probes.
         let container = match TiffContainer::open(path) {
             Ok(c) => c,
-            Err(_) => {
+            Err(err) => {
+                if has_extension(path, "ndpi") {
+                    return Err(err.into_wsi_error(path));
+                }
                 return Ok(ProbeResult {
                     detected: false,
                     vendor: String::new(),
@@ -109,6 +112,12 @@ impl FormatProbe for TiffFamilyBackend {
             })
         }
     }
+}
+
+fn has_extension(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(expected))
 }
 
 impl DatasetReader for TiffFamilyBackend {
@@ -293,6 +302,26 @@ mod tests {
         // This lets other backends in the registry try their probes.
         let probe_result = result.unwrap();
         assert!(!probe_result.detected);
+    }
+
+    #[test]
+    fn probe_reports_malformed_ndpi_instead_of_hiding_parse_error() {
+        let mut file = tempfile::Builder::new().suffix(".ndpi").tempfile().unwrap();
+        file.write_all(b"II").unwrap();
+        file.write_all(&42u16.to_le_bytes()).unwrap();
+        file.write_all(&1024u32.to_le_bytes()).unwrap();
+        file.flush().unwrap();
+
+        let backend = TiffFamilyBackend::new();
+        let err = backend
+            .probe(file.path())
+            .expect_err("malformed .ndpi should surface parser error");
+
+        assert!(
+            err.to_string().contains("first IFD offset")
+                || err.to_string().contains("Error reading TIFF"),
+            "got: {err}"
+        );
     }
 
     #[test]

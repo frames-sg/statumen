@@ -1139,6 +1139,14 @@ impl TileOutputPreference {
         }
     }
 
+    /// Require device output and explicitly allow compressed source tile device decode.
+    pub fn require_device_auto_with_compressed_decode() -> Self {
+        Self::RequireDevice {
+            backend: OutputBackendRequest::Auto,
+            context: DeviceOutputContext::none().with_compressed_device_decode(),
+        }
+    }
+
     #[cfg(feature = "metal")]
     pub fn prefer_device_auto_with_metal(
         sessions: crate::output::metal::MetalBackendSessions,
@@ -1154,6 +1162,16 @@ impl TileOutputPreference {
         sessions: crate::output::metal::MetalBackendSessions,
     ) -> Self {
         Self::PreferDevice {
+            backend: OutputBackendRequest::Auto,
+            context: DeviceOutputContext::with_metal(sessions).with_compressed_device_decode(),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn require_device_auto_with_metal_and_compressed_decode(
+        sessions: crate::output::metal::MetalBackendSessions,
+    ) -> Self {
+        Self::RequireDevice {
             backend: OutputBackendRequest::Auto,
             context: DeviceOutputContext::with_metal(sessions).with_compressed_device_decode(),
         }
@@ -1335,6 +1353,13 @@ mod tests {
         assert!(
             TileOutputPreference::prefer_device_auto_with_compressed_decode()
                 .compressed_device_decode_enabled()
+        );
+        assert!(
+            TileOutputPreference::require_device_auto_with_compressed_decode()
+                .compressed_device_decode_enabled()
+        );
+        assert!(
+            TileOutputPreference::require_device_auto_with_compressed_decode().requires_device()
         );
     }
 
