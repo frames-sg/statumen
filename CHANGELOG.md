@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-05-06
+
+### Changed
+
+- Raised the Metal JPEG adapter dependency to `signinum-jpeg-metal` 0.2.2 so
+  strict device-decode requests preserve resident Metal output for fast 4:4:4
+  JPEG tiles.
+
+## [0.1.4] - 2026-05-06
+
+### Added
+
+- Added a required compressed-device tile output preference so downstream
+  callers can reject CPU decode fallback when they need resident device pixels.
+
+## [0.1.3] - 2026-05-05
+
+### Fixed
+
+- Malformed `.ndpi` files now preserve TIFF parser errors during probe
+  instead of being reported as a generic unsupported format.
+- NDPI files whose first IFD offset points beyond the file length now
+  report a truncation-oriented structure error.
+
 ## [0.1.2] - 2026-05-05
 
 ### Added
@@ -54,6 +78,9 @@ Initial public release on crates.io.
 - Bench harness binaries (`wsi_bench`, `openslide_bench`,
   `bench_driver`, `release_gate`) gated behind cargo features.
 
-[Unreleased]: https://github.com/jcwal1516/statumen/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/jcwal1516/statumen/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/jcwal1516/statumen/compare/v0.1.4...v0.1.5
+[0.1.4]: https://github.com/jcwal1516/statumen/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/jcwal1516/statumen/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/jcwal1516/statumen/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/jcwal1516/statumen/releases/tag/v0.1.1
