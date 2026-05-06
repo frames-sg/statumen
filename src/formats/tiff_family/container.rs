@@ -1212,6 +1212,11 @@ fn repair_ndpi_first_ifd_offset(
             None => break,
         };
     }
+    if raw_offset >= file_len {
+        return Err(TiffParseError::Structure(format!(
+            "NDPI first IFD offset {raw_offset} is outside file length {file_len}; file may be truncated"
+        )));
+    }
     Ok(raw_offset)
 }
 
