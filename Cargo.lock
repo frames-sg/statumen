@@ -1274,8 +1274,6 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "signinum-core"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a961ac531dbd99a10ccc886964c5a349abc78d1eee5259002f5a1db7ebd4c521"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -1283,8 +1281,6 @@ dependencies = [
 [[package]]
 name = "signinum-j2k"
 version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b65c90231616534319c013024ca88da9c9f38686ec8beb953b85e6582351a594"
 dependencies = [
  "signinum-core",
  "signinum-j2k-native",
@@ -1294,10 +1290,10 @@ dependencies = [
 [[package]]
 name = "signinum-j2k-metal"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3c0d1373d964198f2dc6635f86a8f0e94a77f58791d5af700b40fa812ce0dd2"
 dependencies = [
+ "libc",
  "metal",
+ "rayon",
  "signinum-core",
  "signinum-j2k",
  "signinum-j2k-native",
@@ -1307,20 +1303,18 @@ dependencies = [
 [[package]]
 name = "signinum-j2k-native"
 version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "257f4362cf38254bf2cdcd297ab8674417c1324cbb95fdd7c85e8aefcb934ff8"
 dependencies = [
  "fearless_simd",
  "libm",
+ "rayon",
 ]
 
 [[package]]
 name = "signinum-jpeg"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98f827bb18671b7ac6ba30be371a30d13e3730e412a495133f5d58a4e129f11f"
 dependencies = [
  "memchr",
+ "rayon",
  "signinum-core",
  "thiserror 2.0.18",
 ]
@@ -1328,8 +1322,6 @@ dependencies = [
 [[package]]
 name = "signinum-jpeg-metal"
 version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a623f62d4617ac94bb588e12a6d4c7ae69384557d5a40123e79bec110d02a1ea"
 dependencies = [
  "metal",
  "signinum-core",
@@ -1340,8 +1332,6 @@ dependencies = [
 [[package]]
 name = "signinum-tilecodec"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6e7a1207e94da85d6dc4354c330a8829da49d837a69455f4a479f7d3ead2812"
 dependencies = [
  "flate2",
  "signinum-core",

@@ -1335,7 +1335,7 @@ fn read_basic_offset_table_at(
     offset: u64,
     len: u32,
 ) -> Result<Vec<u32>, WsiError> {
-    if len % 4 != 0 {
+    if !len.is_multiple_of(4) {
         return Err(invalid_slide(
             path,
             format!("DICOM basic offset table has non-u32 length {len}"),

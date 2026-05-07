@@ -250,7 +250,7 @@ fn read_overview_region(path: &Path) -> Result<RgbaRegion, String> {
         .enumerate()
         .rev()
         .find(|(_, level)| level.dimensions.0 <= 2048 && level.dimensions.1 <= 2048)
-        .or_else(|| series.levels.iter().enumerate().last())
+        .or_else(|| series.levels.iter().enumerate().next_back())
         .map(|(idx, level)| (idx as u32, level.dimensions))
         .ok_or_else(|| "slide has no levels".to_string())?;
     let width = u32::try_from(dimensions.0.min(1024)).map_err(|_| "overview width overflow")?;

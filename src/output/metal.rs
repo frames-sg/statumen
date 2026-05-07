@@ -8,6 +8,7 @@ pub struct MetalBackendSessions {
     pub(crate) jpeg: Arc<signinum_jpeg_metal::MetalBackendSession>,
     pub(crate) j2k: Arc<signinum_j2k_metal::MetalBackendSession>,
     ycbcr_to_rgb8: Arc<Mutex<Option<Arc<YcbcrToRgb8Converter>>>>,
+    private_jpeg_decode: bool,
 }
 
 impl MetalBackendSessions {
@@ -19,11 +20,21 @@ impl MetalBackendSessions {
             jpeg: Arc::new(jpeg),
             j2k: Arc::new(j2k),
             ycbcr_to_rgb8: Arc::new(Mutex::new(None)),
+            private_jpeg_decode: false,
         }
+    }
+
+    pub fn with_private_jpeg_decode(mut self) -> Self {
+        self.private_jpeg_decode = true;
+        self
     }
 
     pub(crate) fn jpeg(&self) -> &signinum_jpeg_metal::MetalBackendSession {
         &self.jpeg
+    }
+
+    pub(crate) fn private_jpeg_decode(&self) -> bool {
+        self.private_jpeg_decode
     }
 
     pub(crate) fn j2k(&self) -> &signinum_j2k_metal::MetalBackendSession {
@@ -86,6 +97,19 @@ impl MetalDeviceTile {
                 byte_offset,
             },
         })
+    }
+
+    pub(crate) fn from_private_jpeg(tile: signinum_jpeg_metal::ResidentPrivateJpegTile) -> Self {
+        Self {
+            width: tile.dimensions.0,
+            height: tile.dimensions.1,
+            pitch_bytes: tile.pitch_bytes,
+            format: tile.pixel_format,
+            storage: MetalDeviceStorage::Buffer {
+                buffer: tile.buffer,
+                byte_offset: tile.byte_offset,
+            },
+        }
     }
 
     pub(crate) fn from_j2k(surface: signinum_j2k_metal::Surface) -> Option<Self> {
