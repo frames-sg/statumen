@@ -83,6 +83,15 @@ toml = "0.8"
 libloading = "0.8"
 signinum-j2k-native = "0.3"
 
+[patch.crates-io]
+signinum-core = { path = "../signinum/crates/signinum-core" }
+signinum-j2k = { path = "../signinum/crates/signinum-j2k" }
+signinum-j2k-metal = { path = "../signinum/crates/signinum-j2k-metal" }
+signinum-j2k-native = { path = "../signinum/crates/signinum-j2k-native" }
+signinum-jpeg = { path = "../signinum/crates/signinum-jpeg" }
+signinum-jpeg-metal = { path = "../signinum/crates/signinum-jpeg-metal" }
+signinum-tilecodec = { path = "../signinum/crates/signinum-tilecodec" }
+
 [build-dependencies]
 pkg-config = "0.3"
 

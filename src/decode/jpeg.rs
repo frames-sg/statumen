@@ -287,6 +287,21 @@ fn decode_one_jpeg_pixels(
     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
     let mut decoder = signinum_jpeg_metal::Decoder::from_view(view)
         .map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    if metal_sessions.private_jpeg_decode() {
+        match decoder.decode_private_rgb8_tile_with_session(metal_sessions.jpeg()) {
+            Ok(tile) => {
+                return Ok(TilePixels::Device(DeviceTile::Metal(
+                    crate::output::metal::MetalDeviceTile::from_private_jpeg(tile),
+                )));
+            }
+            Err(err) if require_device => {
+                return Err(WsiError::Unsupported {
+                    reason: format!("JPEG private Metal decode failed: {err}"),
+                });
+            }
+            Err(_) => {}
+        }
+    }
     let surface = decoder
         .decode_to_device_with_session(SigninumPixelFormat::Rgb8, metal_sessions.jpeg())
         .map_err(|err| WsiError::Jpeg(format!("signinum JPEG device decode failed: {err}")))?;
@@ -939,6 +954,48 @@ mod tests {
         assert_eq!(decoded.width, 4);
         assert_eq!(decoded.height, 4);
         assert_eq!(decoded.pixels.len(), 4 * 4 * 3);
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn private_metal_jpeg_decode_returns_private_device_tile() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let sessions = crate::output::metal::MetalBackendSessions::new(
+            signinum_jpeg_metal::MetalBackendSession::new(device.clone()),
+            signinum_j2k_metal::MetalBackendSession::new(device),
+        )
+        .with_private_jpeg_decode();
+        let mut rgb = image::RgbImage::new(16, 16);
+        for (idx, pixel) in rgb.pixels_mut().enumerate() {
+            *pixel = image::Rgb([
+                ((idx * 17) & 0xff) as u8,
+                ((idx * 31 + 9) & 0xff) as u8,
+                ((idx * 7 + 3) & 0xff) as u8,
+            ]);
+        }
+        let jpeg_data = encode_test_jpeg(&rgb);
+        let job = JpegDecodeJob {
+            data: Cow::Borrowed(jpeg_data.as_slice()),
+            tables: None,
+            expected_width: 16,
+            expected_height: 16,
+            color_transform: SigninumColorTransform::Auto,
+            force_dimensions: false,
+            requested_size: None,
+        };
+
+        let pixels =
+            decode_one_jpeg_pixels(&job, SigninumBackendRequest::Metal, true, Some(&sessions))
+                .expect("private JPEG Metal tile");
+        let TilePixels::Device(DeviceTile::Metal(tile)) = pixels else {
+            panic!("expected private Metal tile");
+        };
+        let crate::output::metal::MetalDeviceStorage::Buffer { buffer, .. } = tile.storage;
+        assert_eq!(buffer.storage_mode(), metal::MTLStorageMode::Private);
+        assert_eq!(tile.width, 16);
+        assert_eq!(tile.height, 16);
     }
 
     #[test]
