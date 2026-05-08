@@ -5168,6 +5168,23 @@ impl SlideReader for TiffPixelReader {
         &self.layout.dataset
     }
 
+    fn tile_codec_kind(&self, req: &TileRequest) -> TileCodecKind {
+        match self.tile_source_for(req) {
+            Ok(TileSource::NdpiJpeg { .. } | TileSource::NdpiFullDecode { .. }) => {
+                TileCodecKind::Jpeg
+            }
+            Ok(TileSource::TiledIfd { compression, .. }) => {
+                TileCodecKind::from_compression(*compression)
+            }
+            Ok(TileSource::SyntheticDownsample { base_level, .. }) => {
+                let mut base_req = req.clone();
+                base_req.level = *base_level;
+                self.tile_codec_kind(&base_req)
+            }
+            Ok(_) | Err(_) => TileCodecKind::Other,
+        }
+    }
+
     fn level_source_kind(
         &self,
         scene: usize,
@@ -8578,6 +8595,37 @@ mod tests {
             assert_eq!((batched.width, batched.height), (8, 8));
             assert_eq!(batched.data.as_u8(), sequential.data.as_u8());
         }
+    }
+
+    #[test]
+    fn tile_codec_kind_classifies_tiff_jpeg_and_jp2k_sources() {
+        let jpeg_tiles = [encode_solid_rgb_jpeg(8, 8, [200, 10, 10])];
+        let jpeg_reader = build_tiled_jpeg_reader(8, 8, 8, 8, &jpeg_tiles);
+        let req = TileRequest {
+            scene: 0,
+            series: 0,
+            level: 0,
+            plane: PlaneSelection::default(),
+            col: 0,
+            row: 0,
+        };
+        assert_eq!(jpeg_reader.tile_codec_kind(&req), TileCodecKind::Jpeg);
+
+        let codestream = include_bytes!("../../../tests/fixtures/jp2k/rgb_nomct.j2k").to_vec();
+        let expected =
+            load_fixture_rgb(include_bytes!("../../../tests/fixtures/jp2k/rgb_nomct.ppm"));
+        let jp2k_reader = build_tiled_encoded_reader(
+            expected.width(),
+            expected.height(),
+            expected.width(),
+            expected.height(),
+            &[codestream],
+            Compression::Jp2kRgb,
+            33004,
+            3,
+            2,
+        );
+        assert_eq!(jp2k_reader.tile_codec_kind(&req), TileCodecKind::Jp2k);
     }
 
     #[cfg(feature = "metal")]

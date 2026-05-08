@@ -1311,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "signinum-jpeg"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "memchr",
  "rayon",
@@ -1321,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "signinum-jpeg-metal"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "metal",
  "signinum-core",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "statumen"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "base64",
  "byteorder",

@@ -27,6 +27,6 @@ pub use core::types::{
     CpuTileLayout, Dataset, DatasetId, DeviceTile, DisplayWindow,
     EncodedTilePhotometricInterpretation, Level, LevelIdx, LevelSourceKind, OutputBackendRequest,
     PlaneIdx, PlaneSelection, RawCompressedTile, RegionRequest, SampleType, Scene, SceneId, Series,
-    SeriesId, TileEntry, TileHit, TileLayout, TileOutputPreference, TilePixels, TileRequest,
-    TileViewRequest,
+    SeriesId, TileCodecKind, TileEntry, TileHit, TileLayout, TileOutputPreference, TilePixels,
+    TileRequest, TileViewRequest,
 };

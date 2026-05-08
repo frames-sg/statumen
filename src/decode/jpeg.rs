@@ -14,9 +14,11 @@ use signinum_core::{
 #[cfg(feature = "metal")]
 use signinum_jpeg::JpegView as SigninumJpegView;
 use signinum_jpeg::{
+    decode_tiles_into_with_options, decode_tiles_scaled_into_with_options,
     ColorTransform as SigninumColorTransform, DecodeOptions as SigninumDecodeOptions,
     Decoder as SigninumJpegDecoder, Downscale as SigninumDownscale,
-    PixelFormat as SigninumPixelFormat,
+    PixelFormat as SigninumPixelFormat, TileBatchOptions as SigninumTileBatchOptions,
+    TileDecodeJob as SigninumTileDecodeJob, TileScaledDecodeJob as SigninumTileScaledDecodeJob,
 };
 #[cfg(feature = "metal")]
 use signinum_jpeg_metal::SurfaceResidency as SigninumJpegSurfaceResidency;
@@ -63,6 +65,15 @@ struct ScaledJpegDecode<'a> {
     requested_height: u32,
     force_dimensions: bool,
     color_transform: SigninumColorTransform,
+}
+
+struct PreparedBatchJpeg<'a> {
+    input: Cow<'a, [u8]>,
+    output_width: u32,
+    output_height: u32,
+    output_len: usize,
+    stride: usize,
+    scale: SigninumDownscale,
 }
 
 /// Decode JPEG data to premultiplied RGBA (alpha=255 for all decoded pixels).
@@ -173,10 +184,152 @@ pub(crate) fn decode_jpeg_rgb_with_size_override(
 }
 
 pub(crate) fn decode_batch_jpeg<'a>(jobs: &[JpegDecodeJob<'a>]) -> Vec<Result<CpuTile, WsiError>> {
+    if jobs.len() > 1 {
+        if let Some(results) = try_decode_batch_jpeg_with_signinum(jobs) {
+            return results;
+        }
+    }
     if jobs.len() <= 1 {
         return jobs.iter().map(decode_one_jpeg_job).collect();
     }
     jobs.par_iter().map(decode_one_jpeg_job).collect()
+}
+
+fn try_decode_batch_jpeg_with_signinum<'a>(
+    jobs: &[JpegDecodeJob<'a>],
+) -> Option<Vec<Result<CpuTile, WsiError>>> {
+    let first = jobs.first()?;
+    let color_transform = first.color_transform;
+    if jobs
+        .iter()
+        .any(|job| job.color_transform != color_transform)
+    {
+        return None;
+    }
+
+    let mut prepared = Vec::with_capacity(jobs.len());
+    let mut needs_scaled_api = false;
+    for job in jobs {
+        let prepared_job = prepare_signinum_batch_jpeg_job(job)?;
+        needs_scaled_api |= prepared_job.scale != SigninumDownscale::None;
+        prepared.push(prepared_job);
+    }
+
+    let decode_options = SigninumDecodeOptions::default().with_color_transform(color_transform);
+    let mut outputs = prepared
+        .iter()
+        .map(|job| vec![0u8; job.output_len])
+        .collect::<Vec<_>>();
+    let batch_options = SigninumTileBatchOptions::default();
+
+    if needs_scaled_api {
+        let mut batch_jobs = prepared
+            .iter()
+            .zip(outputs.iter_mut())
+            .map(|(job, output)| SigninumTileScaledDecodeJob {
+                input: job.input.as_ref(),
+                out: output.as_mut_slice(),
+                stride: job.stride,
+                scale: job.scale,
+            })
+            .collect::<Vec<_>>();
+        decode_tiles_scaled_into_with_options(
+            &mut batch_jobs,
+            SigninumPixelFormat::Rgb8,
+            decode_options,
+            batch_options,
+        )
+        .ok()?;
+    } else {
+        let mut batch_jobs = prepared
+            .iter()
+            .zip(outputs.iter_mut())
+            .map(|(job, output)| SigninumTileDecodeJob {
+                input: job.input.as_ref(),
+                out: output.as_mut_slice(),
+                stride: job.stride,
+            })
+            .collect::<Vec<_>>();
+        decode_tiles_into_with_options(
+            &mut batch_jobs,
+            SigninumPixelFormat::Rgb8,
+            decode_options,
+            batch_options,
+        )
+        .ok()?;
+    }
+
+    Some(
+        prepared
+            .into_iter()
+            .zip(outputs)
+            .map(|(job, pixels)| {
+                CpuTile::from_u8_interleaved(
+                    job.output_width,
+                    job.output_height,
+                    3,
+                    ColorSpace::Rgb,
+                    pixels,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn prepare_signinum_batch_jpeg_job<'j, 'a>(
+    job: &'j JpegDecodeJob<'a>,
+) -> Option<PreparedBatchJpeg<'j>> {
+    if job.expected_width == 0 || job.expected_height == 0 {
+        return None;
+    }
+    if job.force_dimensions
+        && (job.expected_width > u16::MAX as u32 || job.expected_height > u16::MAX as u32)
+    {
+        return None;
+    }
+
+    let (scale, output_width, output_height) = match job.requested_size {
+        Some((requested_width, requested_height)) => {
+            if requested_width == 0 || requested_height == 0 {
+                return None;
+            }
+            let scale = signinum_downscale_for_dimensions(
+                job.expected_width,
+                job.expected_height,
+                requested_width,
+                requested_height,
+            )?;
+            (scale, requested_width, requested_height)
+        }
+        None => (
+            SigninumDownscale::None,
+            job.expected_width,
+            job.expected_height,
+        ),
+    };
+
+    let input = prepare_jpeg_input(
+        job.data.as_ref(),
+        job.tables.as_deref(),
+        job.expected_width,
+        job.expected_height,
+        job.force_dimensions,
+    );
+    let encoded_dimensions = inspect_signinum_jpeg_output_size(input.as_ref()).ok()?;
+    if encoded_dimensions != (job.expected_width, job.expected_height) {
+        return None;
+    }
+    let output_len = checked_jpeg_rgb_len(output_width, output_height).ok()?;
+    let stride = (output_width as usize).checked_mul(3)?;
+
+    Some(PreparedBatchJpeg {
+        input,
+        output_width,
+        output_height,
+        output_len,
+        stride,
+        scale,
+    })
 }
 
 #[cfg(feature = "metal")]
@@ -736,10 +889,19 @@ fn ensure_jpeg_eoi<'a>(input: &'a [u8]) -> Cow<'a, [u8]> {
 }
 
 fn validate_signinum_jpeg_output_size(input: &[u8]) -> Result<(), WsiError> {
+    inspect_signinum_jpeg_output_size(input).map(|_| ())
+}
+
+fn inspect_signinum_jpeg_output_size(input: &[u8]) -> Result<(u32, u32), WsiError> {
     let info =
         SigninumJpegDecoder::inspect(input).map_err(|err| WsiError::Jpeg(err.to_string()))?;
-    let bytes = u64::from(info.dimensions.0)
-        .checked_mul(u64::from(info.dimensions.1))
+    let _ = checked_jpeg_rgb_len(info.dimensions.0, info.dimensions.1)?;
+    Ok(info.dimensions)
+}
+
+fn checked_jpeg_rgb_len(width: u32, height: u32) -> Result<usize, WsiError> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))
         .and_then(|pixels| pixels.checked_mul(3))
         .ok_or_else(|| WsiError::Jpeg("JPEG decode size overflow".into()))?;
     if bytes > MAX_JPEG_DECODE_BYTES {
@@ -747,7 +909,7 @@ fn validate_signinum_jpeg_output_size(input: &[u8]) -> Result<(), WsiError> {
             "JPEG decode size {bytes} bytes exceeds {MAX_JPEG_DECODE_BYTES} byte limit"
         )));
     }
-    Ok(())
+    usize::try_from(bytes).map_err(|_| WsiError::Jpeg("JPEG decode size overflow".into()))
 }
 
 fn crop_jpeg_rgb_to_expected(
@@ -1022,6 +1184,72 @@ mod tests {
         assert_eq!(decoded.width, 4);
         assert_eq!(decoded.height, 4);
         assert_eq!(decoded.pixels.len(), 4 * 4 * 3);
+    }
+
+    #[test]
+    fn signinum_batch_fast_path_matches_single_tile_for_forced_color_transform() {
+        let mut rgb = image::RgbImage::new(16, 16);
+        for (idx, pixel) in rgb.pixels_mut().enumerate() {
+            *pixel = image::Rgb([idx as u8, 100, 200]);
+        }
+        let jpeg_data = encode_test_jpeg(&rgb);
+        let jobs = (0..4)
+            .map(|_| JpegDecodeJob {
+                data: Cow::Borrowed(jpeg_data.as_slice()),
+                tables: None,
+                expected_width: 16,
+                expected_height: 16,
+                color_transform: SigninumColorTransform::ForceRgb,
+                force_dimensions: false,
+                requested_size: None,
+            })
+            .collect::<Vec<_>>();
+
+        let fast = try_decode_batch_jpeg_with_signinum(&jobs)
+            .expect("forced color transform should use signinum batch fast path");
+        let sequential = jobs.iter().map(decode_one_jpeg_job).collect::<Vec<_>>();
+
+        assert_eq!(fast.len(), sequential.len());
+        for (fast, sequential) in fast.into_iter().zip(sequential) {
+            let fast = fast.unwrap();
+            let sequential = sequential.unwrap();
+            assert_eq!(fast.width, sequential.width);
+            assert_eq!(fast.height, sequential.height);
+            assert_eq!(fast.data.as_u8(), sequential.data.as_u8());
+        }
+    }
+
+    #[test]
+    fn signinum_batch_fast_path_matches_single_tile_for_scaled_decode() {
+        let mut rgb = image::RgbImage::new(16, 16);
+        for (idx, pixel) in rgb.pixels_mut().enumerate() {
+            *pixel = image::Rgb([idx as u8, 100, 200]);
+        }
+        let jpeg_data = encode_test_jpeg(&rgb);
+        let jobs = (0..4)
+            .map(|_| JpegDecodeJob {
+                data: Cow::Borrowed(jpeg_data.as_slice()),
+                tables: None,
+                expected_width: 16,
+                expected_height: 16,
+                color_transform: SigninumColorTransform::ForceRgb,
+                force_dimensions: false,
+                requested_size: Some((4, 4)),
+            })
+            .collect::<Vec<_>>();
+
+        let fast = try_decode_batch_jpeg_with_signinum(&jobs)
+            .expect("scaled decode should use signinum batch fast path");
+        let sequential = jobs.iter().map(decode_one_jpeg_job).collect::<Vec<_>>();
+
+        assert_eq!(fast.len(), sequential.len());
+        for (fast, sequential) in fast.into_iter().zip(sequential) {
+            let fast = fast.unwrap();
+            let sequential = sequential.unwrap();
+            assert_eq!(fast.width, 4);
+            assert_eq!(fast.height, 4);
+            assert_eq!(fast.data.as_u8(), sequential.data.as_u8());
+        }
     }
 
     #[test]

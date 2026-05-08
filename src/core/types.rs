@@ -298,6 +298,25 @@ pub enum Compression {
     Other(u16),
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Hash)]
+pub enum TileCodecKind {
+    Jpeg,
+    Jp2k,
+    Htj2k,
+    #[default]
+    Other,
+}
+
+impl TileCodecKind {
+    pub fn from_compression(compression: Compression) -> Self {
+        match compression {
+            Compression::Jpeg => Self::Jpeg,
+            Compression::Jp2kRgb | Compression::Jp2kYcbcr => Self::Jp2k,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// Photometric interpretation for an encoded tile payload.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EncodedTilePhotometricInterpretation {

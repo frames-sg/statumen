@@ -129,6 +129,9 @@ impl<'a> SlideReadContext<'a> {
 /// ```
 pub trait SlideReader: Send + Sync {
     fn dataset(&self) -> &Dataset;
+    fn tile_codec_kind(&self, _req: &TileRequest) -> TileCodecKind {
+        TileCodecKind::Other
+    }
     fn level_source_kind(
         &self,
         scene: usize,
@@ -1149,6 +1152,10 @@ impl Slide {
         level: u32,
     ) -> Result<LevelSourceKind, WsiError> {
         self.source.level_source_kind(scene, series, level)
+    }
+
+    pub fn tile_codec_kind(&self, req: &TileRequest) -> TileCodecKind {
+        self.source.tile_codec_kind(req)
     }
 
     pub fn cached_tile_present(&self, req: &TileRequest) -> bool {

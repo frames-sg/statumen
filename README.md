@@ -129,6 +129,11 @@ treated as a minor-version change and is recorded in `CHANGELOG.md`.
 
 ## Performance
 
+CPU JPEG tile batches route through Signinum's scoped batch decoder by default
+when the jobs share the same TIFF/DICOM color transform and exact decoded tile
+dimensions. Mixed or irregular JPEG jobs fall back to the conservative
+per-tile path with the same output behavior.
+
 Optional Iris comparison is wired through `scripts/iris_bench.py` and the
 existing `bench_driver` workloads. Iris consumes pre-encoded `.iris` slides, so
 set `WSI_BENCH_INCLUDE_IRIS=1` plus either `WSI_IRIS_SLIDE_PATH=/path/file.iris`

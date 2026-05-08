@@ -1,6 +1,6 @@
 [package]
 name = "statumen"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 license = "Apache-2.0"
 description = "Statumen whole-slide image reader"
@@ -59,11 +59,11 @@ base64 = "0.22"
 flate2 = "1"
 tempfile = "3"
 zstd = "0.13"
-signinum-jpeg = "1.0.2"
+signinum-jpeg = "1.1"
 signinum-core = "1"
 signinum-tilecodec = "1"
 signinum-j2k = "1.1.2"
-signinum-jpeg-metal = { version = "0.2.3", optional = true }
+signinum-jpeg-metal = { version = "0.2.4", optional = true }
 signinum-j2k-metal = { version = "0.3.2", optional = true }
 metal = { version = "0.31", optional = true }
 dicom-core = "0.9"

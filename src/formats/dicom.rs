@@ -20,6 +20,8 @@ use crate::core::registry::{
     DatasetReader, FormatProbe, ProbeConfidence, ProbeResult, SlideReader,
 };
 use crate::core::types::*;
+#[cfg(feature = "metal")]
+use crate::decode::jp2k::decode_batch_jp2k_pixels;
 use crate::decode::jp2k::{decode_batch_jp2k, Jp2kDecodeJob};
 use crate::decode::jpeg::{decode_batch_jpeg, JpegDecodeJob};
 use crate::error::WsiError;
@@ -64,11 +66,23 @@ const JP2K_TRANSFER_SYNTAXES: &[&str] = &[
     HTJ2K_LOSSLESS_TRANSFER_SYNTAX,
     HTJ2K_LOSSLESS_RPCL_TRANSFER_SYNTAX,
 ];
+#[cfg(feature = "metal")]
+const DICOM_JP2K_DEVICE_DECODE_ENV: &str = "STATUMEN_JP2K_DEVICE_DECODE";
 
 fn is_encapsulated_transfer_syntax(uid: &str) -> bool {
     uid == JPEG_TRANSFER_SYNTAX
         || uid == RLE_TRANSFER_SYNTAX
         || JP2K_TRANSFER_SYNTAXES.contains(&uid)
+}
+
+#[cfg(feature = "metal")]
+fn dicom_jp2k_device_decode_enabled() -> bool {
+    std::env::var(DICOM_JP2K_DEVICE_DECODE_ENV).is_ok_and(|value| {
+        value.eq_ignore_ascii_case("1")
+            || value.eq_ignore_ascii_case("true")
+            || value.eq_ignore_ascii_case("yes")
+            || value.eq_ignore_ascii_case("on")
+    })
 }
 
 pub(crate) struct DicomBackend {
@@ -166,6 +180,14 @@ impl SlideReader for DicomReader {
         &self.slide.dataset
     }
 
+    fn tile_codec_kind(&self, req: &TileRequest) -> TileCodecKind {
+        self.slide
+            .levels
+            .get(req.level as usize)
+            .map(|level| level.tile_codec_kind(req))
+            .unwrap_or(TileCodecKind::Other)
+    }
+
     fn use_display_tile_cache(&self, _req: &TileViewRequest) -> bool {
         true
     }
@@ -175,16 +197,36 @@ impl SlideReader for DicomReader {
         reqs: &[TileRequest],
         output: TileOutputPreference,
     ) -> Result<Vec<TilePixels>, WsiError> {
-        let backend = (match output {
-            TileOutputPreference::Cpu { backend }
-            | TileOutputPreference::PreferDevice { backend, .. } => backend,
-            TileOutputPreference::RequireDevice { .. } => {
-                return Err(WsiError::Unsupported {
-                    reason: "RequireDevice not supported for DICOM in Phase 2".into(),
-                });
+        let backend = output.backend().to_signinum();
+
+        #[cfg(feature = "metal")]
+        if output.prefers_device() {
+            match self.read_tiles_jp2k_device_batch(reqs, &output, backend) {
+                Ok(Some(tiles)) => return Ok(tiles),
+                Ok(None) if output.requires_device() => {
+                    return Err(WsiError::Unsupported {
+                        reason: "device backend not available for DICOM tile batch".into(),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) if output.requires_device() => return Err(err),
+                Err(err) => {
+                    tracing::debug!(
+                        error = %err,
+                        fallback_to_cpu = true,
+                        fallback_reason = "dicom_jp2k_device_batch_failed",
+                        "DICOM JP2K device batch failed; retrying through CPU output"
+                    );
+                }
             }
-        })
-        .to_signinum();
+        }
+
+        if output.requires_device() {
+            return Err(WsiError::Unsupported {
+                reason: "RequireDevice not supported for DICOM CPU fallback".into(),
+            });
+        }
+
         reqs.iter()
             .map(|req| {
                 self.read_tile_with_backend(req, backend)
@@ -216,6 +258,199 @@ impl SlideReader for DicomReader {
             .get(name)
             .ok_or_else(|| WsiError::AssociatedImageNotFound(name.into()))?;
         image.read_associated(name)
+    }
+}
+
+#[cfg(feature = "metal")]
+struct DicomDeviceDecodeJob {
+    slot: usize,
+    image: Arc<DicomImage>,
+    frame_index: u32,
+}
+
+#[cfg(feature = "metal")]
+impl DicomReader {
+    fn read_tiles_jp2k_device_batch(
+        &self,
+        reqs: &[TileRequest],
+        output: &TileOutputPreference,
+        backend: BackendRequest,
+    ) -> Result<Option<Vec<TilePixels>>, WsiError> {
+        if reqs.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if !(output.compressed_device_decode_enabled() || dicom_jp2k_device_decode_enabled()) {
+            return Ok(None);
+        }
+        let Some(metal_sessions) = output.metal_sessions() else {
+            return Ok(None);
+        };
+
+        let mut results: Vec<Option<TilePixels>> = Vec::with_capacity(reqs.len());
+        results.resize_with(reqs.len(), || None);
+        let mut jobs = Vec::new();
+        let mut job_meta = Vec::new();
+        let mut saw_device_candidate = false;
+
+        for (slot, req) in reqs.iter().enumerate() {
+            let level =
+                self.slide
+                    .levels
+                    .get(req.level as usize)
+                    .ok_or(WsiError::LevelOutOfRange {
+                        level: req.level,
+                        count: self.slide.levels.len() as u32,
+                    })?;
+            if req.col < 0
+                || req.row < 0
+                || req.col >= level.tiles_across as i64
+                || req.row >= level.tiles_down as i64
+            {
+                return Err(WsiError::Unsupported {
+                    reason: format!(
+                        "tile ({},{}) out of range for DICOM device decode",
+                        req.col, req.row
+                    ),
+                });
+            }
+
+            let col = req.col as u32;
+            let row = req.row as u32;
+            let Some(image) = level.image_for_tile(col, row) else {
+                if output.requires_device() {
+                    return Err(WsiError::Unsupported {
+                        reason:
+                            "DICOM device batch cannot return CPU black tile for sparse missing tile"
+                                .into(),
+                    });
+                }
+                let (width, height) = level.actual_tile_dimensions(col, row);
+                results[slot] = Some(TilePixels::Cpu(black_sample_buffer(width, height)));
+                continue;
+            };
+            if !JP2K_TRANSFER_SYNTAXES.contains(&image.transfer_syntax_uid.as_str()) {
+                continue;
+            }
+            let Some(frame_index) = image.frame_index(col, row) else {
+                if output.requires_device() {
+                    return Err(WsiError::Unsupported {
+                        reason:
+                            "DICOM device batch cannot return CPU black tile for sparse missing tile"
+                                .into(),
+                    });
+                }
+                let (width, height) = level.actual_tile_dimensions(col, row);
+                results[slot] = Some(TilePixels::Cpu(black_sample_buffer(width, height)));
+                continue;
+            };
+            let (actual_width, actual_height) = level.actual_tile_dimensions(col, row);
+            if actual_width != image.tile_width || actual_height != image.tile_height {
+                continue;
+            }
+            if image.samples_per_pixel != 3 {
+                continue;
+            }
+
+            saw_device_candidate = true;
+            if !output.requires_device() {
+                if let Some(cached) = image.cached_decoded_frame(frame_index) {
+                    results[slot] = Some(TilePixels::Cpu(cached.as_ref().clone()));
+                    continue;
+                }
+            }
+
+            let bytes =
+                image.extract_encapsulated_frame(frame_index, req.level, req.col, req.row, true)?;
+            jobs.push(Jp2kDecodeJob {
+                data: Cow::Owned(bytes.as_ref().clone()),
+                expected_width: image.tile_width,
+                expected_height: image.tile_height,
+                rgb_color_space: !matches!(
+                    image.photometric_interpretation.as_str(),
+                    "YBR_ICT" | "YBR_RCT"
+                ),
+                backend,
+            });
+            job_meta.push(DicomDeviceDecodeJob {
+                slot,
+                image: image.clone(),
+                frame_index,
+            });
+        }
+
+        if jobs.is_empty() && !saw_device_candidate {
+            return Ok(None);
+        }
+        if jobs.is_empty() {
+            return results
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .map(Some)
+                .ok_or_else(|| WsiError::Unsupported {
+                    reason: "DICOM device batch had no decodable JP2K frames".into(),
+                });
+        }
+
+        let decoded =
+            decode_batch_jp2k_pixels(&jobs, output.requires_device(), Some(metal_sessions));
+        if decoded.len() != job_meta.len() {
+            return Err(WsiError::Jp2k(format!(
+                "DICOM JP2K device batch returned {} tiles for {} jobs",
+                decoded.len(),
+                job_meta.len()
+            )));
+        }
+
+        for (meta, decoded) in job_meta.into_iter().zip(decoded) {
+            let tile = decoded?;
+            if let TilePixels::Cpu(cpu) = &tile {
+                meta.image
+                    .cache_decoded_frame(meta.frame_index, Arc::new(cpu.clone()));
+            }
+            results[meta.slot] = Some(tile);
+        }
+
+        for (slot, result) in results.iter_mut().enumerate() {
+            if result.is_none() {
+                if output.requires_device() {
+                    return Err(WsiError::Unsupported {
+                        reason: "DICOM device batch contained a non-device-decodable tile".into(),
+                    });
+                }
+                *result = Some(TilePixels::Cpu(
+                    self.read_tile_with_backend(&reqs[slot], backend)?,
+                ));
+            }
+        }
+
+        Ok(Some(
+            results
+                .into_iter()
+                .map(|tile| {
+                    tile.ok_or_else(|| WsiError::TileRead {
+                        col: 0,
+                        row: 0,
+                        level: 0,
+                        reason: "DICOM device batch result was not populated".into(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ))
+    }
+}
+
+fn dicom_tile_codec_kind(transfer_syntax_uid: &str) -> TileCodecKind {
+    if transfer_syntax_uid == JPEG_TRANSFER_SYNTAX {
+        TileCodecKind::Jpeg
+    } else if matches!(
+        transfer_syntax_uid,
+        HTJ2K_LOSSLESS_TRANSFER_SYNTAX | HTJ2K_LOSSLESS_RPCL_TRANSFER_SYNTAX
+    ) {
+        TileCodecKind::Htj2k
+    } else if JP2K_TRANSFER_SYNTAXES.contains(&transfer_syntax_uid) {
+        TileCodecKind::Jp2k
+    } else {
+        TileCodecKind::Other
     }
 }
 
@@ -464,6 +699,26 @@ impl DicomLevel {
         &self.parts[0].photometric_interpretation
     }
 
+    fn image_for_tile(&self, col: u32, row: u32) -> Option<Arc<DicomImage>> {
+        self.parts
+            .iter()
+            .find(|image| image.frame_index(col, row).is_some())
+            .cloned()
+    }
+
+    fn tile_codec_kind(&self, req: &TileRequest) -> TileCodecKind {
+        if req.col < 0
+            || req.row < 0
+            || req.col >= self.tiles_across as i64
+            || req.row >= self.tiles_down as i64
+        {
+            return TileCodecKind::Other;
+        }
+        self.image_for_tile(req.col as u32, req.row as u32)
+            .map(|image| dicom_tile_codec_kind(&image.transfer_syntax_uid))
+            .unwrap_or(TileCodecKind::Other)
+    }
+
     fn read_tile(
         &self,
         col: i64,
@@ -485,10 +740,8 @@ impl DicomLevel {
 
         let col_u32 = col as u32;
         let row_u32 = row as u32;
-        for image in &self.parts {
-            if image.frame_index(col_u32, row_u32).is_some() {
-                return image.read_tile(col, row, level, backend);
-            }
+        if let Some(image) = self.image_for_tile(col_u32, row_u32) {
+            return image.read_tile(col, row, level, backend);
         }
 
         let (width, height) = self.actual_tile_dimensions(col_u32, row_u32);
@@ -765,6 +1018,21 @@ impl DicomImage {
         (width, height)
     }
 
+    fn cached_decoded_frame(&self, frame_index: u32) -> Option<Arc<CpuTile>> {
+        self.decoded_frame_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&frame_index)
+            .cloned()
+    }
+
+    fn cache_decoded_frame(&self, frame_index: u32, tile: Arc<CpuTile>) {
+        self.decoded_frame_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .put(frame_index, tile);
+    }
+
     fn decode_uncompressed_frame_sample_buffer(
         &self,
         frame_index: u32,
@@ -852,13 +1120,7 @@ impl DicomImage {
     ) -> Result<CpuTile, WsiError> {
         let use_decoded_cache = is_encapsulated_transfer_syntax(&self.transfer_syntax_uid);
         if use_decoded_cache {
-            if let Some(cached) = self
-                .decoded_frame_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&frame_index)
-                .cloned()
-            {
+            if let Some(cached) = self.cached_decoded_frame(frame_index) {
                 return Ok(cached.as_ref().clone());
             }
         }
@@ -928,10 +1190,7 @@ impl DicomImage {
 
         let arc = Arc::new(buffer);
         if use_decoded_cache {
-            self.decoded_frame_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .put(frame_index, arc.clone());
+            self.cache_decoded_frame(frame_index, arc.clone());
         }
         Ok(arc.as_ref().clone())
     }
@@ -2558,10 +2817,22 @@ mod tests {
     }
 
     fn test_dicom_image(sop_instance_uid: &str, grid: DicomGrid) -> Arc<DicomImage> {
+        test_dicom_image_with_transfer_syntax(
+            sop_instance_uid,
+            grid,
+            uids::EXPLICIT_VR_LITTLE_ENDIAN,
+        )
+    }
+
+    fn test_dicom_image_with_transfer_syntax(
+        sop_instance_uid: &str,
+        grid: DicomGrid,
+        transfer_syntax_uid: &str,
+    ) -> Arc<DicomImage> {
         Arc::new(DicomImage {
             path: PathBuf::from(format!("{sop_instance_uid}.dcm")),
             sop_instance_uid: sop_instance_uid.into(),
-            transfer_syntax_uid: uids::EXPLICIT_VR_LITTLE_ENDIAN.into(),
+            transfer_syntax_uid: transfer_syntax_uid.into(),
             photometric_interpretation: "RGB".into(),
             samples_per_pixel: 3,
             planar_configuration: Some(0),
@@ -2582,6 +2853,36 @@ mod tests {
             decoded_frame_cache: Mutex::new(LruCache::new(std::num::NonZeroUsize::new(1).unwrap())),
             file: Mutex::new(None),
         })
+    }
+
+    fn empty_dataset() -> Dataset {
+        Dataset {
+            id: DatasetId(1),
+            scenes: Vec::new(),
+            associated_images: HashMap::new(),
+            properties: Properties::new(),
+            icc_profiles: HashMap::new(),
+        }
+    }
+
+    fn tile_request(col: i64, row: i64) -> TileRequest {
+        TileRequest {
+            scene: 0,
+            series: 0,
+            level: 0,
+            plane: PlaneSelection::default(),
+            col,
+            row,
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn test_metal_sessions() -> Option<crate::output::metal::MetalBackendSessions> {
+        let device = metal::Device::system_default()?;
+        Some(crate::output::metal::MetalBackendSessions::new(
+            signinum_jpeg_metal::MetalBackendSession::new(device.clone()),
+            signinum_j2k_metal::MetalBackendSession::new(device),
+        ))
     }
 
     fn rgb_bytes(tile: &CpuTile) -> Vec<u8> {
@@ -2613,6 +2914,88 @@ mod tests {
         assert_eq!(levels[0].parts.len(), 2);
         assert_eq!(levels[0].tiles_across, 8);
         assert_eq!(levels[0].tiles_down, 8);
+    }
+
+    #[test]
+    fn tile_codec_kind_uses_actual_sparse_split_part_for_request() {
+        let mut first_tiles = HashMap::new();
+        first_tiles.insert((0, 0), 0);
+        let mut second_tiles = HashMap::new();
+        second_tiles.insert((1, 0), 0);
+
+        let levels = build_levels(
+            Path::new("split-codec.dcm"),
+            vec![
+                test_dicom_image_with_transfer_syntax(
+                    "1.2.3.1",
+                    DicomGrid::Sparse(first_tiles),
+                    JPEG_TRANSFER_SYNTAX,
+                ),
+                test_dicom_image_with_transfer_syntax(
+                    "1.2.3.2",
+                    DicomGrid::Sparse(second_tiles),
+                    HTJ2K_LOSSLESS_TRANSFER_SYNTAX,
+                ),
+            ],
+        )
+        .expect("split sparse parts should form one logical level");
+        let reader = DicomReader {
+            slide: Arc::new(DicomSlide {
+                dataset: empty_dataset(),
+                levels,
+                associated: HashMap::new(),
+            }),
+        };
+
+        assert_eq!(
+            reader.tile_codec_kind(&tile_request(0, 0)),
+            TileCodecKind::Jpeg
+        );
+        assert_eq!(
+            reader.tile_codec_kind(&tile_request(1, 0)),
+            TileCodecKind::Htj2k
+        );
+        assert_eq!(
+            reader.tile_codec_kind(&tile_request(2, 0)),
+            TileCodecKind::Other
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "metal")]
+    fn require_device_rejects_sparse_missing_dicom_tile_cpu_black_fallback() {
+        let Some(sessions) = test_metal_sessions() else {
+            return;
+        };
+        let mut present_tiles = HashMap::new();
+        present_tiles.insert((0, 0), 0);
+        let levels = build_levels(
+            Path::new("sparse-device.dcm"),
+            vec![test_dicom_image_with_transfer_syntax(
+                "1.2.3.1",
+                DicomGrid::Sparse(present_tiles),
+                uids::JPEG2000_LOSSLESS,
+            )],
+        )
+        .expect("sparse level should build");
+        let reader = DicomReader {
+            slide: Arc::new(DicomSlide {
+                dataset: empty_dataset(),
+                levels,
+                associated: HashMap::new(),
+            }),
+        };
+
+        let err = reader
+            .read_tiles(
+                &[tile_request(1, 0)],
+                TileOutputPreference::require_device_auto_with_metal_and_compressed_decode(
+                    sessions,
+                ),
+            )
+            .expect_err("RequireDevice must not return CPU black sparse tile");
+
+        assert!(matches!(err, WsiError::Unsupported { .. }));
     }
 
     #[test]
@@ -2896,6 +3279,26 @@ mod tests {
             EncodedTilePhotometricInterpretation::Rgb
         );
         assert_eq!(raw.data, codestream);
+    }
+
+    #[test]
+    fn tile_codec_kind_classifies_dicom_transfer_syntaxes() {
+        assert_eq!(
+            dicom_tile_codec_kind(JPEG_TRANSFER_SYNTAX),
+            TileCodecKind::Jpeg
+        );
+        assert_eq!(
+            dicom_tile_codec_kind(uids::JPEG2000_LOSSLESS),
+            TileCodecKind::Jp2k
+        );
+        assert_eq!(
+            dicom_tile_codec_kind(HTJ2K_LOSSLESS_TRANSFER_SYNTAX),
+            TileCodecKind::Htj2k
+        );
+        assert_eq!(
+            dicom_tile_codec_kind(uids::EXPLICIT_VR_LITTLE_ENDIAN),
+            TileCodecKind::Other
+        );
     }
 
     #[test]
