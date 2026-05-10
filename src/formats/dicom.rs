@@ -44,6 +44,9 @@ const THUMBNAIL_IMAGE_TYPES: &[&[&str]] = &[
     &["ORIGINAL", "PRIMARY", "THUMBNAIL", "RESAMPLED"],
     &["DERIVED", "PRIMARY", "THUMBNAIL", "RESAMPLED"],
 ];
+const BASE_ONLY_DICOM_PYRAMID_MESSAGE: &str = "This DICOM WSI contains only a full-resolution base layer and no physical pyramid levels. Open the complete DICOM series/folder, or regenerate the DICOM with DERIVED/PRIMARY/VOLUME/RESAMPLED pyramid instances.";
+const BASE_ONLY_GUARD_MIN_TILE_COUNT: u64 = 4_096;
+const BASE_ONLY_GUARD_MIN_DIMENSION: u32 = 32_768;
 const SUPPORTED_TRANSFER_SYNTAXES: &[&str] = &[
     uids::IMPLICIT_VR_LITTLE_ENDIAN,
     uids::EXPLICIT_VR_LITTLE_ENDIAN,
@@ -126,6 +129,27 @@ impl FormatProbe for DicomBackend {
                 vendor: "dicom".into(),
                 confidence: ProbeConfidence::Definite,
             });
+        }
+        if path.is_dir() {
+            return match self.parse(path) {
+                Ok(slide) => {
+                    self.probe_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .put(key, slide);
+                    Ok(ProbeResult {
+                        detected: true,
+                        vendor: "dicom".into(),
+                        confidence: ProbeConfidence::Definite,
+                    })
+                }
+                Err(WsiError::UnsupportedFormat(_)) => Ok(ProbeResult {
+                    detected: false,
+                    vendor: String::new(),
+                    confidence: ProbeConfidence::Likely,
+                }),
+                Err(err) => Err(err),
+            };
         }
         match parse_metadata_object(path) {
             Ok(meta) if is_vl_wsi(meta.obj.meta().media_storage_sop_class_uid()) => {
@@ -480,52 +504,29 @@ struct DicomSlide {
 
 impl DicomSlide {
     fn parse(path: &Path) -> Result<Self, WsiError> {
-        let start_meta = parse_metadata_object(path)?;
-        let start_meta_level0_properties = parse_level0_properties_from_metadata(&start_meta);
-        let start_series_uid = start_meta.series_instance_uid.clone();
-        let dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let start_key = canonicalize_or_fallback(path);
-
-        let mut level_images = Vec::new();
-        let mut associated_images = Vec::new();
-        match start_meta.classify()? {
-            ImageRole::Ignore => {}
-            ImageRole::Level => level_images.push(Arc::new(DicomImage::from_metadata(start_meta)?)),
-            ImageRole::Associated(kind) => {
-                associated_images.push((
-                    kind.name().to_string(),
-                    Arc::new(DicomImage::from_metadata(start_meta)?),
-                ));
-            }
-        }
-
-        for entry in std::fs::read_dir(dir).map_err(|source| WsiError::IoWithPath {
-            source: Arc::new(source),
-            path: dir.to_path_buf(),
-        })? {
-            let entry = entry?;
-            let sibling_path = entry.path();
-            if !sibling_path.is_file() || canonicalize_or_fallback(&sibling_path) == start_key {
-                continue;
-            }
-            let meta = match parse_metadata_object(&sibling_path) {
-                Ok(meta) => meta,
-                Err(_) => continue,
-            };
-            if meta.series_instance_uid != start_series_uid {
-                continue;
-            }
-            match meta.classify()? {
-                ImageRole::Ignore => {}
-                ImageRole::Level => level_images.push(Arc::new(DicomImage::from_metadata(meta)?)),
-                ImageRole::Associated(kind) => {
-                    associated_images.push((
-                        kind.name().to_string(),
-                        Arc::new(DicomImage::from_metadata(meta)?),
-                    ));
-                }
-            }
-        }
+        let DicomSeriesManifest {
+            study_instance_uid,
+            series_instance_uid,
+            frame_of_reference_uid,
+            container_identifier,
+            specimen_identifier,
+            volume_images,
+            associated_images,
+            source_file_count,
+        } = DicomSeriesManifest::resolve(path)?;
+        let level_images = volume_images
+            .into_iter()
+            .map(DicomImage::from_metadata)
+            .map(|result| result.map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut associated_images = associated_images
+            .into_iter()
+            .map(|(kind, meta)| {
+                DicomImage::from_metadata(meta)
+                    .map(Arc::new)
+                    .map(|image| (kind.name().to_string(), image))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         if level_images.is_empty() {
             return Err(invalid_slide(path, "No pyramid levels found"));
@@ -533,14 +534,21 @@ impl DicomSlide {
 
         dedupe_associated(path, &mut associated_images)?;
         let mut levels = build_levels(path, level_images)?;
-        levels.sort_by(|a, b| b.width.cmp(&a.width).then_with(|| b.height.cmp(&a.height)));
+        levels.sort_by(|a, b| {
+            b.area()
+                .cmp(&a.area())
+                .then_with(|| b.width.cmp(&a.width))
+                .then_with(|| b.height.cmp(&a.height))
+        });
+        validate_monotonic_levels(path, &levels)?;
+        reject_huge_base_only_dicom(path, &levels)?;
 
         let level0 = levels
             .first()
             .ok_or_else(|| invalid_slide(path, "No pyramid levels found"))?
             .clone();
 
-        let quickhash = quickhash_for_series_uid(&start_series_uid)?;
+        let quickhash = quickhash_for_series_uid(&series_instance_uid)?;
         let dataset_id = dataset_id_from_quickhash(path, &quickhash)?;
         let largest_dimensions = (level0.width, level0.height);
         let public_levels = levels
@@ -560,23 +568,26 @@ impl DicomSlide {
         let mut properties = Properties::new();
         properties.insert("openslide.vendor", "dicom");
         properties.insert("openslide.quickhash-1", quickhash);
-        let (shared_pixel_spacing, shared_objective_lens_power) = if level0.pixel_spacing.is_none()
-            || level0.objective_lens_power.is_none()
-        {
-            if canonicalize_or_fallback(&level0.path) == start_key {
-                if start_meta_level0_properties.0.is_some()
-                    && start_meta_level0_properties.1.is_some()
-                {
-                    start_meta_level0_properties
-                } else {
-                    parse_level0_properties(&level0.path).unwrap_or(start_meta_level0_properties)
-                }
-            } else {
+        properties.insert("dicom.series-instance-uid", &series_instance_uid);
+        if let Some(study_instance_uid) = &study_instance_uid {
+            properties.insert("dicom.study-instance-uid", study_instance_uid);
+        }
+        if let Some(frame_of_reference_uid) = &frame_of_reference_uid {
+            properties.insert("dicom.frame-of-reference-uid", frame_of_reference_uid);
+        }
+        if let Some(container_identifier) = &container_identifier {
+            properties.insert("dicom.container-identifier", container_identifier);
+        }
+        if let Some(specimen_identifier) = &specimen_identifier {
+            properties.insert("dicom.specimen-identifier", specimen_identifier);
+        }
+        properties.insert("dicom.source-file-count", source_file_count.to_string());
+        let (shared_pixel_spacing, shared_objective_lens_power) =
+            if level0.pixel_spacing.is_none() || level0.objective_lens_power.is_none() {
                 parse_level0_properties(&level0.path).unwrap_or((None, None))
-            }
-        } else {
-            (None, None)
-        };
+            } else {
+                (None, None)
+            };
         let level0_pixel_spacing = level0.pixel_spacing.or(shared_pixel_spacing);
         if let Some((mpp_x, mpp_y)) = level0_pixel_spacing {
             properties.insert("openslide.mpp-x", format!("{mpp_x}"));
@@ -657,6 +668,14 @@ impl DicomLevel {
             objective_lens_power: image.objective_lens_power,
             parts: vec![image],
         }
+    }
+
+    fn area(&self) -> u64 {
+        u64::from(self.width).saturating_mul(u64::from(self.height))
+    }
+
+    fn is_regular_full_tiling(&self) -> bool {
+        self.parts.iter().all(|part| part.is_full_grid())
     }
 
     fn push_part(&mut self, path: &Path, image: Arc<DicomImage>) -> Result<(), WsiError> {
@@ -812,6 +831,185 @@ enum ImageRole {
     Level,
     Associated(AssociatedKind),
     Ignore,
+}
+
+struct DicomSeriesManifest {
+    study_instance_uid: Option<String>,
+    series_instance_uid: String,
+    frame_of_reference_uid: Option<String>,
+    container_identifier: Option<String>,
+    specimen_identifier: Option<String>,
+    volume_images: Vec<ParsedDicomMetadata>,
+    associated_images: Vec<(AssociatedKind, ParsedDicomMetadata)>,
+    source_file_count: usize,
+}
+
+impl DicomSeriesManifest {
+    fn resolve(path: &Path) -> Result<Self, WsiError> {
+        if path.is_dir() {
+            Self::from_directory(path)
+        } else {
+            Self::from_selected_file(path)
+        }
+    }
+
+    fn from_selected_file(path: &Path) -> Result<Self, WsiError> {
+        let selected_meta = parse_metadata_object(path)?;
+        let selected_series_uid = selected_meta.series_instance_uid.clone();
+        let scan_root = path.parent().unwrap_or_else(|| Path::new("."));
+        let selected_key = canonicalize_or_fallback(path);
+        let mut metas = vec![selected_meta];
+
+        for sibling_path in direct_child_files(scan_root)? {
+            if canonicalize_or_fallback(&sibling_path) == selected_key {
+                continue;
+            }
+            let meta = match parse_metadata_object(&sibling_path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            if meta.series_instance_uid == selected_series_uid {
+                metas.push(meta);
+            }
+        }
+
+        Self::from_group(path, metas)
+    }
+
+    fn from_directory(path: &Path) -> Result<Self, WsiError> {
+        let mut by_series = HashMap::<String, Vec<ParsedDicomMetadata>>::new();
+        for child_path in direct_child_files(path)? {
+            let meta = match parse_metadata_object(&child_path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            by_series
+                .entry(meta.series_instance_uid.clone())
+                .or_default()
+                .push(meta);
+        }
+
+        if by_series.is_empty() {
+            return Err(WsiError::UnsupportedFormat(path.display().to_string()));
+        }
+        if by_series.len() != 1 {
+            return Err(invalid_slide(
+                path,
+                format!(
+                    "DICOM directory contains {} VL WSI series; select a directory containing exactly one series",
+                    by_series.len()
+                ),
+            ));
+        }
+
+        let metas = by_series
+            .into_values()
+            .next()
+            .expect("series map is known to contain one entry");
+        Self::from_group(path, metas)
+    }
+
+    fn from_group(path: &Path, metas: Vec<ParsedDicomMetadata>) -> Result<Self, WsiError> {
+        let first = metas
+            .first()
+            .ok_or_else(|| invalid_slide(path, "No DICOM VL WSI objects found"))?;
+        let series_instance_uid = first.series_instance_uid.clone();
+        let study_instance_uid = common_optional_value(path, "StudyInstanceUID", &metas, |meta| {
+            meta.study_instance_uid.as_deref()
+        })?;
+        let frame_of_reference_uid =
+            common_optional_value(path, "FrameOfReferenceUID", &metas, |meta| {
+                meta.frame_of_reference_uid.as_deref()
+            })?;
+        let container_identifier =
+            common_optional_value(path, "ContainerIdentifier", &metas, |meta| {
+                meta.container_identifier.as_deref()
+            })?;
+        let specimen_identifier =
+            common_optional_value(path, "SpecimenIdentifier", &metas, |meta| {
+                meta.specimen_identifier.as_deref()
+            })?;
+        let source_file_count = metas.len();
+
+        for meta in &metas {
+            if meta.series_instance_uid != series_instance_uid {
+                return Err(invalid_slide(
+                    path,
+                    "DICOM series resolver received mixed SeriesInstanceUID values",
+                ));
+            }
+        }
+
+        let mut volume_images = Vec::new();
+        let mut associated_images = Vec::new();
+        for meta in metas {
+            match meta.classify()? {
+                ImageRole::Ignore => {}
+                ImageRole::Level => volume_images.push(meta),
+                ImageRole::Associated(kind) => associated_images.push((kind, meta)),
+            }
+        }
+
+        Ok(Self {
+            study_instance_uid,
+            series_instance_uid,
+            frame_of_reference_uid,
+            container_identifier,
+            specimen_identifier,
+            volume_images,
+            associated_images,
+            source_file_count,
+        })
+    }
+}
+
+fn direct_child_files(dir: &Path) -> Result<Vec<PathBuf>, WsiError> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|source| WsiError::IoWithPath {
+        source: Arc::new(source),
+        path: dir.to_path_buf(),
+    })? {
+        let entry = entry.map_err(|source| WsiError::IoWithPath {
+            source: Arc::new(source),
+            path: dir.to_path_buf(),
+        })?;
+        let path = entry.path();
+        if path.is_file() {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn common_optional_value<F>(
+    path: &Path,
+    name: &str,
+    metas: &[ParsedDicomMetadata],
+    value: F,
+) -> Result<Option<String>, WsiError>
+where
+    F: Fn(&ParsedDicomMetadata) -> Option<&str>,
+{
+    let mut common = None::<String>;
+    for meta in metas {
+        let Some(actual) = value(meta) else {
+            continue;
+        };
+        match &common {
+            Some(expected) if expected != actual => {
+                return Err(invalid_slide(
+                    path,
+                    format!(
+                        "DICOM series has incompatible {name} values ({expected} vs. {actual})"
+                    ),
+                ));
+            }
+            Some(_) => {}
+            None => common = Some(actual.to_string()),
+        }
+    }
+    Ok(common)
 }
 
 #[derive(Debug)]
@@ -1008,6 +1206,10 @@ impl DicomImage {
             DicomGrid::Full => Some(row * self.tiles_across + col),
             DicomGrid::Sparse(map) => map.get(&(col, row)).copied(),
         }
+    }
+
+    fn is_full_grid(&self) -> bool {
+        matches!(self.grid, DicomGrid::Full)
     }
 
     fn actual_tile_dimensions(&self, col: u32, row: u32) -> (u32, u32) {
@@ -1736,7 +1938,11 @@ fn position_reader_for_dicom_magic<R: Read + Seek>(
 struct ParsedDicomMetadata {
     path: PathBuf,
     obj: DefaultDicomObject,
+    study_instance_uid: Option<String>,
     series_instance_uid: String,
+    frame_of_reference_uid: Option<String>,
+    container_identifier: Option<String>,
+    specimen_identifier: Option<String>,
     sop_instance_uid: String,
     transfer_syntax_uid: String,
     photometric_interpretation: String,
@@ -1810,6 +2016,7 @@ fn parse_level0_properties(path: &Path) -> Result<Level0Properties, WsiError> {
     Ok((pixel_spacing, objective_lens_power))
 }
 
+#[cfg(test)]
 fn parse_level0_properties_from_metadata(
     meta: &ParsedDicomMetadata,
 ) -> (Option<(f64, f64)>, Option<f64>) {
@@ -1863,6 +2070,10 @@ fn parse_metadata_object_until(
 
     let series_instance_uid =
         required_string(&obj, tags::SERIES_INSTANCE_UID, "SeriesInstanceUID")?;
+    let study_instance_uid = optional_string(&obj, tags::STUDY_INSTANCE_UID)?;
+    let frame_of_reference_uid = optional_string(&obj, tags::FRAME_OF_REFERENCE_UID)?;
+    let container_identifier = optional_string(&obj, tags::CONTAINER_IDENTIFIER)?;
+    let specimen_identifier = optional_string(&obj, tags::SPECIMEN_IDENTIFIER)?;
     let sop_instance_uid = required_string(&obj, tags::SOP_INSTANCE_UID, "SOPInstanceUID")?;
     let image_type = required_multi_string(&obj, tags::IMAGE_TYPE, "ImageType")?;
     let rows = required_u32(&obj, tags::ROWS, "Rows")?;
@@ -1899,7 +2110,11 @@ fn parse_metadata_object_until(
     Ok(ParsedDicomMetadata {
         path: path.to_path_buf(),
         obj,
+        study_instance_uid,
         series_instance_uid,
+        frame_of_reference_uid,
+        container_identifier,
+        specimen_identifier,
         sop_instance_uid,
         transfer_syntax_uid,
         photometric_interpretation,
@@ -1930,6 +2145,42 @@ fn build_levels(path: &Path, images: Vec<Arc<DicomImage>>) -> Result<Vec<DicomLe
         levels.push(DicomLevel::from_image(image));
     }
     Ok(levels)
+}
+
+fn validate_monotonic_levels(path: &Path, levels: &[DicomLevel]) -> Result<(), WsiError> {
+    for pair in levels.windows(2) {
+        let finer = &pair[0];
+        let coarser = &pair[1];
+        if coarser.width > finer.width || coarser.height > finer.height {
+            return Err(invalid_slide(
+                path,
+                format!(
+                    "DICOM pyramid levels are not monotonic ({}x{} before {}x{})",
+                    finer.width, finer.height, coarser.width, coarser.height
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_huge_base_only_dicom(path: &Path, levels: &[DicomLevel]) -> Result<(), WsiError> {
+    let [level] = levels else {
+        return Ok(());
+    };
+    if !level.is_regular_full_tiling() {
+        return Ok(());
+    }
+
+    let tile_count = u64::from(level.tiles_across).saturating_mul(u64::from(level.tiles_down));
+    let max_dimension = level.width.max(level.height);
+    if tile_count >= BASE_ONLY_GUARD_MIN_TILE_COUNT
+        || max_dimension >= BASE_ONLY_GUARD_MIN_DIMENSION
+    {
+        return Err(invalid_slide(path, BASE_ONLY_DICOM_PYRAMID_MESSAGE));
+    }
+
+    Ok(())
 }
 
 fn dedupe_associated(
@@ -2632,10 +2883,18 @@ mod tests {
     }
 
     struct TestDicomOptions {
+        sop_instance_uid: &'static str,
+        series_instance_uid: &'static str,
+        image_type: &'static str,
         transfer_syntax: &'static str,
         samples_per_pixel: u16,
         photometric_interpretation: &'static str,
         planar_configuration: Option<u16>,
+        rows: u16,
+        columns: u16,
+        total_pixel_matrix_rows: u32,
+        total_pixel_matrix_columns: u32,
+        number_of_frames: u32,
         pixel_spacing: Option<&'static str>,
         shared_pixel_spacing: Option<&'static str>,
         pixel_data: TestPixelData,
@@ -2644,10 +2903,18 @@ mod tests {
     impl TestDicomOptions {
         fn native(pixel_data: Vec<u8>) -> Self {
             Self {
+                sop_instance_uid: "1.2.826.0.1.3680043.10.777.1",
+                series_instance_uid: "1.2.826.0.1.3680043.10.777",
+                image_type: "ORIGINAL\\PRIMARY\\VOLUME\\NONE",
                 transfer_syntax: uids::EXPLICIT_VR_LITTLE_ENDIAN,
                 samples_per_pixel: 3,
                 photometric_interpretation: "RGB",
                 planar_configuration: Some(0),
+                rows: 2,
+                columns: 2,
+                total_pixel_matrix_rows: 2,
+                total_pixel_matrix_columns: 2,
+                number_of_frames: 1,
                 pixel_spacing: Some("0.00025\\0.00025"),
                 shared_pixel_spacing: None,
                 pixel_data: TestPixelData::Native(pixel_data),
@@ -2665,42 +2932,42 @@ mod tests {
         object.put(DataElement::new(
             tags::SOP_INSTANCE_UID,
             VR::UI,
-            "1.2.826.0.1.3680043.10.777.1",
+            options.sop_instance_uid,
         ));
         object.put(DataElement::new(
             tags::SERIES_INSTANCE_UID,
             VR::UI,
-            "1.2.826.0.1.3680043.10.777",
+            options.series_instance_uid,
         ));
         object.put(DataElement::new(
             tags::IMAGE_TYPE,
             VR::CS,
-            "ORIGINAL\\PRIMARY\\VOLUME\\NONE",
+            options.image_type,
         ));
         object.put(DataElement::new(
             tags::ROWS,
             VR::US,
-            PrimitiveValue::from(2u16),
+            PrimitiveValue::from(options.rows),
         ));
         object.put(DataElement::new(
             tags::COLUMNS,
             VR::US,
-            PrimitiveValue::from(2u16),
+            PrimitiveValue::from(options.columns),
         ));
         object.put(DataElement::new(
             tags::TOTAL_PIXEL_MATRIX_ROWS,
             VR::UL,
-            PrimitiveValue::from(2u32),
+            PrimitiveValue::from(options.total_pixel_matrix_rows),
         ));
         object.put(DataElement::new(
             tags::TOTAL_PIXEL_MATRIX_COLUMNS,
             VR::UL,
-            PrimitiveValue::from(2u32),
+            PrimitiveValue::from(options.total_pixel_matrix_columns),
         ));
         object.put(DataElement::new(
             tags::NUMBER_OF_FRAMES,
             VR::IS,
-            PrimitiveValue::from(1u32),
+            PrimitiveValue::from(options.number_of_frames),
         ));
         object.put(DataElement::new(
             tags::SAMPLES_PER_PIXEL,
@@ -2778,7 +3045,7 @@ mod tests {
             .with_meta(
                 FileMetaTableBuilder::new()
                     .media_storage_sop_class_uid(uids::VL_WHOLE_SLIDE_MICROSCOPY_IMAGE_STORAGE)
-                    .media_storage_sop_instance_uid("1.2.826.0.1.3680043.10.777.1")
+                    .media_storage_sop_instance_uid(options.sop_instance_uid)
                     .transfer_syntax(options.transfer_syntax),
             )
             .unwrap()
@@ -2897,6 +3164,152 @@ mod tests {
         assert_eq!(tile.color_space, ColorSpace::Rgb);
         assert_eq!(tile.layout, CpuTileLayout::Interleaved);
         tile.data.as_u8().expect("u8 RGB tile").to_vec()
+    }
+
+    fn write_series_level(
+        path: &Path,
+        sop_instance_uid: &'static str,
+        total_rows: u32,
+        total_columns: u32,
+    ) {
+        let mut options = TestDicomOptions::native(vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]);
+        options.sop_instance_uid = sop_instance_uid;
+        options.rows = 2;
+        options.columns = 2;
+        options.total_pixel_matrix_rows = total_rows;
+        options.total_pixel_matrix_columns = total_columns;
+        options.number_of_frames = total_rows.div_ceil(2) * total_columns.div_ceil(2);
+        write_test_dicom(path, options);
+    }
+
+    fn series_level_dimensions(slide: &Slide) -> Vec<(u64, u64)> {
+        slide.dataset().scenes[0].series[0]
+            .levels
+            .iter()
+            .map(|level| level.dimensions)
+            .collect()
+    }
+
+    #[test]
+    fn opens_complete_sibling_series_from_any_member_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let level0 = dir.path().join("level0.dcm");
+        let level1 = dir.path().join("level1.dcm");
+        let thumbnail = dir.path().join("thumbnail.dcm");
+
+        write_series_level(&level0, "1.2.826.0.1.3680043.10.777.1", 16, 16);
+        write_series_level(&level1, "1.2.826.0.1.3680043.10.777.2", 4, 4);
+        let mut thumbnail_options =
+            TestDicomOptions::native(vec![32, 32, 32, 64, 64, 64, 96, 96, 96, 128, 128, 128]);
+        thumbnail_options.sop_instance_uid = "1.2.826.0.1.3680043.10.777.3";
+        thumbnail_options.image_type = "DERIVED\\PRIMARY\\THUMBNAIL\\RESAMPLED";
+        write_test_dicom(&thumbnail, thumbnail_options);
+
+        let from_base = Slide::open(&level0).expect("open base member");
+        let from_coarse = Slide::open(&level1).expect("open coarse member");
+        let from_associated = Slide::open(&thumbnail).expect("open associated member");
+
+        assert_eq!(series_level_dimensions(&from_base), vec![(16, 16), (4, 4)]);
+        assert_eq!(
+            series_level_dimensions(&from_coarse),
+            vec![(16, 16), (4, 4)]
+        );
+        assert_eq!(
+            series_level_dimensions(&from_associated),
+            vec![(16, 16), (4, 4)]
+        );
+        assert!(from_associated
+            .dataset()
+            .associated_images
+            .contains_key("thumbnail"));
+    }
+
+    #[test]
+    fn opens_directory_containing_one_dicom_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let level0 = dir.path().join("level0.dcm");
+        let level1 = dir.path().join("level1.dcm");
+        write_series_level(&level0, "1.2.826.0.1.3680043.10.777.1", 16, 16);
+        write_series_level(&level1, "1.2.826.0.1.3680043.10.777.2", 4, 4);
+
+        let from_file = Slide::open(&level0).expect("open DICOM member");
+        let from_directory = Slide::open(dir.path()).expect("open DICOM series directory");
+
+        assert_eq!(
+            series_level_dimensions(&from_directory),
+            series_level_dimensions(&from_file)
+        );
+    }
+
+    #[test]
+    fn opens_public_dicom_folder_and_member_with_matching_levels_when_available() {
+        let bench_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let candidates = [
+            bench_root
+                .join("SlideViewer")
+                .join("downloads/openslide-testdata-extracted/full/DICOM/CMU-1-JP2K-33005"),
+            bench_root.join("downloads/openslide-testdata-extracted/full/DICOM/CMU-1-JP2K-33005"),
+        ];
+        let Some(folder) = candidates.iter().find(|path| path.is_dir()) else {
+            eprintln!("skipping public DICOM folder test; CMU-1-JP2K-33005 not found");
+            return;
+        };
+        let member = std::fs::read_dir(folder)
+            .expect("read DICOM folder")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("dcm"))
+            })
+            .expect("public DICOM folder contains a .dcm member");
+
+        let from_folder = Slide::open(folder).expect("open public DICOM folder");
+        let from_member = Slide::open(&member).expect("open public DICOM member");
+
+        assert!(
+            series_level_dimensions(&from_folder).len() > 1,
+            "public DICOM folder should expose physical pyramid levels"
+        );
+        assert_eq!(
+            series_level_dimensions(&from_folder),
+            series_level_dimensions(&from_member)
+        );
+    }
+
+    #[test]
+    fn rejects_huge_single_level_regular_dicom_missing_physical_pyramid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge-base-only.dcm");
+        let mut options = TestDicomOptions::native(Vec::new());
+        options.rows = 512;
+        options.columns = 512;
+        options.total_pixel_matrix_rows = 32_768;
+        options.total_pixel_matrix_columns = 32_768;
+        options.number_of_frames = 4_096;
+        write_test_dicom(&path, options);
+
+        let err = Slide::open(&path).expect_err("huge base-only DICOM should fail fast");
+        let message = err.to_string();
+        assert!(
+            message.contains("contains only a full-resolution base layer"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("Open the complete DICOM series/folder"),
+            "unexpected error: {message}"
+        );
+    }
+
+    #[test]
+    fn small_single_level_dicom_remains_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small-single-level.dcm");
+        write_series_level(&path, "1.2.826.0.1.3680043.10.777.1", 16, 16);
+
+        let slide = Slide::open(&path).expect("small single-level DICOM remains supported");
+        assert_eq!(series_level_dimensions(&slide), vec![(16, 16)]);
     }
 
     #[test]
@@ -3375,6 +3788,7 @@ mod tests {
                     &[0, 255, 0, 255],
                     &[0, 0, 255, 0],
                 )),
+                ..TestDicomOptions::native(Vec::new())
             },
         );
 
@@ -3399,6 +3813,7 @@ mod tests {
                 pixel_spacing: Some("0.00025\\0.00025"),
                 shared_pixel_spacing: None,
                 pixel_data: TestPixelData::Encapsulated(codestream.clone()),
+                ..TestDicomOptions::native(Vec::new())
             },
         );
 
@@ -3450,6 +3865,7 @@ mod tests {
                 pixel_spacing: Some("0.00025\\0.00025"),
                 shared_pixel_spacing: None,
                 pixel_data: TestPixelData::Encapsulated(codestream.clone()),
+                ..TestDicomOptions::native(Vec::new())
             },
         );
 
