@@ -56,6 +56,7 @@ fn main() {
             Ok(osr) => osr,
             Err(_) => continue,
         };
+        let openslide_origin = osr.bounds().map_or((0, 0), |bounds| (bounds.x, bounds.y));
         let level0 = &handle.dataset().scenes[0].series[0].levels[0];
         let (tile_width, tile_height, tiles_across, tiles_down) = match &level0.tile_layout {
             TileLayout::Regular {
@@ -106,8 +107,8 @@ fn main() {
         for req in &reqs {
             let _ = osr
                 .read_region(
-                    req.col * i64::from(tile_width),
-                    req.row * i64::from(tile_height),
+                    openslide_origin.0 + req.col * i64::from(tile_width),
+                    openslide_origin.1 + req.row * i64::from(tile_height),
                     0,
                     tile_width,
                     tile_height,

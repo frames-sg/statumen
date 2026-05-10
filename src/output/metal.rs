@@ -41,6 +41,17 @@ impl MetalBackendSessions {
         &self.j2k
     }
 
+    pub(crate) fn device_identity(&self) -> String {
+        #[cfg(target_os = "macos")]
+        {
+            self.j2k.device().name().to_string()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            "metal".to_string()
+        }
+    }
+
     pub(crate) fn ycbcr_to_rgb8_converter(&self) -> Result<Arc<YcbcrToRgb8Converter>, WsiError> {
         let mut cached = self
             .ycbcr_to_rgb8

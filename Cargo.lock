@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "signinum-j2k"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "signinum-core",
  "signinum-j2k-native",
@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "signinum-j2k-metal"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "libc",
  "metal",
@@ -1302,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "signinum-j2k-native"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "fearless_simd",
  "libm",
@@ -1381,7 +1381,7 @@ dependencies = [
 
 [[package]]
 name = "statumen"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "base64",
  "byteorder",
@@ -1418,6 +1418,15 @@ dependencies = [
  "toml",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "statumen-openslide-shim"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "statumen",
+ "tempfile",
 ]
 
 [[package]]

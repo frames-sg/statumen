@@ -16,9 +16,10 @@ use signinum_jpeg::JpegView as SigninumJpegView;
 use signinum_jpeg::{
     decode_tiles_into_with_options, decode_tiles_scaled_into_with_options,
     ColorTransform as SigninumColorTransform, DecodeOptions as SigninumDecodeOptions,
-    Decoder as SigninumJpegDecoder, Downscale as SigninumDownscale,
-    PixelFormat as SigninumPixelFormat, TileBatchOptions as SigninumTileBatchOptions,
-    TileDecodeJob as SigninumTileDecodeJob, TileScaledDecodeJob as SigninumTileScaledDecodeJob,
+    Decoder as SigninumJpegDecoder, Downscale as SigninumDownscale, JpegError as SigninumJpegError,
+    PixelFormat as SigninumPixelFormat, SofKind as SigninumSofKind,
+    TileBatchOptions as SigninumTileBatchOptions, TileDecodeJob as SigninumTileDecodeJob,
+    TileScaledDecodeJob as SigninumTileScaledDecodeJob,
 };
 #[cfg(feature = "metal")]
 use signinum_jpeg_metal::SurfaceResidency as SigninumJpegSurfaceResidency;
@@ -438,6 +439,9 @@ fn decode_one_jpeg_pixels(
         SigninumDecodeOptions::default().with_color_transform(job.color_transform),
     )
     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
+    if progressive_jpeg_requires_cpu_device_route(&view, require_device)? {
+        return decode_one_jpeg_job(job).map(TilePixels::Cpu);
+    }
     let mut decoder = signinum_jpeg_metal::Decoder::from_view(view)
         .map_err(|err| WsiError::Jpeg(err.to_string()))?;
     if metal_sessions.private_jpeg_decode() {
@@ -488,6 +492,22 @@ fn decode_one_jpeg_pixels(
     }
     cpu_tile_from_jpeg_surface(surface, job.expected_width, job.expected_height)
         .map(TilePixels::Cpu)
+}
+
+#[cfg(feature = "metal")]
+fn progressive_jpeg_requires_cpu_device_route(
+    view: &SigninumJpegView<'_>,
+    require_device: bool,
+) -> Result<bool, WsiError> {
+    if view.info().sof_kind != SigninumSofKind::Progressive8 {
+        return Ok(false);
+    }
+    if require_device {
+        return Err(WsiError::Unsupported {
+            reason: "Progressive8 JPEG does not have a resident Metal decode path; use CPU decode or a non-required device output preference".into(),
+        });
+    }
+    Ok(true)
 }
 
 #[cfg(feature = "metal")]
@@ -701,14 +721,15 @@ fn try_decode_jpeg_rgb_scaled(
         SigninumDecodeOptions::default().with_color_transform(req.color_transform),
     )
     .map_err(|err| WsiError::Jpeg(err.to_string()))?;
-    let (pixels, outcome) = if scale == SigninumDownscale::None {
-        decoder
-            .decode(SigninumPixelFormat::Rgb8)
-            .map_err(|err| WsiError::Jpeg(err.to_string()))?
+    let decode_result = if scale == SigninumDownscale::None {
+        decoder.decode(SigninumPixelFormat::Rgb8)
     } else {
-        decoder
-            .decode_scaled(SigninumPixelFormat::Rgb8, scale)
-            .map_err(|err| WsiError::Jpeg(err.to_string()))?
+        decoder.decode_scaled(SigninumPixelFormat::Rgb8, scale)
+    };
+    let (pixels, outcome) = match decode_result {
+        Ok(decoded) => decoded,
+        Err(err) if should_retry_scaled_jpeg_as_full_decode(&err) => return Ok(None),
+        Err(err) => return Err(WsiError::Jpeg(err.to_string())),
     };
     let decoded = if scale == SigninumDownscale::None {
         DecodedJpegRgb {
@@ -728,6 +749,16 @@ fn try_decode_jpeg_rgb_scaled(
         req.requested_width,
         req.requested_height,
     )?))
+}
+
+fn should_retry_scaled_jpeg_as_full_decode(err: &SigninumJpegError) -> bool {
+    matches!(
+        err,
+        SigninumJpegError::DownscaleUnsupported { .. }
+            | SigninumJpegError::NotImplemented {
+                sof: SigninumSofKind::Progressive8
+            }
+    )
 }
 
 pub(crate) fn jpeg_dimensions(data: &[u8]) -> Result<(u32, u32), WsiError> {
@@ -1049,6 +1080,31 @@ mod tests {
         encoded
     }
 
+    fn progressive_8x8_jpeg() -> Vec<u8> {
+        const HEX: &str = concat!(
+            "ffd8ffe000104a46494600010100000100010000ffdb0043000302020302020303030304030304050805050404050a07",
+            "0706080c0a0c0c0b0a0b0b0d0e12100d0e110e0b0b1016101113141515150c0f171816141812141514ffdb0043010304",
+            "0405040509050509140d0b0d141414141414141414141414141414141414141414141414141414141414141414141414",
+            "1414141414141414141414141414ffc20011080008000803012200021101031101ffc400150001010000000000000000",
+            "0000000000000006ffc4001501010100000000000000000000000000000506ffda000c0301000210031000000188136f",
+            "7fffc4001410010000000000000000000000000000000000ffda00080101000105027fffc40014110100000000000000",
+            "000000000000000000ffda0008010301013f017fffc40014110100000000000000000000000000000000ffda00080102",
+            "01013f017fffc40014100100000000000000000000000000000000ffda0008010100063f027fffc40014100100000000",
+            "000000000000000000000000ffda0008010100013f217fffda000c03010002000300000010f7ffc40014110100000000",
+            "000000000000000000000000ffda0008010301013f107fffc40014110100000000000000000000000000000000ffda00",
+            "08010201013f107fffc40014100100000000000000000000000000000000ffda0008010100013f107fffd9",
+        );
+        assert_eq!(HEX.len() % 2, 0);
+        HEX.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = (pair[0] as char).to_digit(16).unwrap();
+                let low = (pair[1] as char).to_digit(16).unwrap();
+                ((high << 4) | low) as u8
+            })
+            .collect()
+    }
+
     #[test]
     fn decode_valid_jpeg() {
         let mut rgb = image::RgbImage::new(8, 8);
@@ -1116,6 +1172,56 @@ mod tests {
         assert_eq!(decoded.width, 4);
         assert_eq!(decoded.height, 4);
         assert_eq!(decoded.pixels.len(), 4 * 4 * 3);
+    }
+
+    #[test]
+    fn decode_progressive_jpeg_rgb_returns_interleaved_rgb() {
+        let jpeg_data = progressive_8x8_jpeg();
+
+        let decoded = decode_jpeg_rgb(&jpeg_data, None, 8, 8).unwrap();
+
+        assert_eq!(decoded.width, 8);
+        assert_eq!(decoded.height, 8);
+        assert_eq!(decoded.pixels.len(), 8 * 8 * 3);
+    }
+
+    #[test]
+    fn progressive_scaled_decode_falls_back_to_full_decode_resize() {
+        let jpeg_data = progressive_8x8_jpeg();
+
+        let decoded = decode_jpeg_rgb_with_size_override(
+            &jpeg_data,
+            None,
+            8,
+            8,
+            Some(4),
+            Some(4),
+            SigninumColorTransform::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.width, 4);
+        assert_eq!(decoded.height, 4);
+        assert_eq!(decoded.pixels.len(), 4 * 4 * 3);
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn progressive_jpeg_device_route_uses_cpu_unless_device_is_required() {
+        let jpeg_data = progressive_8x8_jpeg();
+        let view = SigninumJpegView::parse_with_options(
+            &jpeg_data,
+            SigninumDecodeOptions::default().with_color_transform(SigninumColorTransform::Auto),
+        )
+        .unwrap();
+
+        assert!(progressive_jpeg_requires_cpu_device_route(&view, false).unwrap());
+        let err = progressive_jpeg_requires_cpu_device_route(&view, true).unwrap_err();
+        assert!(matches!(
+            err,
+            WsiError::Unsupported { reason }
+                if reason.contains("Progressive8") && reason.contains("Metal")
+        ));
     }
 
     #[cfg(all(feature = "metal", target_os = "macos"))]

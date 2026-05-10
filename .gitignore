@@ -3,3 +3,9 @@ target/
 **/.DS_Store
 __pycache__/
 *.py[cod]
+paper/
+papers/
+docs/papers/
+docs/benchmarks/paper/
+*.docx
+*.pptx

@@ -1,6 +1,6 @@
 [package]
 name = "statumen"
-version = "0.1.7"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Statumen whole-slide image reader"
@@ -62,9 +62,9 @@ zstd = "0.13"
 signinum-jpeg = "1.1"
 signinum-core = "1"
 signinum-tilecodec = "1"
-signinum-j2k = "1.1.2"
+signinum-j2k = "1.2.0"
 signinum-jpeg-metal = { version = "0.2.4", optional = true }
-signinum-j2k-metal = { version = "0.3.2", optional = true }
+signinum-j2k-metal = { version = "0.3.3", optional = true }
 metal = { version = "0.31", optional = true }
 dicom-core = "0.9"
 dicom-object = "0.9"
@@ -81,7 +81,7 @@ jpeg-encoder = "0.6"
 tempfile = "3"
 toml = "0.8"
 libloading = "0.8"
-signinum-j2k-native = "0.3.2"
+signinum-j2k-native = "0.3.3"
 
 [patch.crates-io]
 signinum-core = { path = "../signinum/crates/signinum-core" }
@@ -128,6 +128,11 @@ path = "src/bin/bench_driver.rs"
 required-features = ["bench", "openslide-bench"]
 
 [[bin]]
+name = "jp2k_batch_bench"
+path = "src/bin/jp2k_batch_bench.rs"
+required-features = ["bench"]
+
+[[bin]]
 name = "release_gate"
 path = "src/bin/release_gate.rs"
 required-features = ["bench", "openslide-bench"]
@@ -137,5 +142,5 @@ name = "svcache"
 path = "src/bin/svcache.rs"
 
 [workspace]
-members = [".", "xtask"]
+members = [".", "xtask", "statumen-openslide-shim"]
 resolver = "2"

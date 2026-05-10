@@ -42,6 +42,10 @@ extern "C" {
     fn openslide_get_associated_image_names(
         osr: *mut openslide_t,
     ) -> *const *const std::os::raw::c_char;
+    fn openslide_get_property_value(
+        osr: *mut openslide_t,
+        name: *const std::os::raw::c_char,
+    ) -> *const std::os::raw::c_char;
     fn openslide_get_associated_image_dimensions(
         osr: *mut openslide_t,
         name: *const std::os::raw::c_char,
@@ -104,6 +108,38 @@ impl Slide {
         Ok(buf)
     }
 
+    fn property(&self, name: &str) -> Option<String> {
+        let cname = CString::new(name).ok()?;
+        let value = unsafe { openslide_get_property_value(self.raw, cname.as_ptr()) };
+        if value.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    fn bounds(&self) -> Option<SlideBounds> {
+        let x = self.property("openslide.bounds-x")?.parse::<i64>().ok()?;
+        let y = self.property("openslide.bounds-y")?.parse::<i64>().ok()?;
+        let width = self
+            .property("openslide.bounds-width")?
+            .parse::<u64>()
+            .ok()?;
+        let height = self
+            .property("openslide.bounds-height")?
+            .parse::<u64>()
+            .ok()?;
+        (width > 0 && height > 0).then_some(SlideBounds {
+            x,
+            y,
+            width,
+            height,
+        })
+    }
+
     fn associated_names(&self) -> Vec<String> {
         let names_ptr = unsafe { openslide_get_associated_image_names(self.raw) };
         if names_ptr.is_null() {
@@ -136,6 +172,44 @@ impl Slide {
         unsafe { openslide_read_associated_image(self.raw, cname.as_ptr(), buf.as_mut_ptr()) };
         Ok(buf)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SlideBounds {
+    x: i64,
+    y: i64,
+    width: u64,
+    height: u64,
+}
+
+fn comparable_level_dims(
+    level_dims: &[(u64, u64)],
+    bounds: Option<SlideBounds>,
+) -> Vec<(u64, u64)> {
+    let Some(bounds) = bounds else {
+        return level_dims.to_vec();
+    };
+    let Some(&(level0_w, level0_h)) = level_dims.first() else {
+        return level_dims.to_vec();
+    };
+    if bounds.width >= level0_w && bounds.height >= level0_h {
+        return level_dims.to_vec();
+    }
+    level_dims
+        .iter()
+        .map(|&(level_w, level_h)| {
+            let dx = level0_w as f64 / level_w.max(1) as f64;
+            let dy = level0_h as f64 / level_h.max(1) as f64;
+            (
+                ((bounds.width as f64 / dx).ceil() as u64)
+                    .max(1)
+                    .min(level_w),
+                ((bounds.height as f64 / dy).ceil() as u64)
+                    .max(1)
+                    .min(level_h),
+            )
+        })
+        .collect()
 }
 
 impl Drop for Slide {
@@ -223,12 +297,21 @@ fn main() {
     };
     let level_count = slide.level_count();
     let level_dims: Vec<(u64, u64)> = (0..level_count).map(|l| slide.level_dims(l)).collect();
-    let plan = WorkloadPlan::compute(&level_dims);
+    let bounds = slide.bounds();
+    let plan_dims = comparable_level_dims(&level_dims, bounds);
+    let plan = WorkloadPlan::compute(&plan_dims);
+    let origin = bounds.map_or((0, 0), |bounds| (bounds.x, bounds.y));
 
     if should_run_workload(selected_workload.as_deref(), "single_tile_l0") {
         let (x, y) = tile_top_left_at_pixel(plan.center_l0, plan.tile_px);
         workloads.push(run_workload::<_, String>("single_tile_l0", 200, || {
-            slide.read_region(x, y, 0, plan.tile_px as i64, plan.tile_px as i64)
+            slide.read_region(
+                origin.0 + x,
+                origin.1 + y,
+                0,
+                plan.tile_px as i64,
+                plan.tile_px as i64,
+            )
         }));
     }
 
@@ -241,7 +324,13 @@ fn main() {
             || {
                 let (x, y) = coords[idx];
                 idx += 1;
-                slide.read_region(x, y, 0, plan.tile_px as i64, plan.tile_px as i64)
+                slide.read_region(
+                    origin.0 + x,
+                    origin.1 + y,
+                    0,
+                    plan.tile_px as i64,
+                    plan.tile_px as i64,
+                )
             },
         ));
     }
@@ -256,8 +345,8 @@ fn main() {
                 let (x, y) = coords[idx];
                 idx += 1;
                 slide.read_region(
-                    x,
-                    y,
+                    origin.0 + x,
+                    origin.1 + y,
                     plan.level2_idx as i32,
                     plan.tile_px as i64,
                     plan.tile_px as i64,
@@ -276,8 +365,8 @@ fn main() {
                 let (x, y) = dense_coords[idx];
                 idx += 1;
                 slide.read_region(
-                    x,
-                    y,
+                    origin.0 + x,
+                    origin.1 + y,
                     plan.level2_idx as i32,
                     plan.tile_px as i64,
                     plan.tile_px as i64,
@@ -289,7 +378,7 @@ fn main() {
     if should_run_workload(selected_workload.as_deref(), "region_2k") {
         workloads.push(run_workload::<_, String>("region_2k", 30, || {
             let (cx, cy) = plan.center_l0;
-            slide.read_region(cx - 1024, cy - 1024, 0, 2048, 2048)
+            slide.read_region(origin.0 + cx - 1024, origin.1 + cy - 1024, 0, 2048, 2048)
         }));
     }
 
@@ -297,8 +386,8 @@ fn main() {
         let viewport = plan.centered_viewport_l2(1024);
         workloads.push(run_workload::<_, String>("viewport_region_l2", 30, || {
             slide.read_region(
-                viewport.level0_top_left.0,
-                viewport.level0_top_left.1,
+                origin.0 + viewport.level0_top_left.0,
+                origin.1 + viewport.level0_top_left.1,
                 plan.level2_idx as i32,
                 viewport.side_px as i64,
                 viewport.side_px as i64,
@@ -329,4 +418,25 @@ fn main() {
         workloads,
     );
     println!("{}", run.to_json());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comparable_level_dims_uses_bounds_canvas() {
+        let dims = [(1000, 2000), (250, 500), (125, 250)];
+        let bounds = SlideBounds {
+            x: 100,
+            y: 200,
+            width: 400,
+            height: 800,
+        };
+
+        assert_eq!(
+            comparable_level_dims(&dims, Some(bounds)),
+            vec![(400, 800), (100, 200), (50, 100)]
+        );
+    }
 }

@@ -21,6 +21,8 @@ type GetError = unsafe extern "C" fn(osr: *mut openslide_t) -> *const c_char;
 type LevelCount = unsafe extern "C" fn(osr: *mut openslide_t) -> c_int;
 type LevelDimensions =
     unsafe extern "C" fn(osr: *mut openslide_t, level: c_int, w: *mut i64, h: *mut i64);
+type GetPropertyValue =
+    unsafe extern "C" fn(osr: *mut openslide_t, name: *const c_char) -> *const c_char;
 type ReadRegion = unsafe extern "C" fn(
     osr: *mut openslide_t,
     dest: *mut u32,
@@ -44,9 +46,34 @@ struct OpenSlideApi {
     open: Open,
     close: Close,
     get_error: GetError,
+    get_property_value: GetPropertyValue,
     level_count: LevelCount,
     level_dimensions: LevelDimensions,
     read_region: ReadRegion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenSlideBounds {
+    pub x: i64,
+    pub y: i64,
+    pub width: u64,
+    pub height: u64,
+}
+
+pub fn parse_bounds_from_properties<F>(mut property: F) -> Option<OpenSlideBounds>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let x = property("openslide.bounds-x")?.parse::<i64>().ok()?;
+    let y = property("openslide.bounds-y")?.parse::<i64>().ok()?;
+    let width = property("openslide.bounds-width")?.parse::<u64>().ok()?;
+    let height = property("openslide.bounds-height")?.parse::<u64>().ok()?;
+    (width > 0 && height > 0).then_some(OpenSlideBounds {
+        x,
+        y,
+        width,
+        height,
+    })
 }
 
 fn discover_lib_paths() -> Vec<PathBuf> {
@@ -94,6 +121,8 @@ fn try_load_api() -> Option<Arc<OpenSlideApi>> {
             let open: Symbol<Open> = lib.get(b"openslide_open\0").ok()?;
             let close: Symbol<Close> = lib.get(b"openslide_close\0").ok()?;
             let get_error: Symbol<GetError> = lib.get(b"openslide_get_error\0").ok()?;
+            let get_property_value: Symbol<GetPropertyValue> =
+                lib.get(b"openslide_get_property_value\0").ok()?;
             let level_count: Symbol<LevelCount> = lib.get(b"openslide_get_level_count\0").ok()?;
             let level_dimensions: Symbol<LevelDimensions> =
                 lib.get(b"openslide_get_level_dimensions\0").ok()?;
@@ -102,17 +131,27 @@ fn try_load_api() -> Option<Arc<OpenSlideApi>> {
                 *open,
                 *close,
                 *get_error,
+                *get_property_value,
                 *level_count,
                 *level_dimensions,
                 *read_region,
             )
         };
-        let (open, close, get_error, level_count, level_dimensions, read_region) = symbols;
+        let (
+            open,
+            close,
+            get_error,
+            get_property_value,
+            level_count,
+            level_dimensions,
+            read_region,
+        ) = symbols;
         return Some(Arc::new(OpenSlideApi {
             _lib: lib,
             open,
             close,
             get_error,
+            get_property_value,
             level_count,
             level_dimensions,
             read_region,
@@ -164,6 +203,23 @@ impl OpenSlide {
             (self.api.level_dimensions)(self.raw, level as c_int, &mut width, &mut height);
         }
         (width.max(0) as u64, height.max(0) as u64)
+    }
+
+    pub fn property(&self, name: &str) -> Option<String> {
+        let cname = CString::new(name).ok()?;
+        let value = unsafe { (self.api.get_property_value)(self.raw, cname.as_ptr()) };
+        if value.is_null() {
+            return None;
+        }
+        Some(
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    pub fn bounds(&self) -> Option<OpenSlideBounds> {
+        parse_bounds_from_properties(|name| self.property(name))
     }
 
     pub fn read_region(

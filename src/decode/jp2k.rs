@@ -1,3 +1,4 @@
+use crate::core::decode_runtime::{current_decode_runtime, DecodeRuntime};
 use crate::core::types::CpuTile;
 #[cfg(feature = "metal")]
 use crate::core::types::{DeviceTile, TilePixels};
@@ -13,6 +14,7 @@ use std::borrow::Cow;
 #[cfg(feature = "metal")]
 use signinum_core::DeviceSurface as SigninumDeviceSurface;
 use signinum_core::{BackendRequest as SigninumBackendRequest, PixelFormat as SigninumPixelFormat};
+use signinum_j2k::CpuDecodeParallelism;
 use signinum_j2k::J2kDecoder as SigninumJp2kDecoder;
 #[cfg(feature = "metal")]
 use signinum_j2k_metal::SurfaceResidency as SigninumJp2kSurfaceResidency;
@@ -83,6 +85,24 @@ fn decode_jp2k_to_sample_buffer_with_backend(
     colorspace: Jp2kColorSpace,
     backend: SigninumBackendRequest,
 ) -> Result<CpuTile, WsiError> {
+    decode_jp2k_to_sample_buffer_with_backend_and_parallelism(
+        data,
+        expected_width,
+        expected_height,
+        colorspace,
+        backend,
+        CpuDecodeParallelism::Auto,
+    )
+}
+
+fn decode_jp2k_to_sample_buffer_with_backend_and_parallelism(
+    data: &[u8],
+    expected_width: u32,
+    expected_height: u32,
+    colorspace: Jp2kColorSpace,
+    backend: SigninumBackendRequest,
+    parallelism: CpuDecodeParallelism,
+) -> Result<CpuTile, WsiError> {
     let header = validate_jp2k_decode_request(data, expected_width, expected_height)?;
     let output_colorspace = effective_output_colorspace(&header, colorspace);
     match backend {
@@ -92,6 +112,7 @@ fn decode_jp2k_to_sample_buffer_with_backend(
                 expected_width,
                 expected_height,
                 output_colorspace,
+                parallelism,
             )
         }
         SigninumBackendRequest::Metal | SigninumBackendRequest::Cuda => {
@@ -102,6 +123,7 @@ fn decode_jp2k_to_sample_buffer_with_backend(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn decode_jp2k_tile_batch_to_sample_buffers(
     reqs: &[Jp2kDecodeJob<'_>],
 ) -> Result<Vec<CpuTile>, WsiError> {
@@ -112,13 +134,29 @@ pub(crate) fn decode_jp2k_tile_batch_to_sample_buffers(
 }
 
 pub(crate) fn decode_batch_jp2k(jobs: &[Jp2kDecodeJob<'_>]) -> Vec<Result<CpuTile, WsiError>> {
-    if jobs.len() <= 1 {
-        return jobs.iter().map(decode_one_jp2k_job).collect();
+    let runtime = current_decode_runtime().unwrap_or_else(DecodeRuntime::default_arc);
+    decode_batch_jp2k_with_runtime(jobs, &runtime)
+}
+
+fn decode_batch_jp2k_with_runtime(
+    jobs: &[Jp2kDecodeJob<'_>],
+    runtime: &DecodeRuntime,
+) -> Vec<Result<CpuTile, WsiError>> {
+    if jobs.is_empty() {
+        return Vec::new();
     }
-    match decode_jp2k_tile_batch_to_sample_buffers(jobs) {
-        Ok(tiles) => tiles.into_iter().map(Ok).collect(),
-        Err(_) => jobs.iter().map(decode_one_jp2k_job).collect(),
+    if jobs.len() == 1 {
+        return jobs
+            .iter()
+            .map(|job| decode_one_jp2k_job_with_parallelism(job, CpuDecodeParallelism::Auto))
+            .collect();
     }
+    runtime.jp2k_cpu_pool().install(|| {
+        use rayon::prelude::*;
+        jobs.par_iter()
+            .map(|job| decode_one_jp2k_job_with_parallelism(job, CpuDecodeParallelism::Serial))
+            .collect()
+    })
 }
 
 #[cfg(feature = "metal")]
@@ -140,17 +178,25 @@ pub(crate) fn decode_batch_jp2k_pixels(
 }
 
 fn decode_one_jp2k_job(job: &Jp2kDecodeJob<'_>) -> Result<CpuTile, WsiError> {
+    decode_one_jp2k_job_with_parallelism(job, CpuDecodeParallelism::Auto)
+}
+
+fn decode_one_jp2k_job_with_parallelism(
+    job: &Jp2kDecodeJob<'_>,
+    parallelism: CpuDecodeParallelism,
+) -> Result<CpuTile, WsiError> {
     let colorspace = if job.rgb_color_space {
         Jp2kColorSpace::Rgb
     } else {
         Jp2kColorSpace::YCbCr
     };
-    decode_jp2k_to_sample_buffer_with_backend(
+    decode_jp2k_to_sample_buffer_with_backend_and_parallelism(
         job.data.as_ref(),
         job.expected_width,
         job.expected_height,
         colorspace,
         job.backend,
+        parallelism,
     )
     .map_err(|err| WsiError::Codec {
         codec: "j2k",
@@ -234,9 +280,11 @@ fn decode_jp2k_to_sample_buffer_cpu(
     expected_width: u32,
     expected_height: u32,
     colorspace: Jp2kColorSpace,
+    parallelism: CpuDecodeParallelism,
 ) -> Result<CpuTile, WsiError> {
     let mut decoder =
         SigninumJp2kDecoder::new(data).map_err(|err| WsiError::Jp2k(err.to_string()))?;
+    decoder.set_cpu_decode_parallelism(parallelism);
     let (width, height) = decoder.info().dimensions;
     let row_bytes = (width as usize)
         .checked_mul(SigninumPixelFormat::Rgb8.bytes_per_pixel())
@@ -1003,6 +1051,69 @@ mod tests {
         assert_eq!(decoded.len(), 2);
         assert_sample_buffer_matches_rgb_fixture(&decoded[0], &expected);
         assert_sample_buffer_matches_rgb_fixture(&decoded[1], &expected);
+    }
+
+    #[test]
+    fn decode_batch_jp2k_preserves_order_and_per_tile_results() {
+        let first_codestream = include_bytes!("../../tests/fixtures/jp2k/rgb_nomct.j2k");
+        let first_header = parse_codestream_header(first_codestream).unwrap();
+        let second_codestream = include_bytes!("../../tests/fixtures/jp2k/ycbcr_420.j2k");
+        let second_header = parse_codestream_header(second_codestream).unwrap();
+        let jobs = [
+            Jp2kDecodeJob {
+                data: Cow::Borrowed(first_codestream),
+                expected_width: first_header.image_width,
+                expected_height: first_header.image_height,
+                rgb_color_space: true,
+                backend: SigninumBackendRequest::Cpu,
+            },
+            Jp2kDecodeJob {
+                data: Cow::Borrowed(second_codestream),
+                expected_width: second_header.image_width,
+                expected_height: second_header.image_height,
+                rgb_color_space: false,
+                backend: SigninumBackendRequest::Cpu,
+            },
+        ];
+
+        let decoded = decode_batch_jp2k(&jobs);
+
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].is_ok());
+        assert!(decoded[1].is_ok());
+        assert_eq!(decoded[0].as_ref().unwrap().width, first_header.image_width);
+        assert_eq!(
+            decoded[1].as_ref().unwrap().width,
+            second_header.image_width
+        );
+    }
+
+    #[test]
+    fn decode_batch_jp2k_reports_malformed_tile_without_losing_good_tiles() {
+        let codestream = include_bytes!("../../tests/fixtures/jp2k/rgb_nomct.j2k");
+        let header = parse_codestream_header(codestream).unwrap();
+        let jobs = [
+            Jp2kDecodeJob {
+                data: Cow::Borrowed(codestream),
+                expected_width: header.image_width,
+                expected_height: header.image_height,
+                rgb_color_space: true,
+                backend: SigninumBackendRequest::Cpu,
+            },
+            Jp2kDecodeJob {
+                data: Cow::Borrowed(b"not j2k"),
+                expected_width: header.image_width,
+                expected_height: header.image_height,
+                rgb_color_space: true,
+                backend: SigninumBackendRequest::Cpu,
+            },
+        ];
+
+        let decoded = decode_batch_jp2k(&jobs);
+
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded[0].is_ok());
+        assert!(decoded[1].is_err());
     }
 
     #[test]
