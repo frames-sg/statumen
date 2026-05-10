@@ -1653,12 +1653,17 @@ fn build_encapsulated_frame_index(
         std::iter::once(0..fragments.len()).collect()
     } else if !offset_table.is_empty() {
         let base_item_offset = fragments[0].item_offset;
+        let fragment_indices_by_offset: HashMap<u64, usize> = fragments
+            .iter()
+            .enumerate()
+            .map(|(index, fragment)| (fragment.item_offset, index))
+            .collect();
         let mut start_indices = Vec::with_capacity(offset_table.len());
         for offset in &offset_table {
             let target = base_item_offset + *offset as u64;
-            let index = fragments
-                .iter()
-                .position(|fragment| fragment.item_offset == target)
+            let index = fragment_indices_by_offset
+                .get(&target)
+                .copied()
                 .ok_or_else(|| {
                     invalid_slide(
                         path,
@@ -3116,6 +3121,135 @@ mod tests {
         assert_eq!(frames.fragments[0].len, first.len() as u32);
         assert_eq!(frames.fragments[1].item_offset, second_item_offset);
         assert_eq!(frames.fragments[1].len, second.len() as u32);
+    }
+
+    #[test]
+    fn large_basic_offset_table_frame_index_builds_quickly() {
+        let frame_count = 25_000usize;
+        let mut fragments = Vec::with_capacity(frame_count);
+        let mut offset_table = Vec::with_capacity(frame_count);
+        let mut item_offset = 1024u64;
+        for _ in 0..frame_count {
+            offset_table.push((item_offset - 1024) as u32);
+            fragments.push(DicomFragmentRef {
+                payload_offset: item_offset + 8,
+                item_offset,
+                len: 64,
+            });
+            item_offset += 72;
+        }
+
+        let started = std::time::Instant::now();
+        let frames = build_encapsulated_frame_index(
+            Path::new("large-basic-offset-table.dcm"),
+            fragments,
+            offset_table,
+            frame_count as u32,
+        )
+        .expect("large basic offset table should build");
+
+        assert_eq!(frames.frame_ranges.len(), frame_count);
+        assert_eq!(frames.frame_ranges[0], 0..1);
+        assert_eq!(
+            frames.frame_ranges[frame_count - 1],
+            frame_count - 1..frame_count
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "large DICOM basic offset table frame index should build in linear time"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "metal")]
+    fn local_htj2k_dicom_full_tile_can_require_device_output() {
+        let Some(path) = local_htj2k_dicom_device_fixture() else {
+            return;
+        };
+        let Some(sessions) = test_metal_sessions() else {
+            eprintln!("skipping local HTJ2K DICOM device test; no Metal device");
+            return;
+        };
+
+        let slide = Slide::open(&path).expect("open local HTJ2K DICOM slide");
+        let tile = slide
+            .read_tile(
+                &TileRequest {
+                    scene: 0,
+                    series: 0,
+                    level: 0,
+                    plane: PlaneSelection::default(),
+                    col: 0,
+                    row: 0,
+                },
+                TileOutputPreference::require_device_auto_with_metal_and_compressed_decode(
+                    sessions,
+                ),
+            )
+            .expect("read full HTJ2K tile with required device output");
+
+        assert!(matches!(tile, TilePixels::Device(_)));
+    }
+
+    #[test]
+    #[cfg(feature = "metal")]
+    fn local_htj2k_dicom_prefer_device_batch_keeps_full_tiles_on_device() {
+        let Some(path) = local_htj2k_dicom_device_fixture() else {
+            return;
+        };
+        let Some(sessions) = test_metal_sessions() else {
+            eprintln!("skipping local HTJ2K DICOM device test; no Metal device");
+            return;
+        };
+
+        let slide = Slide::open(&path).expect("open local HTJ2K DICOM slide");
+        let tiles = slide
+            .read_tiles(
+                &[
+                    TileRequest {
+                        scene: 0,
+                        series: 0,
+                        level: 0,
+                        plane: PlaneSelection::default(),
+                        col: 0,
+                        row: 0,
+                    },
+                    TileRequest {
+                        scene: 0,
+                        series: 0,
+                        level: 0,
+                        plane: PlaneSelection::default(),
+                        col: 1,
+                        row: 0,
+                    },
+                ],
+                TileOutputPreference::prefer_device_auto_with_metal_and_compressed_decode(sessions)
+                    .without_adaptive_decode_route(),
+            )
+            .expect("read full HTJ2K tile batch with residency-preferred device output");
+
+        assert!(
+            tiles
+                .iter()
+                .any(|tile| matches!(tile, TilePixels::Device(_))),
+            "prefer-device HTJ2K batch should return device tiles when full tiles are decodable"
+        );
+    }
+
+    #[cfg(feature = "metal")]
+    fn local_htj2k_dicom_device_fixture() -> Option<PathBuf> {
+        let Some(path) = std::env::var_os("STATUMEN_LOCAL_HTJ2K_DICOM").map(PathBuf::from) else {
+            eprintln!("skipping local HTJ2K DICOM device test; STATUMEN_LOCAL_HTJ2K_DICOM unset");
+            return None;
+        };
+        if !path.is_file() {
+            eprintln!(
+                "skipping local HTJ2K DICOM device test; missing {}",
+                path.display()
+            );
+            return None;
+        }
+        Some(path)
     }
 
     #[test]

@@ -2,12 +2,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::core::cache::{CacheConfig, CacheKey, TileCache};
+use crate::core::decode_runtime::{AdaptiveDecodeReader, DecodeExecutionOptions, DecodeRuntime};
+#[cfg(test)]
+use crate::core::decode_runtime::{DecodeRoute, DecodeRouteDecision};
 use crate::core::types::*;
 use crate::error::WsiError;
 use crate::formats::dicom::DicomBackend;
 use crate::formats::hamamatsu_vms::HamamatsuVmsBackend;
 use crate::formats::mirax::MiraxBackend;
 use crate::formats::olympus_vsi::OlympusVsiBackend;
+use crate::formats::raw_jp2k::RawJp2kBackend;
 use crate::formats::svcache::SvcacheBackend;
 use crate::formats::tiff_family::TiffFamilyBackend;
 use crate::formats::zeiss::ZeissBackend;
@@ -953,6 +957,8 @@ impl FormatRegistry {
         self.register(vms.clone(), vms);
         let vsi = Arc::new(OlympusVsiBackend::new());
         self.register(vsi.clone(), vsi);
+        let raw_jp2k = Arc::new(RawJp2kBackend::new());
+        self.register(raw_jp2k.clone(), raw_jp2k);
         let zeiss_zvi = Arc::new(ZeissZviBackend::new());
         self.register(zeiss_zvi.clone(), zeiss_zvi);
         let zeiss = Arc::new(ZeissBackend::new());
@@ -1001,10 +1007,11 @@ impl FormatRegistry {
 }
 
 pub struct SlideOpenOptions {
-    pub registry: FormatRegistry,
-    pub cache_config: CacheConfig,
-    pub svcache_policy: crate::formats::svcache::SvcachePolicy,
-    pub max_region_pixels: u64,
+    registry: FormatRegistry,
+    cache_config: CacheConfig,
+    svcache_policy: crate::formats::svcache::SvcachePolicy,
+    max_region_pixels: u64,
+    decode_execution_options: DecodeExecutionOptions,
 }
 
 impl SlideOpenOptions {
@@ -1014,6 +1021,7 @@ impl SlideOpenOptions {
             cache_config: CacheConfig::deterministic(),
             svcache_policy: crate::formats::svcache::SvcachePolicy::Off,
             max_region_pixels: DEFAULT_MAX_REGION_PIXELS,
+            decode_execution_options: DecodeExecutionOptions::default(),
         }
     }
 
@@ -1039,6 +1047,30 @@ impl SlideOpenOptions {
         self.max_region_pixels = max_region_pixels;
         self
     }
+
+    pub fn with_decode_execution_options(
+        mut self,
+        decode_execution_options: DecodeExecutionOptions,
+    ) -> Self {
+        self.decode_execution_options = decode_execution_options;
+        self
+    }
+
+    pub fn cache_config(&self) -> CacheConfig {
+        self.cache_config
+    }
+
+    pub fn svcache_policy(&self) -> crate::formats::svcache::SvcachePolicy {
+        self.svcache_policy
+    }
+
+    pub fn max_region_pixels(&self) -> u64 {
+        self.max_region_pixels
+    }
+
+    pub fn decode_execution_options(&self) -> DecodeExecutionOptions {
+        self.decode_execution_options
+    }
 }
 
 impl Default for SlideOpenOptions {
@@ -1055,6 +1087,7 @@ pub struct Slide {
     cache: Arc<TileCache>,
     display_cache: Arc<TileCache>,
     max_region_pixels: u64,
+    decode_runtime: Arc<DecodeRuntime>,
 }
 
 impl std::fmt::Debug for Slide {
@@ -1068,25 +1101,29 @@ impl std::fmt::Debug for Slide {
 impl Slide {
     /// Construct from an already-opened source and cache.
     pub(crate) fn from_source(source: Box<dyn SlideReader>, cache: Arc<TileCache>) -> Self {
+        let decode_runtime = DecodeRuntime::default_arc();
         Self {
-            source,
+            source: Box::new(AdaptiveDecodeReader::new(source, decode_runtime.clone())),
             cache,
             display_cache: Arc::new(TileCache::display_default()),
             max_region_pixels: DEFAULT_MAX_REGION_PIXELS,
+            decode_runtime,
         }
     }
 
-    pub(crate) fn from_source_with_config(
+    pub(crate) fn from_source_with_config_and_runtime(
         source: Box<dyn SlideReader>,
         cache_config: CacheConfig,
         max_region_pixels: u64,
+        decode_runtime: Arc<DecodeRuntime>,
     ) -> Self {
         let source_hint = source.recommended_shared_cache_bytes();
         Self {
-            source,
+            source: Box::new(AdaptiveDecodeReader::new(source, decode_runtime.clone())),
             cache: Arc::new(TileCache::shared_with_config(cache_config, source_hint)),
             display_cache: Arc::new(TileCache::display_with_config(cache_config)),
             max_region_pixels,
+            decode_runtime,
         }
     }
 
@@ -1109,10 +1146,12 @@ impl Slide {
             options.svcache_policy,
         )?;
         let source = options.registry.open(&resolved_path)?;
-        Ok(Self::from_source_with_config(
+        let decode_runtime = Arc::new(DecodeRuntime::new(options.decode_execution_options)?);
+        Ok(Self::from_source_with_config_and_runtime(
             source,
             options.cache_config,
             options.max_region_pixels,
+            decode_runtime,
         ))
     }
 
@@ -1143,6 +1182,10 @@ impl Slide {
 
     pub fn dataset(&self) -> &Dataset {
         self.source.dataset()
+    }
+
+    pub fn decode_execution_options(&self) -> DecodeExecutionOptions {
+        self.decode_runtime.options()
     }
 
     pub fn level_source_kind(
@@ -1361,6 +1404,7 @@ mod tests {
     use super::*;
     use crate::properties::Properties;
     use std::collections::HashMap;
+    use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1918,6 +1962,48 @@ mod tests {
     }
 
     #[test]
+    fn slide_open_options_configures_decode_execution() {
+        let options = SlideOpenOptions::default().with_decode_execution_options(
+            DecodeExecutionOptions::default().with_route_sample_size(2),
+        );
+
+        assert_eq!(options.decode_execution_options().route_sample_size(), 2);
+    }
+
+    #[test]
+    fn adaptive_route_cpu_wins_when_device_is_slower() {
+        let winner = DecodeRouteDecision::winner_for_measurement(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(20),
+            4,
+        );
+
+        assert_eq!(winner, DecodeRoute::Cpu);
+    }
+
+    #[test]
+    fn adaptive_route_cpu_wins_when_device_returns_no_resident_tiles() {
+        let winner = DecodeRouteDecision::winner_for_measurement(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(1),
+            0,
+        );
+
+        assert_eq!(winner, DecodeRoute::Cpu);
+    }
+
+    #[test]
+    fn adaptive_route_device_wins_when_it_beats_threshold() {
+        let winner = DecodeRouteDecision::winner_for_measurement(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(80),
+            4,
+        );
+
+        assert_eq!(winner, DecodeRoute::Device);
+    }
+
+    #[test]
     fn probe_confidence_definite_beats_likely() {
         // Definite should beat Likely — tested via ProbeConfidence ordering
         assert!(matches!(
@@ -2024,6 +2110,44 @@ mod tests {
             Err(_) => {} // Any other error also proves the backend tried
             Ok(_) => panic!("expected error for nonexistent file"),
         }
+    }
+
+    #[test]
+    fn builtin_registry_opens_raw_j2c_codestream_as_single_tile_slide() {
+        let mut file = tempfile::Builder::new().suffix(".j2c").tempfile().unwrap();
+        file.write_all(include_bytes!("../../tests/fixtures/jp2k/rgb_mct.j2k"))
+            .unwrap();
+        file.flush().unwrap();
+
+        let slide =
+            Slide::open_with_cache_bytes(file.path(), &FormatRegistry::builtin(), 16 * 1024 * 1024)
+                .unwrap();
+
+        let level = &slide.dataset().scenes[0].series[0].levels[0];
+        assert_eq!(level.dimensions, (16, 12));
+        assert!(matches!(
+            level.tile_layout,
+            TileLayout::Regular {
+                tile_width: 16,
+                tile_height: 12,
+                tiles_across: 1,
+                tiles_down: 1
+            }
+        ));
+
+        let req = TileRequest {
+            scene: 0,
+            series: 0,
+            level: 0,
+            plane: PlaneSelection::default(),
+            col: 0,
+            row: 0,
+        };
+        assert_eq!(slide.tile_codec_kind(&req), TileCodecKind::Jp2k);
+        let tile = slide.source().read_tiles_cpu(&[req]).unwrap().remove(0);
+        assert_eq!((tile.width, tile.height), (16, 12));
+        assert_eq!(tile.channels, 3);
+        assert_eq!(tile.color_space, ColorSpace::Rgb);
     }
 
     #[test]

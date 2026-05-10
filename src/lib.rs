@@ -10,6 +10,7 @@ pub mod output;
 pub mod properties;
 
 pub use core::cache::CacheConfig;
+pub use core::decode_runtime::{DecodeExecutionOptions, DecodeRoute, DecodeRouteDecision};
 pub use error::WsiError;
 pub use formats::svcache::{
     build_svcache, build_svcache_tiles, cache_dir_svcache_path, default_svcache_path,

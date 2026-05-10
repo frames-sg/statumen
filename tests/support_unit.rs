@@ -257,6 +257,53 @@ fn openslide_shim_missing_env_path_does_not_panic() {
     let _ = result;
 }
 
+#[cfg(feature = "parity-openslide")]
+#[test]
+fn openslide_shim_bounds_parser_reads_canvas_origin() {
+    let props = [
+        ("openslide.bounds-x", "10778"),
+        ("openslide.bounds-y", "35096"),
+        ("openslide.bounds-width", "36832"),
+        ("openslide.bounds-height", "38432"),
+    ];
+
+    let bounds = support::openslide_shim::parse_bounds_from_properties(|name| {
+        props
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_string())
+    })
+    .expect("bounds");
+
+    assert_eq!(bounds.x, 10778);
+    assert_eq!(bounds.y, 35096);
+    assert_eq!(bounds.width, 36832);
+    assert_eq!(bounds.height, 38432);
+}
+
+#[cfg(feature = "parity-openslide")]
+#[test]
+fn openslide_shim_bounds_parser_rejects_missing_or_empty_bounds() {
+    assert!(support::openslide_shim::parse_bounds_from_properties(|_| None).is_none());
+
+    let props = [
+        ("openslide.bounds-x", "0"),
+        ("openslide.bounds-y", "0"),
+        ("openslide.bounds-width", "0"),
+        ("openslide.bounds-height", "100"),
+    ];
+
+    assert!(
+        support::openslide_shim::parse_bounds_from_properties(|name| {
+            props
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+        .is_none()
+    );
+}
+
 struct EnvGuard {
     key: &'static str,
     prev: Option<std::ffi::OsString>,

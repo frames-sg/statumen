@@ -1059,6 +1059,7 @@ pub struct DeviceOutputContext {
     #[cfg(feature = "metal")]
     metal: Option<crate::output::metal::MetalBackendSessions>,
     compressed_device_decode: bool,
+    adaptive_decode_route: bool,
 }
 
 impl DeviceOutputContext {
@@ -1067,6 +1068,7 @@ impl DeviceOutputContext {
             #[cfg(feature = "metal")]
             metal: None,
             compressed_device_decode: false,
+            adaptive_decode_route: true,
         }
     }
 
@@ -1075,6 +1077,7 @@ impl DeviceOutputContext {
         Self {
             metal: Some(metal),
             compressed_device_decode: false,
+            adaptive_decode_route: true,
         }
     }
 
@@ -1083,8 +1086,17 @@ impl DeviceOutputContext {
         self
     }
 
+    pub fn without_adaptive_decode_route(mut self) -> Self {
+        self.adaptive_decode_route = false;
+        self
+    }
+
     pub(crate) fn compressed_device_decode(&self) -> bool {
         self.compressed_device_decode
+    }
+
+    pub(crate) fn adaptive_decode_route(&self) -> bool {
+        self.adaptive_decode_route
     }
 
     #[cfg(feature = "metal")]
@@ -1093,7 +1105,7 @@ impl DeviceOutputContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OutputBackendRequest {
     Auto,
     Cpu,
@@ -1227,6 +1239,25 @@ impl TileOutputPreference {
             }
             Self::Cpu { .. } => false,
         }
+    }
+
+    pub fn adaptive_decode_route_enabled(&self) -> bool {
+        match self {
+            Self::PreferDevice { context, .. } | Self::RequireDevice { context, .. } => {
+                context.adaptive_decode_route()
+            }
+            Self::Cpu { .. } => false,
+        }
+    }
+
+    pub fn without_adaptive_decode_route(mut self) -> Self {
+        match &mut self {
+            Self::PreferDevice { context, .. } | Self::RequireDevice { context, .. } => {
+                *context = context.clone().without_adaptive_decode_route();
+            }
+            Self::Cpu { .. } => {}
+        }
+        self
     }
 
     #[cfg(feature = "metal")]
@@ -1380,6 +1411,16 @@ mod tests {
         assert!(
             TileOutputPreference::require_device_auto_with_compressed_decode().requires_device()
         );
+    }
+
+    #[test]
+    fn tile_output_preference_can_disable_adaptive_decode_route() {
+        let preference = TileOutputPreference::prefer_device_auto_with_compressed_decode();
+        assert!(preference.adaptive_decode_route_enabled());
+
+        let preference = preference.without_adaptive_decode_route();
+        assert!(!preference.adaptive_decode_route_enabled());
+        assert!(preference.compressed_device_decode_enabled());
     }
 
     // --- TileLayout intersection ---
