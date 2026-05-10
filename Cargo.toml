@@ -59,12 +59,12 @@ base64 = "0.22"
 flate2 = "1"
 tempfile = "3"
 zstd = "0.13"
-signinum-jpeg = "1.1"
+signinum-jpeg = "1.1.1"
 signinum-core = "1"
 signinum-tilecodec = "1"
-signinum-j2k = "1.2.0"
-signinum-jpeg-metal = { version = "0.2.4", optional = true }
-signinum-j2k-metal = { version = "0.3.3", optional = true }
+signinum-j2k = "1.2.1"
+signinum-jpeg-metal = { version = "0.2.5", optional = true }
+signinum-j2k-metal = { version = "0.3.4", optional = true }
 metal = { version = "0.31", optional = true }
 dicom-core = "0.9"
 dicom-object = "0.9"
@@ -81,7 +81,7 @@ jpeg-encoder = "0.6"
 tempfile = "3"
 toml = "0.8"
 libloading = "0.8"
-signinum-j2k-native = "0.3.3"
+signinum-j2k-native = "0.3.4"
 
 [patch.crates-io]
 signinum-core = { path = "../signinum/crates/signinum-core" }
