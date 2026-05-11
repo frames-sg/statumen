@@ -30,9 +30,12 @@ pub(crate) struct CStringArray {
     ptrs: Vec<*const c_char>,
 }
 
-// CStringArray is immutable after construction. The raw pointers point into
-// heap allocations owned by `strings` and remain valid for the handle lifetime.
+// SAFETY: CStringArray is immutable after construction. The raw pointers point
+// into heap allocations owned by `_strings` and remain valid for the handle
+// lifetime.
 unsafe impl Send for CStringArray {}
+// SAFETY: Shared access cannot mutate `_strings` or `ptrs`, so the stored C
+// string pointers remain stable while the owning handle is alive.
 unsafe impl Sync for CStringArray {}
 
 impl CStringArray {

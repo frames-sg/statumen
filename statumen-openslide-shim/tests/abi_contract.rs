@@ -14,11 +14,17 @@ fn fixture_path() -> CString {
 }
 
 unsafe fn c_string(ptr: *const std::os::raw::c_char) -> String {
-    CStr::from_ptr(ptr).to_string_lossy().into_owned()
+    // SAFETY: Test callers only pass non-null pointers returned by the shim;
+    // each points to a static or handle-owned NUL-terminated C string.
+    unsafe { CStr::from_ptr(ptr) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[test]
 fn null_inputs_are_safe_error_values() {
+    // SAFETY: This test intentionally exercises the C ABI with null pointers
+    // and stack-allocated output buffers to verify OpenSlide-compatible guards.
     unsafe {
         assert!(openslide_detect_vendor(ptr::null()).is_null());
         assert!(openslide_open(ptr::null()).is_null());
@@ -57,6 +63,8 @@ fn unsupported_file_returns_null_without_error_handle() {
     std::fs::write(&path, b"not a slide").expect("write fixture");
     let cpath = CString::new(path.to_string_lossy().as_bytes()).expect("path has no NUL");
 
+    // SAFETY: `cpath` is a live NUL-terminated path for the duration of both
+    // ABI calls; the returned handles are asserted null and not dereferenced.
     unsafe {
         assert!(openslide_detect_vendor(cpath.as_ptr()).is_null());
         assert!(openslide_open(cpath.as_ptr()).is_null());
@@ -67,6 +75,8 @@ fn unsupported_file_returns_null_without_error_handle() {
 fn opens_supported_slide_and_exposes_core_metadata() {
     let path = fixture_path();
 
+    // SAFETY: `path` is a live NUL-terminated fixture path, and every returned
+    // OpenSlide handle/string pointer is checked before use.
     unsafe {
         let vendor = openslide_detect_vendor(path.as_ptr());
         assert!(!vendor.is_null());
@@ -120,6 +130,8 @@ fn opens_supported_slide_and_exposes_core_metadata() {
 fn read_errors_zero_dest_and_make_handle_terminal() {
     let path = fixture_path();
 
+    // SAFETY: `path` is a live NUL-terminated fixture path, `argb`/dimension
+    // buffers are valid for writes, and the handle is closed exactly once.
     unsafe {
         let osr = openslide_open(path.as_ptr());
         assert!(!osr.is_null());
@@ -146,6 +158,8 @@ fn read_errors_zero_dest_and_make_handle_terminal() {
 fn associated_icc_and_cache_apis_have_v4_safe_defaults() {
     let path = fixture_path();
 
+    // SAFETY: `path` is a live NUL-terminated fixture path, the cache pointer
+    // is released exactly once, and the handle is closed exactly once.
     unsafe {
         let osr = openslide_open(path.as_ptr());
         assert!(!osr.is_null());

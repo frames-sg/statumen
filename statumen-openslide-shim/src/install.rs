@@ -216,6 +216,9 @@ fn read_manifest(path: &Path) -> Result<Vec<RestoreEntry>, String> {
 }
 
 fn verify_library_version(path: &Path) -> Result<(), String> {
+    // SAFETY: The loaded library is immediately queried for the documented
+    // OpenSlide version symbol, and the returned pointer is checked for NULL
+    // before conversion to a C string.
     unsafe {
         let library = libloading::Library::new(path)
             .map_err(|err| format!("load {}: {err}", path.display()))?;
