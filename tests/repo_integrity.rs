@@ -30,6 +30,16 @@ fn public_docs_use_statumen_entrypoint() {
     let readme = fs::read_to_string(crate_root().join("README.md")).expect("read README");
     let architecture =
         fs::read_to_string(crate_root().join("docs/architecture.md")).expect("read docs");
+    let manifest = fs::read_to_string(crate_root().join("Cargo.toml")).expect("read manifest");
+    let manifest = manifest
+        .parse::<toml::Value>()
+        .expect("Cargo.toml must parse as TOML");
+    let version = manifest
+        .get("package")
+        .and_then(toml::Value::as_table)
+        .and_then(|package| package.get("version"))
+        .and_then(toml::Value::as_str)
+        .expect("package.version must be present");
 
     assert!(
         readme.contains("# statumen"),
@@ -51,10 +61,38 @@ fn public_docs_use_statumen_entrypoint() {
             "README must keep public usability docs current; missing `{required}`"
         );
     }
+    let metal_dependency =
+        format!("statumen = {{ version = \"{version}\", features = [\"metal\"] }}");
     assert!(
-        !readme.contains("statumen = \"0.1\""),
-        "README must not advertise the old pre-0.2 dependency version"
+        readme.contains(&metal_dependency),
+        "README Metal dependency snippet must match Cargo.toml package.version `{version}`"
     );
+    for required in [
+        "SlideOpenOptions",
+        "SvcachePolicy",
+        "prefer_device_auto_with_metal_and_compressed_decode",
+        "`.j2k`, `.j2c`",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README must document current public behavior; missing `{required}`"
+        );
+    }
+    for stale in [
+        "statumen = \"0.1\"",
+        "version = \"0.2\"",
+        "TileOutputPreference::metal()",
+        "Phase 7a",
+        "sv-slide",
+        "`.jp2`, `.jpc`",
+        "TBD: replace",
+        "sibling signinum",
+    ] {
+        assert!(
+            !readme.contains(stale),
+            "README must not retain stale public docs text `{stale}`"
+        );
+    }
     assert!(
         architecture.contains("# statumen Architecture"),
         "architecture docs must title the crate statumen"
