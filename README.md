@@ -37,35 +37,109 @@ sparse tiled frame maps.
 
 ## Install
 
-```toml
-[dependencies]
-statumen = "0.1"
+```sh
+cargo add statumen
 ```
 
 ## Quick Start
 
+The easiest public API is region reading. It opens a slide, reads pixels in
+level coordinates, and returns an `image::RgbaImage` that can be saved or passed
+to analysis code.
+
 ```rust,no_run
-use std::path::Path;
-use statumen::{PlaneSelection, Slide, TileOutputPreference, TilePixels, TileRequest};
+use statumen::{
+    LevelIdx, PlaneIdx, RegionRequest, SceneId, SeriesId, Slide,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let slide = Slide::open(Path::new("sample.svs"))?;
-    let req = TileRequest {
-        scene: 0,
-        series: 0,
-        level: 0,
-        plane: PlaneSelection::default(),
-        col: 0,
-        row: 0,
+    let slide = Slide::open("sample.svs")?;
+    let region = RegionRequest {
+        scene: SceneId(0),
+        series: SeriesId(0),
+        level: LevelIdx(0),
+        plane: PlaneIdx::default(),
+        origin_px: (0, 0),
+        size_px: (1024, 1024),
     };
-
-    let tile = slide.read_tile(&req, TileOutputPreference::cpu())?;
-    if let TilePixels::Cpu(cpu) = tile {
-        println!("decoded {}x{} tile", cpu.width, cpu.height);
-    }
+    let image = slide.read_region_rgba(&region)?;
+    image.save("region.png")?;
     Ok(())
 }
 ```
+
+Use tile-level APIs only when you are writing a viewer, cache, benchmark, or
+compressed-tile workflow that needs exact tile coordinates.
+
+## Fast Path For LLM-Assisted Use
+
+If you are a pathologist or researcher asking an LLM to use this repository,
+give it this instruction:
+
+> Use `statumen` to open whole-slide image files and read regions or tiles.
+> Use `Slide::open` plus `read_region_rgba` for the first working prototype.
+> Use `wsi-dicom` only when the task is DICOM export, and use `signinum` only
+> when the task is codec-level JPEG or JPEG 2000 work.
+
+For a quick script, ask the LLM to:
+
+1. Add `statumen` as a Rust dependency.
+2. Open the slide with `Slide::open("path/to/slide.svs")`.
+3. Build a `RegionRequest` for scene 0, series 0, level 0.
+4. Call `read_region_rgba`.
+5. Save the returned image or pass it to the next analysis step.
+
+## Supported Inputs
+
+Statumen is a reader layer. It detects the container, normalizes slide
+geometry, and delegates codec decode to Signinum.
+
+| Input family | Typical extensions | Notes |
+| --- | --- | --- |
+| TIFF-family WSI | `.svs`, `.tif`, `.tiff`, `.ndpi`, `.scn` | Includes common Aperio, Hamamatsu, Leica, Philips, Ventana, Trestle, and generic tiled TIFF layouts where metadata is available. |
+| DICOM VL WSI | `.dcm` or DICOM series directory | Opens single instances or sibling pyramid instances from the same series. |
+| MIRAX | `.mrxs` | Reads slide metadata and tiles through the Statumen format adapter. |
+| Hamamatsu VMS/VMU | `.vms`, `.vmu` | Reads legacy Hamamatsu multi-file slides. |
+| Olympus VSI | `.vsi` | Reads Olympus whole-slide containers. |
+| Raw JPEG 2000 / HTJ2K | `.j2k`, `.jp2`, `.jpc` | Useful for codec fixtures and simple single-image workflows. |
+| `.svcache` | `.svcache` | Statumen's cache format for prebuilt slide tiles. |
+
+Unsupported or incomplete sources return `WsiError`; they should not silently
+produce black or partial pixels.
+
+## OpenSlide Compatibility Shim
+
+The workspace includes `statumen-openslide-shim`, a C ABI library that exports
+OpenSlide-compatible symbols and routes reads through Statumen. Use it when an
+existing tool already loads `libopenslide` and you want to try Statumen without
+rewriting that tool.
+
+Build the shim:
+
+```sh
+cargo build -p statumen-openslide-shim --release
+```
+
+Then point a test client at the produced dynamic library with a local loader
+path, or install it into a private prefix:
+
+```sh
+cargo run -p statumen-openslide-shim --bin statumen-openslide-install -- \
+  install --shim target/release/libstatumen_openslide_shim.dylib \
+  --prefix /tmp/statumen-openslide
+```
+
+On Linux the library suffix is `.so`; on macOS it is `.dylib`. Prefer a private
+prefix while testing. The installer writes a restore manifest and can restore
+backed-up libraries with:
+
+```sh
+cargo run -p statumen-openslide-shim --bin statumen-openslide-install -- \
+  restore --prefix /tmp/statumen-openslide
+```
+
+See [`statumen-openslide-shim/README.md`](statumen-openslide-shim/README.md)
+for ABI coverage and loader-path notes.
 
 ## Features
 
@@ -86,7 +160,7 @@ backend is macOS-only and is provided by the `signinum-jpeg-metal` and
 
 ```toml
 [dependencies]
-statumen = { version = "0.1", features = ["metal"] }
+statumen = { version = "0.2", features = ["metal"] }
 ```
 
 ```rust,ignore

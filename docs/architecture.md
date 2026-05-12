@@ -14,6 +14,8 @@ delegated to `signinum`; app runtime policy is owned by SlideViewer.
   into signinum calls.
 - `output`: optional device-output session plumbing, currently Metal.
 - `bin`: benchmark and cache-building entry points.
+- `statumen-openslide-shim`: OpenSlide-compatible C ABI shim that calls
+  `statumen::Slide` for existing OpenSlide-based applications.
 
 Dependencies flow from format readers inward to `core` and outward only through
 `decode`/`output` adapter glue. Format readers must not type-erase cache state
@@ -27,7 +29,7 @@ or reach into SlideViewer runtime policy.
   `.svcache` policy, registry selection, and region limits.
 - `SvcachePolicy` controls read-through cache resolution. SlideViewer maps env
   vars to this policy; the library does not read `SV_SVCACHE`.
-- `TileOutputPreference` uses WSI-rs-owned `OutputBackendRequest`. Conversion to
+- `TileOutputPreference` uses Statumen-owned `OutputBackendRequest`. Conversion to
   `signinum_core::BackendRequest` happens only inside codec glue.
 - `SlideReadContext` is the typed path for read caches and request limits.
   `Any`/downcast-based cache tunnels are not allowed.
@@ -38,8 +40,8 @@ or reach into SlideViewer runtime policy.
   persist only after metadata and payload are complete.
 - Sparse `.svcache` updates must preserve fresh existing tiles and append
   missing requested tiles.
-- Cache budgets that depend on system memory belong in SlideViewer manager code,
-  then flow into WSI-rs through `CacheConfig`.
+- Cache budgets that depend on system memory belong in application manager code,
+  then flow into Statumen through `CacheConfig`.
 - `tiff_family/pixel_access.rs` remains the highest-risk module. New TIFF
   behavior should move toward focused helper modules instead of expanding that
   file.

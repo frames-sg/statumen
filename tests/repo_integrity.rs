@@ -39,10 +39,45 @@ fn public_docs_use_statumen_entrypoint() {
         readme.contains("use statumen::"),
         "README quick start must import statumen"
     );
+    for required in [
+        "cargo add statumen",
+        "read_region_rgba",
+        "Fast Path For LLM-Assisted Use",
+        "OpenSlide Compatibility Shim",
+        "statumen-openslide-shim/README.md",
+    ] {
+        assert!(
+            readme.contains(required),
+            "README must keep public usability docs current; missing `{required}`"
+        );
+    }
+    assert!(
+        !readme.contains("statumen = \"0.1\""),
+        "README must not advertise the old pre-0.2 dependency version"
+    );
     assert!(
         architecture.contains("# statumen Architecture"),
         "architecture docs must title the crate statumen"
     );
+}
+
+#[test]
+fn openslide_shim_has_public_usage_docs() {
+    let readme = fs::read_to_string(crate_root().join("statumen-openslide-shim/README.md"))
+        .expect("read OpenSlide shim README");
+    for required in [
+        "cargo build -p statumen-openslide-shim --release",
+        "libopenslide.1.dylib",
+        "libopenslide.so.1",
+        "private prefix",
+        "ABI Coverage",
+        "read_region",
+    ] {
+        assert!(
+            readme.contains(required),
+            "OpenSlide shim README must document `{required}`"
+        );
+    }
 }
 
 #[test]
