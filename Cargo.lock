@@ -1274,6 +1274,8 @@ checksum = "0fda2ff0d084019ba4d7c6f371c95d8fd75ce3524c3cb8fb653a3023f6323e64"
 [[package]]
 name = "signinum-core"
 version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a961ac531dbd99a10ccc886964c5a349abc78d1eee5259002f5a1db7ebd4c521"
 dependencies = [
  "thiserror 2.0.18",
 ]
@@ -1281,6 +1283,8 @@ dependencies = [
 [[package]]
 name = "signinum-j2k"
 version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93ee6938dcab7f43cb71c3b329b98e2c68cb92c3eb7f9d2b2eb959ea72158608"
 dependencies = [
  "signinum-core",
  "signinum-j2k-native",
@@ -1290,6 +1294,8 @@ dependencies = [
 [[package]]
 name = "signinum-j2k-metal"
 version = "0.3.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cacb613e6179081217d063da0d3faeec0d084c7e0c00a90d34c8fbd1dd7bbe51"
 dependencies = [
  "libc",
  "metal",
@@ -1303,6 +1309,8 @@ dependencies = [
 [[package]]
 name = "signinum-j2k-native"
 version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c18387d6667133bdd8470a996cf0d0d1b35de0957d3d2b030166b8b6cac9c0b"
 dependencies = [
  "fearless_simd",
  "libm",
@@ -1312,6 +1320,8 @@ dependencies = [
 [[package]]
 name = "signinum-jpeg"
 version = "1.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c9e7908bc4e6c9b8b301f538ebf84640d7e764c4f29051fd0a6dfc82d8c7002"
 dependencies = [
  "memchr",
  "rayon",
@@ -1322,6 +1332,8 @@ dependencies = [
 [[package]]
 name = "signinum-jpeg-metal"
 version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7e39fcedd212683578e137931cb5b15a2b6e3410127538d1748500249570b7c"
 dependencies = [
  "metal",
  "signinum-core",
@@ -1332,6 +1344,8 @@ dependencies = [
 [[package]]
 name = "signinum-tilecodec"
 version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6e7a1207e94da85d6dc4354c330a8829da49d837a69455f4a479f7d3ead2812"
 dependencies = [
  "flate2",
  "signinum-core",
