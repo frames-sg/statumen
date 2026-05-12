@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+#[cfg(all(feature = "metal", test, target_os = "macos"))]
+use std::cell::Cell;
 
 use crate::core::types::{ColorSpace, CpuTile};
 #[cfg(feature = "metal")]
@@ -29,6 +31,20 @@ use signinum_jpeg_metal::SurfaceResidency as SigninumJpegSurfaceResidency;
 /// OOM from crafted JPEG headers with extreme dimensions.
 const MAX_JPEG_DECODE_BYTES: u64 = 512 * 1024 * 1024;
 const JPEG_MAX_DIMENSION: u16 = 65500;
+#[cfg(all(feature = "metal", test, target_os = "macos"))]
+thread_local! {
+    static JPEG_DEVICE_BATCH_ATTEMPTS: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(all(feature = "metal", test, target_os = "macos"))]
+fn reset_jpeg_device_batch_attempts_for_test() {
+    JPEG_DEVICE_BATCH_ATTEMPTS.with(|attempts| attempts.set(0));
+}
+
+#[cfg(all(feature = "metal", test, target_os = "macos"))]
+fn jpeg_device_batch_attempts_for_test() -> usize {
+    JPEG_DEVICE_BATCH_ATTEMPTS.with(Cell::get)
+}
 
 pub struct DecodedJpegRgb {
     pub width: u32,
@@ -340,6 +356,15 @@ pub(crate) fn decode_batch_jpeg_pixels<'a>(
     require_device: bool,
     metal_sessions: Option<&crate::output::metal::MetalBackendSessions>,
 ) -> Vec<Result<TilePixels, WsiError>> {
+    #[cfg(target_os = "macos")]
+    if let Some(metal_sessions) = metal_sessions {
+        if let Some(decoded) =
+            decode_jpeg_tile_batch_to_device_pixels(jobs, backend, require_device, metal_sessions)
+        {
+            return decoded;
+        }
+    }
+
     if jobs.len() <= 1 {
         return jobs
             .iter()
@@ -349,6 +374,116 @@ pub(crate) fn decode_batch_jpeg_pixels<'a>(
     jobs.par_iter()
         .map(|job| decode_one_jpeg_pixels(job, backend, require_device, metal_sessions))
         .collect()
+}
+
+#[cfg(all(feature = "metal", target_os = "macos"))]
+fn decode_jpeg_tile_batch_to_device_pixels<'a>(
+    jobs: &[JpegDecodeJob<'a>],
+    backend: SigninumBackendRequest,
+    require_device: bool,
+    metal_sessions: &crate::output::metal::MetalBackendSessions,
+) -> Option<Vec<Result<TilePixels, WsiError>>> {
+    if jobs.len() < 2
+        || metal_sessions.private_jpeg_decode()
+        || !matches!(
+            backend,
+            SigninumBackendRequest::Auto | SigninumBackendRequest::Metal
+        )
+    {
+        return None;
+    }
+
+    let mut prepared = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        if job.force_dimensions
+            || job.requested_size.is_some()
+            || !matches!(job.color_transform, SigninumColorTransform::Auto)
+        {
+            return None;
+        }
+
+        let input = prepare_jpeg_input(
+            job.data.as_ref(),
+            job.tables.as_deref(),
+            job.expected_width,
+            job.expected_height,
+            job.force_dimensions,
+        );
+        let Ok(dimensions) = inspect_signinum_jpeg_output_size(input.as_ref()) else {
+            return None;
+        };
+        if dimensions != (job.expected_width, job.expected_height) {
+            return None;
+        }
+        let Ok(view) = SigninumJpegView::parse_with_options(
+            input.as_ref(),
+            SigninumDecodeOptions::default().with_color_transform(job.color_transform),
+        ) else {
+            return None;
+        };
+        if view.info().sof_kind == SigninumSofKind::Progressive8 {
+            return None;
+        }
+        prepared.push(input);
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    JPEG_DEVICE_BATCH_ATTEMPTS.with(|attempts| attempts.set(attempts.get().saturating_add(1)));
+
+    let inputs = prepared
+        .iter()
+        .map(|input| input.as_ref())
+        .collect::<Vec<_>>();
+    let surfaces = match signinum_jpeg_metal::decode_rgb8_batch_to_device_with_session(
+        &inputs,
+        metal_sessions.jpeg(),
+    ) {
+        Ok(Some(surfaces)) => surfaces,
+        Ok(None) => return None,
+        Err(err) if require_device => {
+            let reason = format!("JPEG Metal batch decode failed: {err}");
+            return Some(
+                (0..jobs.len())
+                    .map(|_| {
+                        Err(WsiError::Unsupported {
+                            reason: reason.clone(),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        Err(_) => return None,
+    };
+
+    if surfaces.len() != jobs.len() {
+        let reason = format!(
+            "JPEG Metal batch returned {} surfaces for {} jobs",
+            surfaces.len(),
+            jobs.len()
+        );
+        return Some(
+            (0..jobs.len())
+                .map(|_| {
+                    Err(WsiError::Unsupported {
+                        reason: reason.clone(),
+                    })
+                })
+                .collect(),
+        );
+    }
+
+    Some(
+        jobs.iter()
+            .zip(surfaces)
+            .map(|(job, surface)| match surface {
+                Ok(surface) => tile_pixels_from_jpeg_surface(surface, job, require_device),
+                Err(err) if require_device => Err(WsiError::Unsupported {
+                    reason: format!("JPEG Metal batch decode failed: {err}"),
+                }),
+                Err(_) => decode_one_jpeg_job(job).map(TilePixels::Cpu),
+            })
+            .collect(),
+    )
 }
 
 fn decode_one_jpeg_job(job: &JpegDecodeJob<'_>) -> Result<CpuTile, WsiError> {
@@ -463,6 +598,15 @@ fn decode_one_jpeg_pixels(
         .decode_to_device_with_session(SigninumPixelFormat::Rgb8, metal_sessions.jpeg())
         .map_err(|err| WsiError::Jpeg(format!("signinum JPEG device decode failed: {err}")))?;
 
+    tile_pixels_from_jpeg_surface(surface, job, require_device)
+}
+
+#[cfg(feature = "metal")]
+fn tile_pixels_from_jpeg_surface(
+    surface: signinum_jpeg_metal::Surface,
+    job: &JpegDecodeJob<'_>,
+    require_device: bool,
+) -> Result<TilePixels, WsiError> {
     if surface.backend_kind() == SigninumBackendKind::Metal {
         if surface.residency() == SigninumJpegSurfaceResidency::CpuStagedMetalUpload {
             if require_device {
@@ -1264,6 +1408,58 @@ mod tests {
         assert_eq!(buffer.storage_mode(), metal::MTLStorageMode::Private);
         assert_eq!(tile.width, 16);
         assert_eq!(tile.height, 16);
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    fn decode_batch_jpeg_pixels_uses_session_backed_device_batch() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let sessions = crate::output::metal::MetalBackendSessions::new(
+            signinum_jpeg_metal::MetalBackendSession::new(device.clone()),
+            signinum_j2k_metal::MetalBackendSession::new(device),
+        );
+        let mut first = image::RgbImage::new(16, 16);
+        for (idx, pixel) in first.pixels_mut().enumerate() {
+            *pixel = image::Rgb([idx as u8, 80, 180]);
+        }
+        let mut second = image::RgbImage::new(16, 16);
+        for (idx, pixel) in second.pixels_mut().enumerate() {
+            *pixel = image::Rgb([200, idx as u8, 40]);
+        }
+        let first_jpeg = encode_test_jpeg(&first);
+        let second_jpeg = encode_test_jpeg(&second);
+        let jobs = [
+            JpegDecodeJob {
+                data: Cow::Borrowed(first_jpeg.as_slice()),
+                tables: None,
+                expected_width: 16,
+                expected_height: 16,
+                color_transform: SigninumColorTransform::Auto,
+                force_dimensions: false,
+                requested_size: None,
+            },
+            JpegDecodeJob {
+                data: Cow::Borrowed(second_jpeg.as_slice()),
+                tables: None,
+                expected_width: 16,
+                expected_height: 16,
+                color_transform: SigninumColorTransform::Auto,
+                force_dimensions: false,
+                requested_size: None,
+            },
+        ];
+
+        reset_jpeg_device_batch_attempts_for_test();
+        let pixels =
+            decode_batch_jpeg_pixels(&jobs, SigninumBackendRequest::Metal, true, Some(&sessions));
+
+        assert_eq!(jpeg_device_batch_attempts_for_test(), 1);
+        assert_eq!(pixels.len(), 2);
+        for pixels in pixels {
+            assert!(matches!(pixels.unwrap(), TilePixels::Device(_)));
+        }
     }
 
     #[test]
