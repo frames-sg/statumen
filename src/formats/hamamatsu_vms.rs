@@ -1111,15 +1111,14 @@ fn read_vms_jpeg_header(path: &Path) -> Result<VmsJpegHeader, WsiError> {
                     restart_interval = Some(interval);
                 }
             }
-            0xFE => {
-                if comment.is_none() {
-                    let end = payload
-                        .iter()
-                        .position(|b| *b == 0)
-                        .unwrap_or(payload.len());
-                    comment = Some(String::from_utf8_lossy(&payload[..end]).into_owned());
-                }
+            0xFE if comment.is_none() => {
+                let end = payload
+                    .iter()
+                    .position(|b| *b == 0)
+                    .unwrap_or(payload.len());
+                comment = Some(String::from_utf8_lossy(&payload[..end]).into_owned());
             }
+            0xFE => {}
             0xDA => {
                 let (width, height) = dimensions
                     .ok_or_else(|| WsiError::Jpeg("VMS JPEG missing SOF before SOS".into()))?;

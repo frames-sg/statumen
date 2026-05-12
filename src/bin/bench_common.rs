@@ -675,7 +675,7 @@ mod plan_tests {
         let world = p.pan_trace_l2_world_l0();
 
         assert_eq!(l2.len(), world.len());
-        for ((x_l2, y_l2), (x_l0, y_l0)) in l2.into_iter().zip(world.into_iter()) {
+        for ((x_l2, y_l2), (x_l0, y_l0)) in l2.into_iter().zip(world) {
             assert_eq!(x_l0, x_l2 * 4);
             assert_eq!(y_l0, y_l2 * 4);
         }
