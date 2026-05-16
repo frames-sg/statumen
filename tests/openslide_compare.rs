@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use openslide_test_support::OpenSlide;
-use statumen::{PlaneSelection, RegionRequest, Slide};
+use statumen::{LevelIdx, PlaneIdx, PlaneSelection, RegionRequest, SceneId, SeriesId, Slide};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PixelCompareMode {
@@ -22,6 +22,27 @@ struct RegionCase {
     y: i64,
     w: u32,
     h: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn region_request(
+    scene: usize,
+    series: usize,
+    level: u32,
+    plane: PlaneSelection,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> RegionRequest {
+    RegionRequest {
+        scene: SceneId(scene),
+        series: SeriesId(series),
+        level: LevelIdx(level),
+        plane: PlaneIdx(plane),
+        origin_px: (x, y),
+        size_px: (w, h),
+    }
 }
 
 #[test]
@@ -55,7 +76,7 @@ fn aperio_jpeg_rgb_pyramid_levels_match_openslide() {
     let max_level = level_count.saturating_sub(1).min(3);
 
     for level in 1..=max_level {
-        let req = RegionRequest::legacy_xywh(
+        let req = region_request(
             0,
             0,
             level as u32,
@@ -306,7 +327,7 @@ fn compare_level0_regions(
     let level0 = &handle.dataset().scenes[0].series[0].levels[0];
     let mode = pixel_compare_mode(path, openslide_props);
     for region in representative_regions(level0.dimensions) {
-        let req = RegionRequest::legacy_xywh(
+        let req = region_request(
             0,
             0,
             0,

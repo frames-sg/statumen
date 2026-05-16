@@ -78,9 +78,9 @@ cfb = "0.14.0"
 criterion = { version = "0.5", features = ["html_reports"] }
 jpeg-decoder = "0.3.2"
 jpeg-encoder = "0.6"
-tempfile = "3"
+tempfile = { workspace = true }
 toml = "0.8"
-libloading = "0.8"
+libloading = { workspace = true }
 signinum-j2k-native = "0.4"
 
 
@@ -136,3 +136,25 @@ path = "src/bin/svcache.rs"
 [workspace]
 members = [".", "xtask", "statumen-openslide-shim"]
 resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/frames-sg/statumen"
+homepage = "https://github.com/frames-sg/statumen"
+documentation = "https://docs.rs/statumen"
+authors = ["Statumen contributors"]
+
+[workspace.dependencies]
+libloading = "0.8"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = "allow"
+
+[lints]
+workspace = true

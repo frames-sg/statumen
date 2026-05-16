@@ -8,7 +8,7 @@ use std::collections::HashMap;
 const MAX_XML_DEPTH: u32 = 256;
 
 /// Find the first element with the given tag name and return its text content.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn parse_element_text(xml: &str, tag: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
@@ -34,7 +34,7 @@ pub fn parse_element_text(xml: &str, tag: &str) -> Option<String> {
 }
 
 /// Find the first element with the given tag name and return the value of the specified attribute.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn parse_attribute(xml: &str, tag: &str, attr: &str) -> Option<String> {
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();

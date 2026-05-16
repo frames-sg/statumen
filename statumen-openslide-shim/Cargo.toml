@@ -11,11 +11,11 @@ name = "statumen_openslide_shim"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-libloading = "0.8"
+libloading = { workspace = true }
 statumen = { path = ".." }
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = { workspace = true }
 
 [lints.rust]
 unsafe_code = "allow"

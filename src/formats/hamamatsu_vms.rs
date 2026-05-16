@@ -1160,7 +1160,6 @@ fn read_vms_jpeg_header(path: &Path) -> Result<VmsJpegHeader, WsiError> {
                         height,
                         tile_width,
                         tile_height: mcu_height,
-                        restart_interval,
                     },
                     sof_dimensions_offset,
                     scan_data_offset,

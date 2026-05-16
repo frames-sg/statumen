@@ -1,7 +1,10 @@
 use crate::core::types::{ColorSpace, CpuTile, CpuTileData, CpuTileLayout};
 use crate::decode::jp2k::Jp2kColorSpace;
-use crate::decode::jp2k_backend::{DecodedImage, DecodedInterleavedImage};
+#[cfg(test)]
+use crate::decode::jp2k_backend::DecodedImage;
+use crate::decode::jp2k_backend::DecodedInterleavedImage;
 use crate::error::WsiError;
+#[cfg(test)]
 use image::RgbaImage;
 
 #[inline]
@@ -9,7 +12,7 @@ fn clamp_u8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn decoded_image_to_rgba(
     image: DecodedImage,
     colorspace: Jp2kColorSpace,
@@ -80,7 +83,7 @@ pub(crate) fn decoded_image_to_rgba(
         .ok_or_else(|| WsiError::Jp2k("failed to create RgbaImage from decoded data".into()))
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn decoded_image_to_sample_buffer(
     image: DecodedImage,
     colorspace: Jp2kColorSpace,
@@ -201,34 +204,6 @@ pub(crate) fn interleaved_image_to_sample_buffer(
     })
 }
 
-#[allow(dead_code)]
-pub(crate) fn crop_rgba_image(
-    image: RgbaImage,
-    expected_width: u32,
-    expected_height: u32,
-) -> Result<RgbaImage, WsiError> {
-    if expected_width == 0 || expected_height == 0 {
-        return Err(WsiError::Jp2k(
-            "cropped JP2K dimensions must be non-zero".into(),
-        ));
-    }
-    if expected_width > image.width() || expected_height > image.height() {
-        return Err(WsiError::Jp2k(format!(
-            "decoded JP2K image too small to crop: decoded {}x{}, requested {}x{}",
-            image.width(),
-            image.height(),
-            expected_width,
-            expected_height
-        )));
-    }
-    if expected_width == image.width() && expected_height == image.height() {
-        return Ok(image);
-    }
-
-    Ok(image::imageops::crop_imm(&image, 0, 0, expected_width, expected_height).to_image())
-}
-
-#[allow(dead_code)]
 pub(crate) fn crop_sample_buffer(
     buffer: CpuTile,
     expected_width: u32,

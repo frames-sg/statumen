@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use image::RgbImage;
 use jpeg_encoder::{ColorType as JpegColorType, Encoder as JpegEncoder};
-use statumen::{PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest, TileViewRequest};
+use statumen::{
+    LevelIdx, PlaneIdx, PlaneSelection, RegionRequest, SceneId, SeriesId, Slide, TileLayout,
+    TileRequest, TileViewRequest,
+};
 use tempfile::NamedTempFile;
 
 const TILE_CACHE_BYTES_ENV: &str = "STATUMEN_TILE_CACHE_BYTES";
@@ -41,16 +44,17 @@ fn centered_level0_region(handle: &Slide, side: u32) -> RegionRequest {
     let dims = handle.dataset().scenes[0].series[0].levels[0].dimensions;
     let w = side.min(dims.0 as u32);
     let h = side.min(dims.1 as u32);
-    RegionRequest::legacy_xywh(
-        0,
-        0,
-        0,
-        PlaneSelection::default(),
-        ((dims.0 as i64 - i64::from(w)) / 2).max(0),
-        ((dims.1 as i64 - i64::from(h)) / 2).max(0),
-        w,
-        h,
-    )
+    RegionRequest {
+        scene: SceneId(0),
+        series: SeriesId(0),
+        level: LevelIdx(0),
+        plane: PlaneIdx(PlaneSelection::default()),
+        origin_px: (
+            ((dims.0 as i64 - i64::from(w)) / 2).max(0),
+            ((dims.1 as i64 - i64::from(h)) / 2).max(0),
+        ),
+        size_px: (w, h),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -383,10 +387,22 @@ fn benchmark_handle_reads(c: &mut Criterion) {
         tile_width: 128,
         tile_height: 128,
     };
-    let region_req =
-        RegionRequest::legacy_xywh(0, 0, 0, PlaneSelection::default(), 32, 32, 160, 160);
-    let small_region_req =
-        RegionRequest::legacy_xywh(0, 0, 0, PlaneSelection::default(), 2, 2, 12, 12);
+    let region_req = RegionRequest {
+        scene: SceneId(0),
+        series: SeriesId(0),
+        level: LevelIdx(0),
+        plane: PlaneIdx(PlaneSelection::default()),
+        origin_px: (32, 32),
+        size_px: (160, 160),
+    };
+    let small_region_req = RegionRequest {
+        scene: SceneId(0),
+        series: SeriesId(0),
+        level: LevelIdx(0),
+        plane: PlaneIdx(PlaneSelection::default()),
+        origin_px: (2, 2),
+        size_px: (12, 12),
+    };
 
     let mut group = c.benchmark_group("synthetic_read_paths");
     group.bench_function("aperio_jpeg_display_tile", |b| {

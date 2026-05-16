@@ -32,11 +32,19 @@ jobs:
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt,clippy
-      - run: cargo xtask fmt
+      - uses: taiki-e/install-action@nextest
+      - run: cargo xtask validate
         working-directory: statumen
-      - run: cargo xtask clippy
-        working-directory: statumen
-      - run: cargo xtask test
+
+  feature-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: statumen
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo xtask feature-check
         working-directory: statumen
 
   docs:
@@ -106,12 +114,11 @@ jobs:
         with:
           path: statumen
       - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: taiki-e/install-action@v2
         with:
-          command: check
-          arguments: ""
-          command-arguments: advisories bans licenses sources
-          manifest-path: statumen/Cargo.toml
+          tool: cargo-deny,cargo-machete
+      - run: cargo xtask deps
+        working-directory: statumen
 
   coverage:
     runs-on: ubuntu-latest

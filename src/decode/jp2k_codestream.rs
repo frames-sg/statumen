@@ -215,7 +215,7 @@ impl<'a> Reader<'a> {
 }
 
 impl Jp2kCodingStyleInfo {
-    #[allow(dead_code)]
+    #[cfg(any(debug_assertions, test))]
     pub fn resolution_count(&self) -> u8 {
         self.decomposition_levels + 1
     }

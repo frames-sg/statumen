@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use std::ptr;
 
 use handle::{empty_names, OpenSlideHandle};
-use statumen::{PlaneSelection, RegionRequest};
+use statumen::{LevelIdx, PlaneIdx, PlaneSelection, RegionRequest, SceneId, SeriesId};
 
 const VERSION: &[u8] = b"OpenSlide-statumen 4.0.0+statumen-0.3.0\0";
 
@@ -361,16 +361,14 @@ pub unsafe extern "C" fn openslide_read_region(
         } else {
             y
         };
-        let req = RegionRequest::legacy_xywh(
-            0,
-            0,
-            level as u32,
-            PlaneSelection::default(),
-            level_x,
-            level_y,
-            width,
-            height,
-        );
+        let req = RegionRequest {
+            scene: SceneId(0),
+            series: SeriesId(0),
+            level: LevelIdx(level as u32),
+            plane: PlaneIdx(PlaneSelection::default()),
+            origin_px: (level_x, level_y),
+            size_px: (width, height),
+        };
         match slide
             .read_region(&req)
             .and_then(pixels::tile_to_premultiplied_argb)

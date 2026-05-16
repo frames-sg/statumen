@@ -8,6 +8,7 @@ use crate::decode::jp2k_codestream::{parse_codestream_header, validate_narrow_su
 use crate::decode::jp2k_packet::parse_tile_part_packets;
 use crate::decode::jp2k_raster::{crop_sample_buffer, interleaved_image_to_sample_buffer};
 use crate::error::WsiError;
+#[cfg(test)]
 use image::RgbaImage;
 use std::borrow::Cow;
 
@@ -30,7 +31,6 @@ pub enum Jp2kColorSpace {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub(crate) struct Jp2kDecodeJob<'a> {
     pub data: Cow<'a, [u8]>,
     pub expected_width: u32,
@@ -47,7 +47,7 @@ pub(crate) fn dimensions_from_bounds(x0: u32, x1: u32, y0: u32, y1: u32) -> Opti
 
 /// Decode a raw JPEG2000 codestream (J2K, not JP2 container) into a
 /// premultiplied RGBA image with alpha = 255.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn decode_jp2k(
     data: &[u8],
     expected_width: u32,
@@ -62,7 +62,6 @@ pub fn decode_jp2k(
     )?)
 }
 
-#[allow(dead_code)]
 pub(crate) fn decode_jp2k_to_sample_buffer(
     data: &[u8],
     expected_width: u32,
@@ -177,6 +176,7 @@ pub(crate) fn decode_batch_jp2k_pixels(
     }
 }
 
+#[cfg(test)]
 fn decode_one_jp2k_job(job: &Jp2kDecodeJob<'_>) -> Result<CpuTile, WsiError> {
     decode_one_jp2k_job_with_parallelism(job, CpuDecodeParallelism::Auto)
 }
@@ -216,7 +216,8 @@ fn decode_one_jp2k_pixels(
                 reason: "device backend not available for j2k without Metal session".into(),
             });
         }
-        return decode_one_jp2k_job(job).map(TilePixels::Cpu);
+        return decode_one_jp2k_job_with_parallelism(job, CpuDecodeParallelism::Auto)
+            .map(TilePixels::Cpu);
     };
     let header =
         validate_jp2k_decode_request(job.data.as_ref(), job.expected_width, job.expected_height)?;
@@ -308,7 +309,7 @@ fn decode_jp2k_to_sample_buffer_cpu(
     )
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 fn decode_jp2k_tile_batch_with_signinum(
     reqs: &[Jp2kDecodeJob<'_>],
 ) -> Result<Vec<CpuTile>, WsiError> {
@@ -607,6 +608,7 @@ fn sample_buffer_from_signinum_surface(
     )
 }
 
+#[cfg(test)]
 fn sample_buffer_to_rgba(buffer: CpuTile) -> Result<RgbaImage, WsiError> {
     if buffer.channels != 3 || buffer.layout != crate::core::types::CpuTileLayout::Interleaved {
         return Err(WsiError::Jp2k(format!(

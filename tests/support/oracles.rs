@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use jpeg_decoder::{Decoder as ReferenceJpegDecoder, PixelFormat as ReferenceJpegPixelFormat};
 use statumen::{
-    CpuTile, FormatRegistry, PlaneSelection, RegionRequest, Slide, TileLayout, TileRequest,
+    CpuTile, FormatRegistry, LevelIdx, PlaneIdx, PlaneSelection, RegionRequest, SceneId, SeriesId,
+    Slide, TileLayout, TileRequest,
 };
 
 #[derive(Debug, Clone)]
@@ -15,6 +16,27 @@ pub struct TileBuffer {
     pub pixels_rgba: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn region_request(
+    scene: usize,
+    series: usize,
+    level: u32,
+    plane: PlaneSelection,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> RegionRequest {
+    RegionRequest {
+        scene: SceneId(scene),
+        series: SeriesId(series),
+        level: LevelIdx(level),
+        plane: PlaneIdx(plane),
+        origin_px: (x, y),
+        size_px: (w, h),
+    }
 }
 
 pub trait Oracle {
@@ -226,8 +248,7 @@ fn open_via_statumen(
                 region_path.display()
             ));
         }
-        let req =
-            RegionRequest::legacy_xywh(0, 0, level, PlaneSelection::default(), x, y, width, height);
+        let req = region_request(0, 0, level, PlaneSelection::default(), x, y, width, height);
         let buf = region_handle
             .read_region(&req)
             .map_err(|e| format!("read_region: {e}"))?;

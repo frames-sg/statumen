@@ -1,2 +1,3 @@
 [alias]
-xtask = "run --package xtask --"
+xtask = "run --package xtask --target-dir target/xtask --"
+run-checks = "xtask validate"

@@ -12,7 +12,9 @@ use bench_common::{
     host_string, repeat_index, run_workload, selected_workload, should_run_workload,
     tile_top_left_at_pixel, BenchRun, WorkloadPlan, WorkloadResult,
 };
-use statumen::{PlaneSelection, RegionRequest, Slide, TileViewRequest};
+use statumen::{
+    LevelIdx, PlaneIdx, PlaneSelection, RegionRequest, SceneId, SeriesId, Slide, TileViewRequest,
+};
 use std::path::PathBuf;
 
 fn main() {
@@ -162,16 +164,14 @@ fn main() {
             "region_2k",
             30,
             || {
-                let req = RegionRequest::legacy_xywh(
-                    0,
-                    0,
-                    0,
-                    PlaneSelection::default(),
-                    plan.center_l0.0 - 1024,
-                    plan.center_l0.1 - 1024,
-                    2048,
-                    2048,
-                );
+                let req = RegionRequest {
+                    scene: SceneId(0),
+                    series: SeriesId(0),
+                    level: LevelIdx(0),
+                    plane: PlaneIdx(PlaneSelection::default()),
+                    origin_px: (plan.center_l0.0 - 1024, plan.center_l0.1 - 1024),
+                    size_px: (2048, 2048),
+                };
                 handle.read_region(&req)
             },
         ));
@@ -183,16 +183,14 @@ fn main() {
             "viewport_region_l2",
             30,
             || {
-                let req = RegionRequest::legacy_xywh(
-                    0,
-                    0,
-                    plan.level2_idx,
-                    PlaneSelection::default(),
-                    viewport.level2_top_left.0,
-                    viewport.level2_top_left.1,
-                    viewport.side_px,
-                    viewport.side_px,
-                );
+                let req = RegionRequest {
+                    scene: SceneId(0),
+                    series: SeriesId(0),
+                    level: LevelIdx(plan.level2_idx),
+                    plane: PlaneIdx(PlaneSelection::default()),
+                    origin_px: viewport.level2_top_left,
+                    size_px: (viewport.side_px, viewport.side_px),
+                };
                 handle.read_region(&req)
             },
         ));
@@ -207,16 +205,14 @@ fn main() {
             let deepest = plan.level_count - 1;
             let dims = level_dims[deepest as usize];
             run_workload::<_, statumen::WsiError>("thumbnail", 30, || {
-                let req = RegionRequest::legacy_xywh(
-                    0,
-                    0,
-                    deepest,
-                    PlaneSelection::default(),
-                    0,
-                    0,
-                    dims.0 as u32,
-                    dims.1 as u32,
-                );
+                let req = RegionRequest {
+                    scene: SceneId(0),
+                    series: SeriesId(0),
+                    level: LevelIdx(deepest),
+                    plane: PlaneIdx(PlaneSelection::default()),
+                    origin_px: (0, 0),
+                    size_px: (dims.0 as u32, dims.1 as u32),
+                };
                 handle.read_region(&req)
             })
         };

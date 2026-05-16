@@ -4,6 +4,7 @@ use crate::decode::jp2k_codestream::Jp2kCodestreamInfo;
 use crate::error::WsiError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct DecodedComponent {
     pub width: usize,
     pub height: usize,
@@ -11,6 +12,7 @@ pub(crate) struct DecodedComponent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct DecodedImage {
     pub width: usize,
     pub height: usize,

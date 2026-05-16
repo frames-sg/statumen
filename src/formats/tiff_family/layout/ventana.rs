@@ -601,12 +601,9 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 // ── Level 0 XML parsing ────────────────────────────────────────────
 
 /// Parsed BIF area of interest.
-#[allow(dead_code)]
 struct BifArea {
     x: i64,
     y: i64,
-    width: i64,
-    height: i64,
     start_col: i64,
     start_row: i64,
     tiles_across: i64,
@@ -739,8 +736,6 @@ fn parse_level0_xml(
         areas.push(BifArea {
             x: pos_x as i64,
             y: pos_y as i64,
-            width: image_width,
-            height: image_height,
             start_col,
             start_row,
             tiles_across: num_cols,
@@ -1320,8 +1315,6 @@ mod tests {
                 BifArea {
                     x: 12_000,
                     y: 9_000,
-                    width: 0,
-                    height: 0,
                     start_col: 0,
                     start_row: 0,
                     tiles_across: 2,
@@ -1330,8 +1323,6 @@ mod tests {
                 BifArea {
                     x: 12_500,
                     y: 9_250,
-                    width: 0,
-                    height: 0,
                     start_col: 2,
                     start_row: 1,
                     tiles_across: 1,
@@ -1385,8 +1376,6 @@ mod tests {
             areas: vec![BifArea {
                 x: 0,
                 y: 0,
-                width: 0,
-                height: 0,
                 start_col: 0,
                 start_row: 0,
                 tiles_across: 3,
@@ -1457,8 +1446,6 @@ mod tests {
             areas: vec![BifArea {
                 x: 0,
                 y: 0,
-                width: 0,
-                height: 0,
                 start_col: 0,
                 start_row: 0,
                 tiles_across: 3,
@@ -1505,8 +1492,6 @@ mod tests {
                 BifArea {
                     x: 0,
                     y: 0,
-                    width: 0,
-                    height: 0,
                     start_col: 0,
                     start_row: 0,
                     tiles_across: 2,
@@ -1515,8 +1500,6 @@ mod tests {
                 BifArea {
                     x: 500,
                     y: 0,
-                    width: 0,
-                    height: 0,
                     start_col: 2,
                     start_row: 0,
                     tiles_across: 2,

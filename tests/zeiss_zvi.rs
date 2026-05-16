@@ -1,7 +1,9 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
-use statumen::{CpuTileData, PlaneSelection, RegionRequest, Slide};
+use statumen::{
+    CpuTileData, LevelIdx, PlaneIdx, PlaneSelection, RegionRequest, SceneId, SeriesId, Slide,
+};
 
 const ZVI_FIXTURES: &[&str] = &[
     "Zeiss-1-Merged.zvi",
@@ -11,6 +13,27 @@ const ZVI_FIXTURES: &[&str] = &[
     "Zeiss-3-Mosaic.zvi",
     "Zeiss-4-Mosaic.zvi",
 ];
+
+#[allow(clippy::too_many_arguments)]
+fn region_request(
+    scene: usize,
+    series: usize,
+    level: u32,
+    plane: PlaneSelection,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> RegionRequest {
+    RegionRequest {
+        scene: SceneId(scene),
+        series: SeriesId(series),
+        level: LevelIdx(level),
+        plane: PlaneIdx(plane),
+        origin_px: (x, y),
+        size_px: (w, h),
+    }
+}
 
 fn zeiss_zvi_root() -> Option<PathBuf> {
     if let Some(path) = env::var_os("STATUMEN_ZVI_ROOT").map(PathBuf::from) {
@@ -43,7 +66,7 @@ fn assert_decodes_u16_region(
     require_nonzero: bool,
 ) {
     let region = slide
-        .read_region(&RegionRequest::legacy_xywh(0, 0, 0, plane, 0, 0, 64, 64))
+        .read_region(&region_request(0, 0, 0, plane, 0, 0, 64, 64))
         .expect("read Zeiss ZVI region");
     assert_eq!((region.width, region.height), (64, 64));
     assert_eq!(region.channels, 1);

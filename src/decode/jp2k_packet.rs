@@ -59,7 +59,6 @@ struct ResolutionLayout {
 #[derive(Debug, Clone)]
 struct BandLayout {
     bandno: u8,
-    num_bit_planes: u32,
     precincts: Vec<PrecinctLayout>,
 }
 
@@ -67,16 +66,7 @@ struct BandLayout {
 struct PrecinctLayout {
     code_block_width: u32,
     code_block_height: u32,
-    code_blocks: Vec<CodeBlockLayout>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct CodeBlockLayout {
-    x0: i32,
-    y0: i32,
-    x1: i32,
-    y1: i32,
+    code_block_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -428,7 +418,7 @@ impl TileLayout {
                         )
                     };
 
-                    let step = info.quantization.steps.get(step_index).ok_or_else(|| {
+                    info.quantization.steps.get(step_index).ok_or_else(|| {
                         WsiError::Jp2k("JP2K quantization step table underflow".into())
                     })?;
                     step_index += 1;
@@ -461,30 +451,14 @@ impl TileLayout {
                             ((code_block_x1 - code_block_x0) >> code_block_width) as u32;
                         let code_blocks_h =
                             ((code_block_y1 - code_block_y0) >> code_block_height) as u32;
-                        let mut code_blocks =
-                            Vec::with_capacity((code_blocks_w * code_blocks_h) as usize);
-                        for code_block in 0..(code_blocks_w * code_blocks_h) {
-                            let x0 = code_block_x0
-                                + (code_block % code_blocks_w) as i32 * (1i32 << code_block_width);
-                            let y0 = code_block_y0
-                                + (code_block / code_blocks_w) as i32 * (1i32 << code_block_height);
-                            let x1 = (x0 + (1i32 << code_block_width)).min(clipped_x1);
-                            let y1 = (y0 + (1i32 << code_block_height)).min(clipped_y1);
-                            code_blocks.push(CodeBlockLayout { x0, y0, x1, y1 });
-                        }
                         precincts.push(PrecinctLayout {
                             code_block_width: code_blocks_w,
                             code_block_height: code_blocks_h,
-                            code_blocks,
+                            code_block_count: (code_blocks_w * code_blocks_h) as usize,
                         });
                     }
 
-                    bands.push(BandLayout {
-                        bandno,
-                        num_bit_planes: step.exponent as u32 + info.quantization.guard_bits as u32
-                            - 1,
-                        precincts,
-                    });
+                    bands.push(BandLayout { bandno, precincts });
                 }
 
                 resolutions.push(ResolutionLayout {
@@ -533,7 +507,7 @@ impl PacketParserState {
                                         ),
                                         code_blocks: vec![
                                             CodeBlockState::default();
-                                            precinct.code_blocks.len()
+                                            precinct.code_block_count
                                         ],
                                     })
                                     .collect(),
@@ -548,7 +522,7 @@ impl PacketParserState {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn enumerate_packet_order(info: &Jp2kCodestreamInfo) -> Vec<Jp2kPacketCoordinate> {
     let Ok(layout) = TileLayout::from_codestream(info) else {
         return Vec::new();
@@ -556,7 +530,7 @@ pub(crate) fn enumerate_packet_order(info: &Jp2kCodestreamInfo) -> Vec<Jp2kPacke
     enumerate_packet_order_with_layout(info, &layout)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn tile_part_packet_coordinates(
     info: &Jp2kCodestreamInfo,
     tile_part: &Jp2kTilePartInfo,
@@ -777,8 +751,7 @@ fn parse_packet_payload(
             .get_mut(precinct_index)
             .ok_or_else(|| WsiError::Jp2k("JP2K packet precinct state out of range".into()))?;
 
-        for (code_block_index, code_block_layout) in precinct_layout.code_blocks.iter().enumerate()
-        {
+        for code_block_index in 0..precinct_layout.code_block_count {
             let code_block_state = precinct_state
                 .code_blocks
                 .get_mut(code_block_index)
@@ -839,9 +812,6 @@ fn parse_packet_payload(
                 length,
                 body_offset: 0,
             });
-
-            let _ = code_block_layout;
-            let _ = band_layout.num_bit_planes;
         }
     }
 

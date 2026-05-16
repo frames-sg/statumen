@@ -7,6 +7,26 @@ fn crate_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
+fn read_repo_text(relative: &str) -> String {
+    let path = crate_root().join(relative);
+    if path.is_dir() {
+        let mut files = Vec::new();
+        collect_text_files(&path, &mut files);
+        files.retain(|path| path.extension().and_then(|value| value.to_str()) == Some("rs"));
+        files.sort();
+        return files
+            .into_iter()
+            .map(|path| {
+                fs::read_to_string(&path).unwrap_or_else(|err| {
+                    panic!("read {}: {err}", path.display());
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}
+
 #[test]
 fn package_metadata_uses_statumen_identity() {
     let manifest = fs::read_to_string(crate_root().join("Cargo.toml")).expect("read manifest");
@@ -97,6 +117,28 @@ fn public_docs_use_statumen_entrypoint() {
         architecture.contains("# statumen Architecture"),
         "architecture docs must title the crate statumen"
     );
+    for required in [
+        "core/registry/traits.rs",
+        "core/registry/registry_impl.rs",
+        "formats/dicom/",
+        "tiff_family/pixel_access/",
+    ] {
+        assert!(
+            architecture.contains(required),
+            "architecture docs must reflect current module layout; missing `{required}`"
+        );
+    }
+    for stale in [
+        "core/types.rs",
+        "core/registry.rs",
+        "formats/dicom.rs",
+        "pixel_access.rs",
+    ] {
+        assert!(
+            !architecture.contains(stale),
+            "architecture docs must not retain stale module path `{stale}`"
+        );
+    }
 }
 
 #[test]
@@ -125,7 +167,7 @@ fn environment_knobs_use_statumen_prefix() {
         "src/bin/release_gate.rs",
         "src/core/cache.rs",
         "src/decode/jp2k.rs",
-        "src/formats/tiff_family/pixel_access.rs",
+        "src/formats/tiff_family/pixel_access",
         "tests/dicom_parity.rs",
         "tests/fixtures/parity_corpus.public.toml",
         "tests/openslide_compare.rs",
@@ -136,9 +178,7 @@ fn environment_knobs_use_statumen_prefix() {
         "tests/support/corpus.rs",
         "tests/support/openslide_shim.rs",
     ] {
-        let source = fs::read_to_string(crate_root().join(relative)).unwrap_or_else(|err| {
-            panic!("read {relative}: {err}");
-        });
+        let source = read_repo_text(relative);
         let retired_prefix = ["ZIG", "GURAT_"].concat();
         assert!(
             !source.contains(&retired_prefix),
@@ -149,8 +189,7 @@ fn environment_knobs_use_statumen_prefix() {
 
 #[test]
 fn registry_does_not_use_type_erased_region_cache_tokens() {
-    let registry =
-        fs::read_to_string(crate_root().join("src/core/registry.rs")).expect("read registry");
+    let registry = read_repo_text("src/core/registry");
 
     assert!(
         !registry.contains("RegionCacheToken"),
@@ -164,8 +203,7 @@ fn registry_does_not_use_type_erased_region_cache_tokens() {
 
 #[test]
 fn format_registry_does_not_silently_rewrite_svcache_paths() {
-    let registry =
-        fs::read_to_string(crate_root().join("src/core/registry.rs")).expect("read registry");
+    let registry = read_repo_text("src/core/registry");
 
     assert!(
         !registry.contains("resolve_svcache"),
@@ -318,8 +356,7 @@ fn referenced_parity_corpus_fetch_script_exists() {
 fn public_docs_do_not_advertise_unregistered_zeiss_support() {
     let formats_mod =
         fs::read_to_string(crate_root().join("src/formats/mod.rs")).expect("read formats mod");
-    let registry =
-        fs::read_to_string(crate_root().join("src/core/registry.rs")).expect("read registry");
+    let registry = read_repo_text("src/core/registry");
     let zeiss_registered = formats_mod.contains("mod zeiss") && registry.contains("ZeissBackend");
 
     if !zeiss_registered {
@@ -359,8 +396,7 @@ fn unregistered_zeiss_backend_is_not_left_as_packaged_source() {
 
     let formats_mod =
         fs::read_to_string(crate_root().join("src/formats/mod.rs")).expect("read formats mod");
-    let registry =
-        fs::read_to_string(crate_root().join("src/core/registry.rs")).expect("read registry");
+    let registry = read_repo_text("src/core/registry");
     assert!(
         formats_mod.contains("mod zeiss") && registry.contains("ZeissBackend"),
         "src/formats/zeiss.rs exists but the Zeiss backend is not registered"

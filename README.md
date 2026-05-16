@@ -285,9 +285,16 @@ points include:
 ```sh
 cargo test
 cargo test --features parity-openslide --test openslide_parity
+cargo xtask bench-check
+cargo xtask bench
 cargo run --release --features bench --bin wsi_bench -- path/to/slide.svs
 cargo run --release --features "bench openslide-bench" --bin bench_driver -- path/to/slide.svs thumbnail
 ```
+
+`cargo xtask bench-check` compiles the Rust benchmark targets without running
+timings and is part of the default validation gate. `cargo xtask bench` runs
+the synthetic Criterion read-path benchmarks locally without requiring a WSI
+corpus.
 
 Optional Iris comparison is wired through `scripts/iris_bench.py` and
 `bench_driver`. Iris consumes pre-encoded `.iris` slides, so set
@@ -302,13 +309,23 @@ The repository uses an `xtask` wrapper for CI-style checks:
 ```sh
 cargo xtask fmt
 cargo xtask clippy
-cargo xtask test
+cargo xtask bench-check
+cargo xtask nextest
 cargo xtask doc
+cargo xtask validate
+cargo xtask feature-check
+cargo xtask deps
 ```
 
-`cargo xtask ci` runs the full sequence, including package checks. Some parity
-tests require local WSI corpora or external libraries; those tests are ignored
-unless the documented environment variables are set.
+`cargo xtask validate` runs the default local gate (`fmt`, `clippy`,
+`bench-check`, `nextest`, and `doc`). `cargo xtask ci` runs that gate plus
+package checks. Some parity tests require local WSI corpora or external
+libraries; those tests are ignored unless the documented environment variables
+are set.
+
+The extended checks use `cargo-nextest`, `cargo-hack`, `cargo-deny`, and
+`cargo-machete`. CI installs these tools before running the corresponding
+`xtask` targets.
 
 ## Codec Library
 

@@ -42,6 +42,7 @@ pub(crate) mod tags {
     pub const SAMPLES_PER_PIXEL: u16 = 277;
     pub const ROWS_PER_STRIP: u16 = 278;
     pub const STRIP_BYTE_COUNTS: u16 = 279;
+    #[cfg(test)]
     pub const SUB_IFDS: u16 = 330;
     pub const TILE_WIDTH: u16 = 322;
     pub const TILE_LENGTH: u16 = 323;
@@ -441,7 +442,7 @@ impl TiffContainer {
         Ok(container)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn open_parse_reader(&self) -> Result<ParseReader, TiffParseError> {
         let file = std::fs::File::open(self.path.as_ref())?;
         Ok(ParseReader::new(file, self.endian, self.bigtiff))
@@ -617,7 +618,7 @@ impl TiffContainer {
 
     /// Parse SubIFDs referenced by tag 330 in an IFD.
     /// Adds newly discovered IFDs to the global arena. Deduplicates by offset.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn materialize_sub_ifds(
         &mut self,
         parent_ifd_id: IfdId,
@@ -628,7 +629,7 @@ impl TiffContainer {
         self.parse_sub_ifds(&mut reader, parent_ifd_id, 0, max_depth, &mut ancestry)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub fn materialize_all_sub_ifds(&mut self, max_depth: u32) -> Result<(), TiffParseError> {
         let root_ids = self.top_ifds.clone();
         let mut reader = self.open_parse_reader()?;
@@ -639,7 +640,7 @@ impl TiffContainer {
         Ok(())
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     fn parse_sub_ifds(
         &mut self,
         reader: &mut ParseReader,

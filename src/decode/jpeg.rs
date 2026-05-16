@@ -6,6 +6,7 @@ use crate::core::types::{ColorSpace, CpuTile};
 #[cfg(feature = "metal")]
 use crate::core::types::{DeviceTile, TilePixels};
 use crate::error::WsiError;
+#[cfg(test)]
 use image::RgbaImage;
 use rayon::prelude::*;
 #[cfg(feature = "metal")]
@@ -58,8 +59,6 @@ pub(crate) struct JpegTileGeometry {
     pub height: u32,
     pub tile_width: u32,
     pub tile_height: u32,
-    #[allow(dead_code)]
-    pub restart_interval: u16,
 }
 
 #[derive(Debug)]
@@ -98,7 +97,7 @@ struct PreparedBatchJpeg<'a> {
 /// If `tables` is provided, it is prepended to `data` before decoding.
 /// Tables end with FFD9 (EOI), data starts with FFD8 (SOI).
 /// Strip EOI from tables, strip SOI from data, concatenate.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn decode_jpeg(
     data: &[u8],
     tables: Option<&[u8]>,
@@ -126,6 +125,7 @@ pub fn decode_jpeg(
         .ok_or_else(|| WsiError::Jpeg("failed to create RgbaImage".into()))
 }
 
+#[cfg(test)]
 pub fn decode_jpeg_rgb(
     data: &[u8],
     tables: Option<&[u8]>,
@@ -934,7 +934,6 @@ pub(crate) fn jpeg_tile_geometry(data: &[u8]) -> Result<JpegTileGeometry, WsiErr
         height: header.height as u32,
         tile_width: mcu_width * u32::from(restart_interval),
         tile_height: mcu_height,
-        restart_interval,
     })
 }
 
@@ -1651,7 +1650,6 @@ mod tests {
         let geometry = jpeg_tile_geometry(&jpeg).unwrap();
         assert_eq!(geometry.width, 32);
         assert_eq!(geometry.height, 8);
-        assert_eq!(geometry.restart_interval, 2);
         assert_eq!(geometry.tile_width, 32);
         assert_eq!(geometry.tile_height, 16);
     }

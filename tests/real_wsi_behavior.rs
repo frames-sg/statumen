@@ -2,8 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use statumen::{
-    Compression, CpuTile, EncodedTilePhotometricInterpretation, FormatRegistry, PlaneSelection,
-    RegionRequest, Slide, TileLayout, TileRequest,
+    Compression, CpuTile, EncodedTilePhotometricInterpretation, FormatRegistry, LevelIdx, PlaneIdx,
+    PlaneSelection, RegionRequest, SceneId, SeriesId, Slide, TileLayout, TileRequest,
 };
 
 mod support;
@@ -15,6 +15,27 @@ struct RegularLevel {
     tile_height: u32,
     tiles_across: u64,
     tiles_down: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn region_request(
+    scene: usize,
+    series: usize,
+    level: u32,
+    plane: PlaneSelection,
+    x: i64,
+    y: i64,
+    w: u32,
+    h: u32,
+) -> RegionRequest {
+    RegionRequest {
+        scene: SceneId(scene),
+        series: SeriesId(series),
+        level: LevelIdx(level),
+        plane: PlaneIdx(plane),
+        origin_px: (x, y),
+        size_px: (w, h),
+    }
 }
 
 fn require_corpus_slide(alias: &str) -> PathBuf {
@@ -164,7 +185,7 @@ fn aperio_jpeg_viewport_pan_populates_and_reuses_distinct_tile_cache_entries() {
     let level = regular_level_with_min_tiles(&handle, 10, 8);
     assert!(level.tiles_across >= 10 && level.tiles_down >= 8);
 
-    let first = RegionRequest::legacy_xywh(
+    let first = region_request(
         0,
         0,
         level.index,

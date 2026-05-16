@@ -18,14 +18,13 @@ by its terms.
 rustup show
 
 # Run the same gates that CI runs.
-cargo xtask fmt
-cargo xtask clippy
-cargo xtask test
-cargo xtask doc
+cargo xtask validate
 ```
 
-`cargo xtask ci` runs the full sequence (`fmt`, `clippy`, `test`, `doc`,
-`package`).
+`cargo xtask validate` runs `fmt`, `clippy`, `bench-check`, `nextest`, and
+`doc`. `cargo xtask bench-check` compiles the Rust benchmark targets without
+running timings; use `cargo xtask bench` for the synthetic local Criterion
+benchmarks. `cargo xtask ci` runs `validate` plus `package`.
 
 ## Branching and commits
 
@@ -35,6 +34,16 @@ cargo xtask doc
   (`feat:`, `fix:`, `chore:`, `ci:`, `docs:`).
 - Keep each commit self-contained: building / formatting / linting / tests
   should pass at every commit, not only at the tip.
+
+## Refactor boundaries
+
+- Keep the main `statumen` library at the repository root.
+- Do not add workspace crates or move the library under `crates/*` for
+  maintainability-only work.
+- Prefer focused module directories inside the existing crate when a file grows
+  too large to review comfortably.
+- Preserve deliberate public re-exports from `src/lib.rs`; internal module
+  splits should not accidentally expand the public API.
 
 ## Tests
 

@@ -82,7 +82,6 @@ impl Quickhash1 {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub fn hash_file(&mut self, path: &Path) -> Result<(), WsiError> {
         self.hash_file_part(path, 0, None)
     }
