@@ -480,7 +480,6 @@ impl NdpiInterpreter {
         let mut levels = Vec::new();
         let mut tile_sources = HashMap::new();
         let mut previous_public_level_idx: Option<u32> = None;
-        let mut nearest_physical_level: Option<(u32, u32)> = None;
 
         for expected_factor in expected_factors {
             let level_idx = levels.len() as u32;
@@ -589,29 +588,12 @@ impl NdpiInterpreter {
                         source,
                     );
                 }
-                nearest_physical_level = Some((level_idx, expected_factor));
             } else {
-                let direct_physical_base =
-                    nearest_physical_level.and_then(|(physical_level, physical_factor)| {
-                        if expected_factor % physical_factor != 0 {
-                            return None;
-                        }
-                        let factor = expected_factor / physical_factor;
-                        (factor.is_power_of_two() && (2..=8).contains(&factor))
-                            .then_some((physical_level, factor))
-                    });
-                let (base_level, synthetic_factor) = match direct_physical_base {
-                    Some(base) => base,
-                    None => (
-                        previous_public_level_idx.ok_or_else(|| {
-                            TiffParseError::Structure(
-                                "NDPI: cannot synthesize level without a higher-resolution base"
-                                    .into(),
-                            )
-                        })?,
-                        2,
-                    ),
-                };
+                let base_level = previous_public_level_idx.ok_or_else(|| {
+                    TiffParseError::Structure(
+                        "NDPI: cannot synthesize level without a higher-resolution base".into(),
+                    )
+                })?;
                 let width_u32 = u32::try_from(width).unwrap_or(u32::MAX);
                 let height_u32 = u32::try_from(height).unwrap_or(u32::MAX);
                 levels.push(Level {
@@ -637,7 +619,7 @@ impl NdpiInterpreter {
                         },
                         TileSource::SyntheticDownsample {
                             base_level,
-                            factor: synthetic_factor,
+                            factor: 2,
                         },
                     );
                 }
@@ -1365,50 +1347,6 @@ mod tests {
                 assert_eq!(*factor, 2);
             }
             other => panic!("expected SyntheticDownsample, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn interpret_points_consecutive_synthetic_levels_at_nearest_physical_base() {
-        let file = build_ndpi_with_jpeg_strips(&[(1024, 768, 40.0, 0), (128, 96, 5.0, 0)]);
-
-        let container = TiffContainer::open(file.path()).unwrap();
-        let interpreter = NdpiInterpreter;
-        let layout = interpreter.interpret(&container).unwrap();
-
-        match layout
-            .tile_sources
-            .get(&TileSourceKey {
-                scene: 0,
-                series: 0,
-                level: 2,
-                z: 0,
-                c: 0,
-                t: 0,
-            })
-            .unwrap()
-        {
-            TileSource::SyntheticDownsample { base_level, factor } => {
-                assert_eq!(*base_level, 0);
-                assert_eq!(*factor, 4);
-            }
-            other => panic!("expected SyntheticDownsample, got: {:?}", other),
-        }
-
-        match layout
-            .tile_sources
-            .get(&TileSourceKey {
-                scene: 0,
-                series: 0,
-                level: 3,
-                z: 0,
-                c: 0,
-                t: 0,
-            })
-            .unwrap()
-        {
-            TileSource::NdpiFullDecode { .. } => {}
-            other => panic!("expected physical NDPI level, got: {:?}", other),
         }
     }
 

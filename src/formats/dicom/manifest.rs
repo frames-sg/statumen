@@ -46,7 +46,6 @@ impl DicomSlide {
         });
         validate_monotonic_levels(path, &levels)?;
         reject_huge_base_only_dicom(path, &levels)?;
-        preload_volume_encapsulated_frame_indexes(&levels)?;
 
         let level0 = levels
             .first()
@@ -143,15 +142,6 @@ impl DicomSlide {
             associated,
         })
     }
-}
-
-fn preload_volume_encapsulated_frame_indexes(levels: &[DicomLevel]) -> Result<(), WsiError> {
-    for level in levels {
-        for image in &level.parts {
-            image.preload_encapsulated_frame_index()?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug)]

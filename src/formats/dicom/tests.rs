@@ -1035,37 +1035,6 @@ fn reads_htj2k_rpcl_raw_compressed_frame_without_dicom_padding() {
 }
 
 #[test]
-fn dicom_parse_preloads_volume_encapsulated_frame_index() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("htj2k-rpcl.dcm");
-    write_test_dicom(
-        &path,
-        TestDicomOptions {
-            transfer_syntax: HTJ2K_LOSSLESS_RPCL_TRANSFER_SYNTAX,
-            samples_per_pixel: 3,
-            photometric_interpretation: "RGB",
-            planar_configuration: Some(0),
-            pixel_spacing: Some("0.00025\\0.00025"),
-            shared_pixel_spacing: None,
-            pixel_data: TestPixelData::Encapsulated(vec![0xFF, 0x4F, 0x00, 0xFF, 0xD9]),
-            ..TestDicomOptions::native(Vec::new())
-        },
-    );
-
-    let slide = DicomSlide::parse(&path).expect("parse DICOM slide");
-
-    let image = &slide.levels[0].parts[0];
-    assert!(
-        image
-            .encapsulated_frames
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .is_some(),
-        "encapsulated frame index should be ready before first tile read"
-    );
-}
-
-#[test]
 fn tile_codec_kind_classifies_dicom_transfer_syntaxes() {
     assert_eq!(
         dicom_tile_codec_kind(JPEG_TRANSFER_SYNTAX),
