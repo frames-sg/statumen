@@ -496,6 +496,13 @@ impl DicomImage {
         Ok(frames)
     }
 
+    pub(super) fn preload_encapsulated_frame_index(&self) -> Result<(), WsiError> {
+        if is_encapsulated_transfer_syntax(&self.transfer_syntax_uid) {
+            self.ensure_encapsulated_frames()?;
+        }
+        Ok(())
+    }
+
     pub(super) fn read_encapsulated_fragments(
         &self,
         fragments: &[DicomFragmentRef],

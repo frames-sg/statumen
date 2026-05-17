@@ -177,6 +177,17 @@ fn full_decode_cache_replacement_updates_bytes() {
 }
 
 #[test]
+fn synthetic_level_cache_default_holds_common_tail_overview_level() {
+    let cache = SyntheticLevelCache::default();
+    let common_tail_level_bytes = 1674_u64 * 1100 * 3;
+
+    assert!(
+        cache.max_bytes >= common_tail_level_bytes,
+        "default synthetic cache should hold a common NDPI tail overview level"
+    );
+}
+
+#[test]
 fn clamp_ndpi_strip_crop_limits_edge_requests_to_strip_bounds() {
     assert_eq!(
         TiffPixelReader::clamp_ndpi_strip_crop(112, 0, 136, 240, 104, 240),
@@ -1206,7 +1217,7 @@ fn synthetic_ndpi_subregion_fastpath_matches_center_roi_without_materializing_le
 }
 
 #[test]
-fn synthetic_ndpi_display_tile_uses_roi_fastpath_without_materializing_level() {
+fn synthetic_ndpi_display_tile_materializes_cacheable_level_for_reuse() {
     let reader = build_synthetic_ndpi_reader(8, 8, &[(4, 4, 2)]);
     let tile = reader
         .read_display_tile(&TileViewRequest {
@@ -1223,10 +1234,9 @@ fn synthetic_ndpi_display_tile_uses_roi_fastpath_without_materializing_level() {
     let expected = expected_synthetic_ndpi_region(&reader, 2, 2, 2, 2, 2);
 
     assert_tile_eq(&tile, &expected);
-    assert_eq!(
-        reader.synthetic_level_cache.lock().unwrap().current_bytes,
-        0,
-        "display-tile reads must not materialize the whole synthetic level"
+    assert!(
+        reader.synthetic_level_cache.lock().unwrap().current_bytes > 0,
+        "cacheable display-tile reads should materialize the synthetic level for reuse"
     );
 }
 

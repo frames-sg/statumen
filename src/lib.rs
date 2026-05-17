@@ -13,8 +13,8 @@ pub use core::cache::CacheConfig;
 pub use core::decode_runtime::{DecodeExecutionOptions, DecodeRoute, DecodeRouteDecision};
 pub use error::WsiError;
 pub use formats::svcache::{
-    build_svcache, build_svcache_tile_payloads_replace, build_svcache_tiles,
-    build_svcache_tiles_replace, cache_dir_svcache_path, default_svcache_path,
+    build_svcache, build_svcache_tile_payloads_merge, build_svcache_tile_payloads_replace,
+    build_svcache_tiles, build_svcache_tiles_replace, cache_dir_svcache_path, default_svcache_path,
     svcache_candidate_paths, svcache_matches_source, SvcachePolicy, SvcacheTileSelection,
 };
 pub use properties::Properties;

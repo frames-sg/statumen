@@ -385,6 +385,33 @@ pub fn build_svcache_tile_payloads_replace(
     out_path: &Path,
     tiles: &[(SvcacheTileSelection, CpuTile)],
 ) -> Result<usize, WsiError> {
+    build_svcache_tile_payloads_with_existing_policy(
+        source_path,
+        out_path,
+        tiles,
+        ExistingTilePolicy::Replace,
+    )
+}
+
+pub fn build_svcache_tile_payloads_merge(
+    source_path: &Path,
+    out_path: &Path,
+    tiles: &[(SvcacheTileSelection, CpuTile)],
+) -> Result<usize, WsiError> {
+    build_svcache_tile_payloads_with_existing_policy(
+        source_path,
+        out_path,
+        tiles,
+        ExistingTilePolicy::Preserve,
+    )
+}
+
+fn build_svcache_tile_payloads_with_existing_policy(
+    source_path: &Path,
+    out_path: &Path,
+    tiles: &[(SvcacheTileSelection, CpuTile)],
+    existing_tile_policy: ExistingTilePolicy,
+) -> Result<usize, WsiError> {
     let registry = FormatRegistry::builtin_native();
     let source = registry.open_exact(source_path)?;
     let slide = Slide::from_source_with_cache_bytes(source, 256 * 1024 * 1024);
@@ -394,6 +421,13 @@ pub fn build_svcache_tile_payloads_replace(
     std::fs::create_dir_all(parent)?;
     let mut payload = tempfile::tempfile()?;
     let mut scenes = metadata_shell(slide.dataset())?;
+    let _copied = copy_existing_svcache_tiles_with_policy(
+        out_path,
+        source_path,
+        &mut scenes,
+        &mut payload,
+        existing_tile_policy,
+    )?;
 
     let mut unique = tiles
         .iter()

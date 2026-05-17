@@ -122,6 +122,21 @@ impl TiffPixelReader {
             .put(key, image);
     }
 
+    pub(super) fn synthetic_level_cache_can_hold(&self, dimensions: (u64, u64)) -> bool {
+        let Some(bytes) = dimensions
+            .0
+            .checked_mul(dimensions.1)
+            .and_then(|pixels| pixels.checked_mul(3))
+        else {
+            return false;
+        };
+        self.synthetic_level_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .max_bytes
+            >= bytes
+    }
+
     pub(super) fn try_decode_synthetic_level_with_signinum(
         &self,
         req: &TileRequest,
@@ -1697,6 +1712,26 @@ impl TiffPixelReader {
                 level: req.level,
                 reason: "display tile origin out of bounds".into(),
             });
+        }
+        if origin_x >= 0 && origin_y >= 0 && self.synthetic_level_cache_can_hold(level.dimensions) {
+            let tile_req = TileRequest {
+                scene: req.scene,
+                series: req.series,
+                level: req.level,
+                plane: req.plane,
+                col: 0,
+                row: 0,
+            };
+            let image = self.get_or_decode_synthetic_level(&tile_req, base_level, factor)?;
+            let crop_width = req.tile_width.min((level_w - origin_x) as u32);
+            let crop_height = req.tile_height.min((level_h - origin_y) as u32);
+            return crop_rgb_interleaved_u8_buffer(
+                image.as_ref(),
+                origin_x as u32,
+                origin_y as u32,
+                crop_width,
+                crop_height,
+            );
         }
 
         let clipped = RegionRequest {
@@ -3915,6 +3950,17 @@ impl TiffPixelReader {
             if let Some(tiles) = self.decode_tiled_ifd_mixed_batch(reqs, backend)? {
                 return Ok(tiles);
             }
+        }
+
+        if matches!(first_source, TileSource::NdpiJpeg { .. })
+            && reqs
+                .iter()
+                .all(|req| matches!(self.tile_source_for(req), Ok(TileSource::NdpiJpeg { .. })))
+        {
+            return reqs
+                .par_iter()
+                .map(|req| self.read_tile_cpu_with_backend_request(req, backend))
+                .collect();
         }
 
         let mut decode_reqs = Vec::with_capacity(reqs.len());
