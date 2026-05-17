@@ -105,7 +105,16 @@ struct LevelMeta {
     tile_height: u32,
     tiles_across: u64,
     tiles_down: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tiles: Vec<Option<TileMeta>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sparse_tiles: Vec<SparseTileMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SparseTileMeta {
+    index: u64,
+    tile: TileMeta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +135,42 @@ struct TileMeta {
     color_space: ColorSpaceMeta,
     codec: PayloadCodec,
     sha256: String,
+}
+
+impl LevelMeta {
+    fn tile_meta_for_index(&self, index: u64) -> Option<&TileMeta> {
+        if !self.tiles.is_empty() {
+            return usize::try_from(index)
+                .ok()
+                .and_then(|idx| self.tiles.get(idx))
+                .and_then(Option::as_ref);
+        }
+        self.sparse_tiles
+            .binary_search_by_key(&index, |entry| entry.index)
+            .ok()
+            .map(|idx| &self.sparse_tiles[idx].tile)
+    }
+
+    fn insert_tile_for_index(&mut self, index: u64, tile: TileMeta) {
+        if !self.tiles.is_empty() {
+            if let Ok(idx) = usize::try_from(index) {
+                if let Some(slot) = self.tiles.get_mut(idx) {
+                    *slot = Some(tile);
+                }
+            }
+            return;
+        }
+
+        match self
+            .sparse_tiles
+            .binary_search_by_key(&index, |entry| entry.index)
+        {
+            Ok(idx) => self.sparse_tiles[idx].tile = tile,
+            Err(idx) => self
+                .sparse_tiles
+                .insert(idx, SparseTileMeta { index, tile }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +308,7 @@ pub fn build_svcache(source_path: &Path, out_path: &Path) -> Result<(), WsiError
                     tiles_across,
                     tiles_down,
                     tiles,
+                    sparse_tiles: Vec::new(),
                 });
             }
             series_meta.push(SeriesMeta {
@@ -313,6 +359,32 @@ pub fn build_svcache_tiles(
     out_path: &Path,
     selections: &[SvcacheTileSelection],
 ) -> Result<usize, WsiError> {
+    build_svcache_tiles_with_existing_policy(
+        source_path,
+        out_path,
+        selections,
+        ExistingTilePolicy::Preserve,
+    )
+}
+
+pub fn build_svcache_tiles_replace(
+    source_path: &Path,
+    out_path: &Path,
+    selections: &[SvcacheTileSelection],
+) -> Result<usize, WsiError> {
+    build_svcache_tiles_with_existing_policy(
+        source_path,
+        out_path,
+        selections,
+        ExistingTilePolicy::Replace,
+    )
+}
+
+pub fn build_svcache_tile_payloads_replace(
+    source_path: &Path,
+    out_path: &Path,
+    tiles: &[(SvcacheTileSelection, CpuTile)],
+) -> Result<usize, WsiError> {
     let registry = FormatRegistry::builtin_native();
     let source = registry.open_exact(source_path)?;
     let slide = Slide::from_source_with_cache_bytes(source, 256 * 1024 * 1024);
@@ -322,7 +394,107 @@ pub fn build_svcache_tiles(
     std::fs::create_dir_all(parent)?;
     let mut payload = tempfile::tempfile()?;
     let mut scenes = metadata_shell(slide.dataset())?;
-    let _copied = copy_existing_svcache_tiles(out_path, source_path, &mut scenes, &mut payload)?;
+
+    let mut unique = tiles
+        .iter()
+        .map(|(selection, tile)| (*selection, tile))
+        .collect::<Vec<_>>();
+    unique.sort_by_key(|(selection, _)| {
+        (
+            selection.scene,
+            selection.series,
+            selection.level,
+            selection.plane.z,
+            selection.plane.c,
+            selection.plane.t,
+            selection.row,
+            selection.col,
+        )
+    });
+    unique.dedup_by_key(|(selection, _)| *selection);
+
+    let mut written = 0usize;
+    for (selection, tile) in unique {
+        let (_, _, tiles_across, tiles_down) =
+            level_grid_for_selection(slide.dataset(), selection)?;
+        if selection.col < 0 || selection.row < 0 {
+            return Err(WsiError::TileRead {
+                col: selection.col,
+                row: selection.row,
+                level: selection.level,
+                reason: ".svcache selection has negative tile coordinate".into(),
+            });
+        }
+        let col = selection.col as u64;
+        let row = selection.row as u64;
+        if col >= tiles_across || row >= tiles_down {
+            return Err(WsiError::TileRead {
+                col: selection.col,
+                row: selection.row,
+                level: selection.level,
+                reason: ".svcache selection tile coordinate out of range".into(),
+            });
+        }
+        let idx = row
+            .checked_mul(tiles_across)
+            .and_then(|base| base.checked_add(col))
+            .ok_or_else(|| WsiError::TileRead {
+                col: selection.col,
+                row: selection.row,
+                level: selection.level,
+                reason: ".svcache selection tile index overflow".into(),
+            })?;
+        if scenes[selection.scene].series[selection.series].levels[selection.level as usize]
+            .tile_meta_for_index(idx)
+            .is_some()
+        {
+            continue;
+        }
+        let tile_meta = write_tile_payload(&mut payload, tile)?;
+        scenes[selection.scene].series[selection.series].levels[selection.level as usize]
+            .insert_tile_for_index(idx, tile_meta);
+        written += 1;
+    }
+
+    let metadata = SvcacheMetadata {
+        schema_version: SCHEMA_VERSION,
+        complete: false,
+        source: source_fingerprint,
+        properties: slide
+            .dataset()
+            .properties
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+        scenes,
+        associated: Vec::new(),
+    };
+    write_svcache_file(out_path, &metadata, payload)?;
+    Ok(written)
+}
+
+fn build_svcache_tiles_with_existing_policy(
+    source_path: &Path,
+    out_path: &Path,
+    selections: &[SvcacheTileSelection],
+    existing_tile_policy: ExistingTilePolicy,
+) -> Result<usize, WsiError> {
+    let registry = FormatRegistry::builtin_native();
+    let source = registry.open_exact(source_path)?;
+    let slide = Slide::from_source_with_cache_bytes(source, 256 * 1024 * 1024);
+    let source_fingerprint = fingerprint_source(source_path)?;
+
+    let parent = out_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let mut payload = tempfile::tempfile()?;
+    let mut scenes = metadata_shell(slide.dataset())?;
+    let _copied = copy_existing_svcache_tiles_with_policy(
+        out_path,
+        source_path,
+        &mut scenes,
+        &mut payload,
+        existing_tile_policy,
+    )?;
     let mut seen = HashSet::new();
     let mut unique = Vec::with_capacity(selections.len());
     for &selection in selections {
@@ -365,16 +537,19 @@ pub fn build_svcache_tiles(
                 reason: ".svcache selection tile coordinate out of range".into(),
             });
         }
-        let idx = usize::try_from(row * tiles_across + col).map_err(|_| WsiError::TileRead {
-            col: selection.col,
-            row: selection.row,
-            level: selection.level,
-            reason: ".svcache selection tile index overflow".into(),
-        })?;
-        let slot = &mut scenes[selection.scene].series[selection.series].levels
-            [selection.level as usize]
-            .tiles[idx];
-        if slot.is_some() {
+        let idx = row
+            .checked_mul(tiles_across)
+            .and_then(|base| base.checked_add(col))
+            .ok_or_else(|| WsiError::TileRead {
+                col: selection.col,
+                row: selection.row,
+                level: selection.level,
+                reason: ".svcache selection tile index overflow".into(),
+            })?;
+        if scenes[selection.scene].series[selection.series].levels[selection.level as usize]
+            .tile_meta_for_index(idx)
+            .is_some()
+        {
             continue;
         }
         let request = TileViewRequest {
@@ -388,7 +563,9 @@ pub fn build_svcache_tiles(
             tile_height,
         };
         let tile = slide.read_display_tile(&request)?;
-        *slot = Some(write_tile_payload(&mut payload, &tile)?);
+        let tile_meta = write_tile_payload(&mut payload, &tile)?;
+        scenes[selection.scene].series[selection.series].levels[selection.level as usize]
+            .insert_tile_for_index(idx, tile_meta);
         written += 1;
     }
 
@@ -407,6 +584,27 @@ pub fn build_svcache_tiles(
     };
     write_svcache_file(out_path, &metadata, payload)?;
     Ok(written)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingTilePolicy {
+    Preserve,
+    Replace,
+}
+
+fn copy_existing_svcache_tiles_with_policy(
+    out_path: &Path,
+    source_path: &Path,
+    scenes: &mut [SceneMeta],
+    payload: &mut File,
+    policy: ExistingTilePolicy,
+) -> Result<usize, WsiError> {
+    match policy {
+        ExistingTilePolicy::Preserve => {
+            copy_existing_svcache_tiles(out_path, source_path, scenes, payload)
+        }
+        ExistingTilePolicy::Replace => Ok(0),
+    }
 }
 
 fn copy_existing_svcache_tiles(
@@ -433,18 +631,54 @@ fn copy_existing_svcache_tiles(
                 let Some(existing_level) = existing_series.levels.get(level_idx) else {
                     continue;
                 };
-                for (slot, existing_slot) in level.tiles.iter_mut().zip(&existing_level.tiles) {
-                    if slot.is_none() {
-                        if let Some(existing_tile) = existing_slot {
-                            *slot = Some(copy_tile_payload(
-                                &mut existing_file,
-                                payload_start,
-                                existing_tile,
-                                payload,
-                            )?);
-                            copied += 1;
-                        }
+                let tile_limit = level
+                    .tiles_across
+                    .checked_mul(level.tiles_down)
+                    .ok_or_else(|| WsiError::InvalidSlide {
+                        path: out_path.into(),
+                        message: "svcache level tile count overflow".into(),
+                    })?;
+                for (idx, existing_slot) in existing_level.tiles.iter().enumerate() {
+                    let idx = u64::try_from(idx).map_err(|_| WsiError::InvalidSlide {
+                        path: out_path.into(),
+                        message: "svcache tile index overflow".into(),
+                    })?;
+                    if idx >= tile_limit {
+                        break;
                     }
+                    if level.tile_meta_for_index(idx).is_some() {
+                        continue;
+                    }
+                    let Some(existing_tile) = existing_slot else {
+                        continue;
+                    };
+                    let copied_tile = copy_tile_payload(
+                        &mut existing_file,
+                        payload_start,
+                        existing_tile,
+                        payload,
+                    )?;
+                    level.insert_tile_for_index(idx, copied_tile);
+                    copied += 1;
+                }
+                for existing_entry in &existing_level.sparse_tiles {
+                    if existing_entry.index >= tile_limit {
+                        return Err(WsiError::InvalidSlide {
+                            path: out_path.into(),
+                            message: "svcache sparse tile index out of range".into(),
+                        });
+                    }
+                    if level.tile_meta_for_index(existing_entry.index).is_some() {
+                        continue;
+                    }
+                    let copied_tile = copy_tile_payload(
+                        &mut existing_file,
+                        payload_start,
+                        &existing_entry.tile,
+                        payload,
+                    )?;
+                    level.insert_tile_for_index(existing_entry.index, copied_tile);
+                    copied += 1;
                 }
             }
         }
@@ -584,17 +818,17 @@ impl SvcacheReader {
                 reason: ".svcache tile coordinate out of range".into(),
             });
         }
-        let idx =
-            usize::try_from(row * level.tiles_across + col).map_err(|_| WsiError::TileRead {
+        let idx = row
+            .checked_mul(level.tiles_across)
+            .and_then(|base| base.checked_add(col))
+            .ok_or_else(|| WsiError::TileRead {
                 col: req.col,
                 row: req.row,
                 level: req.level,
                 reason: ".svcache tile index overflow".into(),
             })?;
         level
-            .tiles
-            .get(idx)
-            .and_then(Option::as_ref)
+            .tile_meta_for_index(idx)
             .ok_or_else(|| WsiError::TileRead {
                 col: req.col,
                 row: req.row,
@@ -646,12 +880,6 @@ fn metadata_shell(dataset: &Dataset) -> Result<Vec<SceneMeta>, WsiError> {
             for level in &series.levels {
                 let (tile_width, tile_height, tiles_across, tiles_down) =
                     cache_grid_for_level(level);
-                let tile_count =
-                    usize::try_from(tiles_across.saturating_mul(tiles_down)).map_err(|_| {
-                        WsiError::UnsupportedFormat(
-                            ".svcache level tile count exceeds addressable memory".into(),
-                        )
-                    })?;
                 levels_meta.push(LevelMeta {
                     dimensions: level.dimensions,
                     downsample: level.downsample,
@@ -659,7 +887,8 @@ fn metadata_shell(dataset: &Dataset) -> Result<Vec<SceneMeta>, WsiError> {
                     tile_height,
                     tiles_across,
                     tiles_down,
-                    tiles: vec![None; tile_count],
+                    tiles: Vec::new(),
+                    sparse_tiles: Vec::new(),
                 });
             }
             series_meta.push(SeriesMeta {
@@ -1035,6 +1264,7 @@ mod tests {
                         tiles_across: 1,
                         tiles_down: 1,
                         tiles: vec![Some(tile_meta)],
+                        sparse_tiles: Vec::new(),
                     }],
                 }],
             }],
@@ -1085,6 +1315,7 @@ mod tests {
                         tiles_across: 2,
                         tiles_down: 1,
                         tiles: vec![None, None],
+                        sparse_tiles: Vec::new(),
                     }],
                 }],
             }],
@@ -1125,6 +1356,44 @@ mod tests {
         };
 
         assert_eq!(cache_grid_for_level(&level), (256, 256, 15, 12));
+    }
+
+    #[test]
+    fn partial_svcache_metadata_shell_starts_sparse() {
+        let dataset = Dataset {
+            id: DatasetId(42),
+            scenes: vec![Scene {
+                id: "scene-0".into(),
+                name: None,
+                series: vec![Series {
+                    id: "series-0".into(),
+                    axes: AxesShape::default(),
+                    levels: vec![Level {
+                        dimensions: (65_536, 65_536),
+                        downsample: 1.0,
+                        tile_layout: TileLayout::Regular {
+                            tile_width: 256,
+                            tile_height: 256,
+                            tiles_across: 256,
+                            tiles_down: 256,
+                        },
+                    }],
+                    sample_type: SampleType::Uint8,
+                    channels: Vec::new(),
+                }],
+            }],
+            associated_images: std::collections::HashMap::new(),
+            properties: Properties::new(),
+            icc_profiles: std::collections::HashMap::new(),
+        };
+
+        let scenes = metadata_shell(&dataset).unwrap();
+        let level = &scenes[0].series[0].levels[0];
+
+        assert!(level.tiles.is_empty());
+        assert!(level.sparse_tiles.is_empty());
+        assert_eq!(level.tiles_across, 256);
+        assert_eq!(level.tiles_down, 256);
     }
 
     #[test]
@@ -1199,6 +1468,7 @@ mod tests {
                         tiles_across: 2,
                         tiles_down: 1,
                         tiles: vec![Some(existing_tile), None],
+                        sparse_tiles: Vec::new(),
                     }],
                 }],
             }],
@@ -1217,5 +1487,165 @@ mod tests {
         assert_eq!(copied, 1);
         assert!(scenes[0].series[0].levels[0].tiles[0].is_some());
         assert!(scenes[0].series[0].levels[0].tiles[1].is_none());
+    }
+
+    #[test]
+    fn sparse_svcache_replace_does_not_copy_existing_tiles() {
+        let mut existing_payload = tempfile::tempfile().unwrap();
+        let tile =
+            CpuTile::from_u8_interleaved(1, 1, 3, ColorSpace::Rgb, vec![1_u8, 2_u8, 3_u8]).unwrap();
+        let existing_tile = write_tile_payload(&mut existing_payload, &tile).unwrap();
+        let source = tempfile::NamedTempFile::new().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("replace.svcache");
+        let metadata = SvcacheMetadata {
+            schema_version: SCHEMA_VERSION,
+            complete: false,
+            source: fingerprint_source(source.path()).unwrap(),
+            properties: Vec::new(),
+            scenes: vec![SceneMeta {
+                id: "scene-0".into(),
+                name: None,
+                series: vec![SeriesMeta {
+                    id: "series-0".into(),
+                    axes: AxesMeta { z: 1, c: 1, t: 1 },
+                    sample_type: SampleTypeMeta::Uint8,
+                    channels: Vec::new(),
+                    levels: vec![LevelMeta {
+                        dimensions: (2, 1),
+                        downsample: 1.0,
+                        tile_width: 1,
+                        tile_height: 1,
+                        tiles_across: 2,
+                        tiles_down: 1,
+                        tiles: vec![Some(existing_tile), None],
+                        sparse_tiles: Vec::new(),
+                    }],
+                }],
+            }],
+            associated: Vec::new(),
+        };
+        write_svcache_file(&out_path, &metadata, existing_payload).unwrap();
+
+        let mut replacement_payload = tempfile::tempfile().unwrap();
+        let mut scenes = metadata.scenes.clone();
+        scenes[0].series[0].levels[0].tiles = vec![None, None];
+
+        let copied = copy_existing_svcache_tiles_with_policy(
+            &out_path,
+            source.path(),
+            &mut scenes,
+            &mut replacement_payload,
+            ExistingTilePolicy::Replace,
+        )
+        .unwrap();
+
+        assert_eq!(copied, 0);
+        assert!(scenes[0].series[0].levels[0].tiles[0].is_none());
+        assert!(scenes[0].series[0].levels[0].tiles[1].is_none());
+    }
+
+    #[test]
+    fn build_svcache_tiles_replace_rewrites_selected_tiles_when_cache_exists() {
+        let mut source = tempfile::Builder::new().suffix(".j2c").tempfile().unwrap();
+        source
+            .write_all(include_bytes!("../../tests/fixtures/jp2k/rgb_nomct.j2k"))
+            .unwrap();
+        source.flush().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("viewport.svcache");
+        let selections = [SvcacheTileSelection {
+            scene: 0,
+            series: 0,
+            level: 0,
+            plane: PlaneSelection::default(),
+            col: 0,
+            row: 0,
+        }];
+
+        let first_written = build_svcache_tiles(source.path(), &out_path, &selections).unwrap();
+        let merged_written = build_svcache_tiles(source.path(), &out_path, &selections).unwrap();
+        let replaced_written =
+            build_svcache_tiles_replace(source.path(), &out_path, &selections).unwrap();
+
+        assert_eq!(first_written, 1);
+        assert_eq!(merged_written, 0);
+        assert_eq!(
+            replaced_written, 1,
+            "replace mode must not treat copied existing tiles as already populated"
+        );
+
+        let (_, _, metadata) = read_svcache(&out_path).unwrap();
+        let level = &metadata.scenes[0].series[0].levels[0];
+        assert!(
+            level.tiles.is_empty(),
+            "viewport caches must not serialize dense empty tile slots"
+        );
+        assert_eq!(level.sparse_tiles.len(), 1);
+        assert_eq!(level.sparse_tiles[0].index, 0);
+
+        let backend = SvcacheBackend::new();
+        let reader = backend.open(&out_path).unwrap();
+        reader
+            .read_tile_cpu(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 0,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn build_svcache_tile_payloads_replace_writes_sparse_decoded_tiles() {
+        let mut source = tempfile::Builder::new().suffix(".j2c").tempfile().unwrap();
+        source
+            .write_all(include_bytes!("../../tests/fixtures/jp2k/rgb_nomct.j2k"))
+            .unwrap();
+        source.flush().unwrap();
+        let out_dir = tempfile::tempdir().unwrap();
+        let out_path = out_dir.path().join("decoded-tiles.svcache");
+        let selection = SvcacheTileSelection {
+            scene: 0,
+            series: 0,
+            level: 0,
+            plane: PlaneSelection::default(),
+            col: 0,
+            row: 0,
+        };
+        let tile = CpuTile::from_u8_interleaved(
+            1,
+            1,
+            4,
+            ColorSpace::Rgba,
+            vec![11_u8, 22_u8, 33_u8, 44_u8],
+        )
+        .unwrap();
+
+        let written =
+            build_svcache_tile_payloads_replace(source.path(), &out_path, &[(selection, tile)])
+                .unwrap();
+
+        assert_eq!(written, 1);
+        let (_, _, metadata) = read_svcache(&out_path).unwrap();
+        let level = &metadata.scenes[0].series[0].levels[0];
+        assert!(level.tiles.is_empty());
+        assert_eq!(level.sparse_tiles.len(), 1);
+
+        let backend = SvcacheBackend::new();
+        let reader = backend.open(&out_path).unwrap();
+        let decoded = reader
+            .read_tile_cpu(&TileRequest {
+                scene: 0,
+                series: 0,
+                level: 0,
+                plane: PlaneSelection::default(),
+                col: 0,
+                row: 0,
+            })
+            .unwrap();
+        assert_eq!(decoded.data.as_u8().unwrap(), &[11, 22, 33, 44]);
     }
 }
